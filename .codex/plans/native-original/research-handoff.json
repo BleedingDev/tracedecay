@@ -1,0 +1,58 @@
+{
+  "graph_id": "native-original-research-20260910",
+  "selection_hash": "5553f4b0a8",
+  "snapshot_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plan-graphs/native-original-research-20260910/snapshot.json",
+  "state_dir": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plan-graphs/native-original-research-20260910",
+  "plan_count": 10,
+  "edge_count": 9,
+  "selected_plan_paths": [
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/research/rn-audit-adapter.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/research/rn-audit-data.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/research/rn-audit-delivery.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/research/rn-audit-facts.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/research/rn-audit-interface.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/research/rn-audit-ncm.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/research/rn-audit-review.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/research/rn-audit-sessions.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/research/rn-audit-source.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/research/rn-audit-verification.plan.md"
+  ],
+  "edges": [
+    {
+      "source": "rn-audit-source",
+      "target": "rn-audit-review"
+    },
+    {
+      "source": "rn-audit-facts",
+      "target": "rn-audit-review"
+    },
+    {
+      "source": "rn-audit-sessions",
+      "target": "rn-audit-review"
+    },
+    {
+      "source": "rn-audit-interface",
+      "target": "rn-audit-review"
+    },
+    {
+      "source": "rn-audit-adapter",
+      "target": "rn-audit-review"
+    },
+    {
+      "source": "rn-audit-delivery",
+      "target": "rn-audit-review"
+    },
+    {
+      "source": "rn-audit-data",
+      "target": "rn-audit-review"
+    },
+    {
+      "source": "rn-audit-ncm",
+      "target": "rn-audit-review"
+    },
+    {
+      "source": "rn-audit-verification",
+      "target": "rn-audit-review"
+    }
+  ]
+}

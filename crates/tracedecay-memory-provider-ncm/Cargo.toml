@@ -1,0 +1,57 @@
+[package]
+name = "tracedecay-memory-provider-ncm"
+version.workspace = true
+edition.workspace = true
+publish = false
+license = "MIT"
+description = "Topology-neutral adapter boundary for licensed NCM cognitive memory"
+repository = "https://github.com/BleedingDev/tracedecay"
+
+[features]
+default = []
+rust-backend = [
+    "dep:tracedecay-memory-ncm-runtime",
+    "tracedecay-memory-ncm-runtime/real-encoder",
+]
+# Pure production declarations for consumers that separately validate live health.
+test-helpers = []
+# Explicit test-only worker transport. This keeps the deterministic encoder out
+# of the production WorkerOptions surface while preserving integration fixtures.
+test-transport = [
+    "rust-backend",
+    "tracedecay-memory-ncm-runtime/test-transport",
+]
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+serde_json = "1"
+sha2 = "0.11"
+tracedecay-memory-provider-api = { path = "../tracedecay-memory-provider-api" }
+tracedecay-memory-ncm-runtime = { path = "../tracedecay-memory-ncm-runtime", optional = true, default-features = false }
+
+[dev-dependencies]
+tracedecay-memory-conformance = { path = "../tracedecay-memory-conformance" }
+tracedecay-memory-provider-registry = { path = "../tracedecay-memory-provider-registry" }
+
+[[test]]
+name = "rust_backend"
+required-features = ["test-transport"]
+
+[[test]]
+name = "rust_backend_conformance"
+required-features = ["test-transport"]
+
+[lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+warnings = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+expect_used = "deny"
+panic = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"

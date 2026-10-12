@@ -1,0 +1,73 @@
+diff --git a/tests/product_memory_dependency_direction_test.py b/tests/product_memory_dependency_direction_test.py
+index 2693f2fd9..eba4a67ab 100644
+--- a/tests/product_memory_dependency_direction_test.py
++++ b/tests/product_memory_dependency_direction_test.py
+@@ -206,9 +206,44 @@ def valid_metadata() -> dict[str, Any]:
+                 "tracedecay-memory-provider-native",
+                 ["serde_json", "tracedecay-memory-provider-api"],
+             ),
+-            package(
++            package_of(
+                 "tracedecay-memory-provider-ncm",
+-                ["serde_json", "sha2", "tracedecay-memory-provider-api"],
++                [
++                    dependency("serde_json"),
++                    dependency("sha2"),
++                    dependency("tracedecay-memory-provider-api"),
++                    dependency(
++                        "tracedecay-memory-ncm-runtime",
++                        features=[],
++                        uses_default_features=False,
++                        optional=True,
++                    ),
++                    dependency("tracedecay-memory-conformance", kind="dev"),
++                ],
++            ),
++            package_of(
++                "tracedecay-memory-ncm-core",
++                [
++                    dependency("serde", features=["derive"]),
++                    dependency("serde_json", kind="dev"),
++                ],
++            ),
++            package_of(
++                "tracedecay-memory-ncm-runtime",
++                [
++                    dependency(
++                        "fastembed",
++                        features=["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"],
++                        uses_default_features=False,
++                        optional=True,
++                    ),
++                    dependency("rusqlite", features=["bundled"], uses_default_features=False),
++                    dependency("serde", features=["derive"]),
++                    dependency("serde_json"),
++                    dependency("sha2"),
++                    dependency("tracedecay-memory-ncm-core"),
++                    dependency("tempfile", kind="dev"),
++                ],
+             ),
+             package_of(
+                 "tracedecay-memory-conformance",
+@@ -290,6 +325,12 @@ class MemoryDependencyDirectionTest(unittest.TestCase):
+             destination = root / "crates" / REGISTRY / "src"
+             destination.parent.mkdir(parents=True)
+             shutil.copytree(REPO / "crates" / REGISTRY / "src", destination)
++            for contracted in self.policy["source_contracts"]:
++                name = contracted["package"]
++                if name != REGISTRY:
++                    shutil.copytree(
++                        REPO / "crates" / name / "src", root / "crates" / name / "src"
++                    )
+             mutate(destination)
+             return CHECKER.check_policy(
+                 REPO,
+@@ -679,6 +720,8 @@ class MemoryDependencyDirectionTest(unittest.TestCase):
+     def test_stale_import_allowance_is_refused(self) -> None:
+         policy = copy.deepcopy(self.policy)
+         for contract in policy["source_contracts"]:
++            if "tracedecay_application" not in contract["allowed_imports"]:
++                continue
+             contract["allowed_imports"]["tracedecay_application"].append(
+                 "tracedecay_application::NeverUsedContractType"
+             )

@@ -83,20 +83,29 @@ fn resolve_authorized_root(
 ) -> Result<AuthorizedRoot, ApplicationScopeError> {
     let registered_root = canonical_root(registered_root, "registered root")?;
     let requested_root = canonical_root(requested_root, "requested root")?;
-    let scope_root =
-        if requested_root == registered_root || requested_root.starts_with(&registered_root) {
-            registered_root.clone()
-        } else {
-            let registered_repository = git_common_dir(&registered_root)?;
-            let requested_repository = git_common_dir(&requested_root)?;
-            if registered_repository != requested_repository {
-                return Err(ApplicationScopeError::UnauthorizedSiblingRoot {
-                    registered_root: registered_root.display().to_string(),
-                    requested_root: requested_root.display().to_string(),
-                });
-            }
-            requested_root
-        };
+    // A linked checkout can live beneath the registered root. Resolve its
+    // actual worktree before ordinary subdirectories converge on that root.
+    let nested_worktree = if requested_root.starts_with(&registered_root) {
+        tracedecay_runtime_core::worktree::git_worktree_root(&requested_root)
+            .filter(|root| root != &registered_root && root.starts_with(&registered_root))
+    } else {
+        None
+    };
+    let scope_root = if requested_root == registered_root
+        || (requested_root.starts_with(&registered_root) && nested_worktree.is_none())
+    {
+        registered_root.clone()
+    } else {
+        let registered_repository = git_common_dir(&registered_root)?;
+        let requested_repository = git_common_dir(&requested_root)?;
+        if registered_repository != requested_repository {
+            return Err(ApplicationScopeError::UnauthorizedSiblingRoot {
+                registered_root: registered_root.display().to_string(),
+                requested_root: requested_root.display().to_string(),
+            });
+        }
+        nested_worktree.unwrap_or(requested_root)
+    };
     let marker =
         tracedecay_runtime_core::storage::read_repository_identity_marker(&registered_root)
             .map_err(|error| ApplicationScopeError::Resolution(error.to_string()))?;

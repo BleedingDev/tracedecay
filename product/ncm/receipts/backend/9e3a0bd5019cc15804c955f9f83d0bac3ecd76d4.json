@@ -1,0 +1,1006 @@
+{
+  "allowed_path_diff": {
+    "allowed_rules": [
+      ".github/workflows/product-ncm-backend.yml",
+      "Cargo.lock",
+      "Cargo.toml",
+      "crates/tracedecay-memory-ncm-core/Cargo.toml",
+      "crates/tracedecay-memory-ncm-core/src/centers/allocation.rs",
+      "crates/tracedecay-memory-ncm-core/src/centers/mod.rs",
+      "crates/tracedecay-memory-ncm-core/src/centers/read.rs",
+      "crates/tracedecay-memory-ncm-core/src/centers/write.rs",
+      "crates/tracedecay-memory-ncm-core/src/consolidation/",
+      "crates/tracedecay-memory-ncm-core/src/dynamics/",
+      "crates/tracedecay-memory-ncm-core/src/kernel/",
+      "crates/tracedecay-memory-ncm-core/src/lib.rs",
+      "crates/tracedecay-memory-ncm-core/src/numeric/",
+      "crates/tracedecay-memory-ncm-core/src/projections/",
+      "crates/tracedecay-memory-ncm-core/src/recall/",
+      "crates/tracedecay-memory-ncm-core/src/records/",
+      "crates/tracedecay-memory-ncm-core/src/signals/",
+      "crates/tracedecay-memory-ncm-core/src/terrain/",
+      "crates/tracedecay-memory-ncm-core/src/types.rs",
+      "crates/tracedecay-memory-ncm-core/tests/center_read.rs",
+      "crates/tracedecay-memory-ncm-core/tests/center_write.rs",
+      "crates/tracedecay-memory-ncm-core/tests/consolidation.rs",
+      "crates/tracedecay-memory-ncm-core/tests/dynamics.rs",
+      "crates/tracedecay-memory-ncm-core/tests/kernel.rs",
+      "crates/tracedecay-memory-ncm-core/tests/numeric.rs",
+      "crates/tracedecay-memory-ncm-core/tests/projections.rs",
+      "crates/tracedecay-memory-ncm-core/tests/record_recall.rs",
+      "crates/tracedecay-memory-ncm-core/tests/signals.rs",
+      "crates/tracedecay-memory-ncm-core/tests/terrain.rs",
+      "crates/tracedecay-memory-ncm-runtime/Cargo.toml",
+      "crates/tracedecay-memory-ncm-runtime/benches/ncm_scale.rs",
+      "crates/tracedecay-memory-ncm-runtime/src/bin/tracedecay-ncm-worker.rs",
+      "crates/tracedecay-memory-ncm-runtime/src/client/",
+      "crates/tracedecay-memory-ncm-runtime/src/embedding/",
+      "crates/tracedecay-memory-ncm-runtime/src/engine/",
+      "crates/tracedecay-memory-ncm-runtime/src/lib.rs",
+      "crates/tracedecay-memory-ncm-runtime/src/maintenance/",
+      "crates/tracedecay-memory-ncm-runtime/src/ports.rs",
+      "crates/tracedecay-memory-ncm-runtime/src/privacy/",
+      "crates/tracedecay-memory-ncm-runtime/src/snapshot/",
+      "crates/tracedecay-memory-ncm-runtime/src/store/",
+      "crates/tracedecay-memory-ncm-runtime/src/wire/",
+      "crates/tracedecay-memory-ncm-runtime/src/worker/",
+      "crates/tracedecay-memory-ncm-runtime/tests/deletion.rs",
+      "crates/tracedecay-memory-ncm-runtime/tests/engine_transactions.rs",
+      "crates/tracedecay-memory-ncm-runtime/tests/maintenance.rs",
+      "crates/tracedecay-memory-ncm-runtime/tests/real_embeddings.rs",
+      "crates/tracedecay-memory-ncm-runtime/tests/snapshot.rs",
+      "crates/tracedecay-memory-ncm-runtime/tests/store.rs",
+      "crates/tracedecay-memory-ncm-runtime/tests/worker.rs",
+      "crates/tracedecay-memory-provider-ncm/Cargo.toml",
+      "crates/tracedecay-memory-provider-ncm/README.md",
+      "crates/tracedecay-memory-provider-ncm/src/lib.rs",
+      "crates/tracedecay-memory-provider-ncm/src/rust_backend/",
+      "crates/tracedecay-memory-provider-ncm/tests/ncm_adapter.rs",
+      "crates/tracedecay-memory-provider-ncm/tests/rust_backend.rs",
+      "crates/tracedecay-memory-provider-ncm/tests/rust_backend_conformance.rs",
+      "product/architecture/memory-dependency-policy.json",
+      "product/ncm/README.md",
+      "product/ncm/bootstrap/",
+      "product/ncm/conformance/",
+      "product/ncm/evaluation/",
+      "product/ncm/performance/",
+      "product/ncm/plan/",
+      "product/ncm/plan/join/",
+      "product/ncm/receipts/backend/",
+      "product/ncm/receipts/integration/",
+      "product/ncm/reference/NOTICE.md",
+      "product/ncm/reference/deviations.json",
+      "product/ncm/reference/embedding-manifest.json",
+      "product/ncm/reference/oracle/",
+      "product/ncm/reference/source-manifest.json",
+      "product/ncm/spec/",
+      "product/upstream/convergence-map.json",
+      "scripts/product/ncm/benchmark/",
+      "scripts/product/ncm/check-backend.py",
+      "scripts/product/ncm/conformance/",
+      "scripts/product/ncm/evaluate/",
+      "scripts/product/ncm/reference/",
+      "tests/product_memory_dependency_direction_test.py"
+    ],
+    "base_commit": "9e3a0bd5019cc15804c955f9f83d0bac3ecd76d4",
+    "changed_paths": [
+      "product/ncm/bootstrap/ownership.json",
+      "product/ncm/receipts/backend/919b18c141bec364cc70cc2a9525d6e4736009b2.json",
+      "product/ncm/receipts/backend/9e3a0bd5019cc15804c955f9f83d0bac3ecd76d4.json"
+    ],
+    "diff_stat": " product/ncm/bootstrap/ownership.json | 4 ++--\n 1 file changed, 2 insertions(+), 2 deletions(-)",
+    "ownership_manifest": "product/ncm/bootstrap/ownership.json",
+    "product_checkpoint": "25778c7443cd0cfe257da363da01a56ea1d45d3f",
+    "violations": []
+  },
+  "base_commit": "25778c7443cd0cfe257da363da01a56ea1d45d3f",
+  "blockers": [],
+  "branch": "feat/pluggable-memory-providers-v2",
+  "evidence": {
+    "conformance": {
+      "exists": true,
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/product/ncm/conformance/receipt.json",
+      "sha256": "f39255ea6482284546072c620748c738d6509389c835df706fac449a61f3d2e9"
+    },
+    "evaluation": {
+      "exists": true,
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/product/ncm/evaluation/results-2026-09-06.json",
+      "sha256": "96f33ecf15bfd7277fd51472efaef61f832f8272e4f8b5b9423f03bfa53c80e9"
+    },
+    "performance": {
+      "exists": true,
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/product/ncm/performance/results-sathanovo-2-local.json",
+      "sha256": "4236cb6632d3b351d0a382f814ff8c40066e2cfac8d6b371aa6644123aa6d7e1"
+    }
+  },
+  "exact_commands": [
+    [
+      "cargo",
+      "build",
+      "--locked",
+      "-p",
+      "tracedecay-memory-ncm-runtime",
+      "--bin",
+      "tracedecay-ncm-worker"
+    ],
+    [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "tracedecay-memory-ncm-core",
+      "--no-default-features",
+      "--",
+      "--list"
+    ],
+    [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "tracedecay-memory-ncm-core",
+      "--no-default-features"
+    ],
+    [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "tracedecay-memory-ncm-runtime",
+      "--no-default-features",
+      "--",
+      "--list"
+    ],
+    [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "tracedecay-memory-ncm-runtime",
+      "--no-default-features"
+    ],
+    [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "tracedecay-memory-provider-ncm",
+      "--no-default-features",
+      "--features",
+      "rust-backend",
+      "--",
+      "--list"
+    ],
+    [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "tracedecay-memory-provider-ncm",
+      "--no-default-features",
+      "--features",
+      "rust-backend"
+    ],
+    [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "tracedecay-memory-ncm-runtime",
+      "--test",
+      "real_embeddings",
+      "--",
+      "--list"
+    ],
+    [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "tracedecay-memory-ncm-runtime",
+      "--test",
+      "real_embeddings",
+      "--"
+    ],
+    [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "tracedecay-memory-ncm-runtime",
+      "--test",
+      "engine_transactions",
+      "real_encoder_paraphrase_journey_returns_the_matching_record_first",
+      "--",
+      "--list"
+    ],
+    [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "tracedecay-memory-ncm-runtime",
+      "--test",
+      "engine_transactions",
+      "real_encoder_paraphrase_journey_returns_the_matching_record_first",
+      "--",
+      "--exact"
+    ],
+    [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "tracedecay-memory-provider-ncm",
+      "--no-default-features",
+      "--features",
+      "rust-backend",
+      "--test",
+      "rust_backend_conformance",
+      "enabled::real_encoder_process_population",
+      "--",
+      "--list"
+    ],
+    [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "tracedecay-memory-provider-ncm",
+      "--no-default-features",
+      "--features",
+      "rust-backend",
+      "--test",
+      "rust_backend_conformance",
+      "enabled::real_encoder_process_population",
+      "--",
+      "--exact",
+      "--ignored"
+    ]
+  ],
+  "identities": {
+    "algorithm_profile": "ncm-biomem-rs.v1",
+    "model": {
+      "artifact_sha256": "185ae63f47e17a7e8d30d0e6a3cde6a6e4b79bc5b81666ecffc279a6856ca113",
+      "files": [
+        {
+          "bytes": 470268510,
+          "path": "onnx/model.onnx",
+          "sha256": "185ae63f47e17a7e8d30d0e6a3cde6a6e4b79bc5b81666ecffc279a6856ca113"
+        },
+        {
+          "bytes": 17082913,
+          "path": "tokenizer.json",
+          "sha256": "b60b6b43406a48bf3638526314f3d232d97058bc93472ff2de930d43686fa441"
+        },
+        {
+          "bytes": 673,
+          "path": "config.json",
+          "sha256": "05b570bff786faa5c4604152aa16f19f77ed6dfc31e47dd0f3dd987078693ac7"
+        },
+        {
+          "bytes": 280,
+          "path": "special_tokens_map.json",
+          "sha256": "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f"
+        },
+        {
+          "bytes": 496,
+          "path": "tokenizer_config.json",
+          "sha256": "3f5961b9ac86288cccdb97f32fb848d6187c78e1603958c53f3ea1f296b7d8a2"
+        }
+      ],
+      "manifest_sha256": "8177baea44e400c431cd4c179c917ef917487ce40401f026e7abd6d2faaa9346",
+      "model": "paraphrase-multilingual-MiniLM-L12-v2",
+      "revision": "2c4055b12046f11709e9df2c122e59ffbdc2f900",
+      "root": "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/ncm-backend-model-root"
+    },
+    "production": {
+      "algorithm": {
+        "config_sha256": "b621b06c0e79b0d34e65ff592fc0f420ae7f478a3c01db6fb32bff6016b6d8c0",
+        "profile": "ncm-biomem-rs.v1"
+      },
+      "encoder": {
+        "artifact_sha256": "185ae63f47e17a7e8d30d0e6a3cde6a6e4b79bc5b81666ecffc279a6856ca113",
+        "model": "paraphrase-multilingual-MiniLM-L12-v2"
+      },
+      "epoch": 0,
+      "projection_sha256": "bce0d69924a859ec90b76c39af644f91aa1dab90840a26c5bb09202c3643e428",
+      "state_generation": 0,
+      "state_schema": "ncm.sqlite.v1"
+    },
+    "test_double_control": {
+      "algorithm": {
+        "config_sha256": "427a9092319a02ec391e7854709bbd76c32065b03da5e8f01b56a299b4e606d3",
+        "profile": "ncm-biomem-rs.v1"
+      },
+      "encoder": {
+        "artifact_sha256": "test-double/hash-v1",
+        "model": "test-double/hash"
+      },
+      "epoch": 0,
+      "projection_sha256": "bce0d69924a859ec90b76c39af644f91aa1dab90840a26c5bb09202c3643e428",
+      "state_generation": 0,
+      "state_schema": "ncm.sqlite.v1"
+    }
+  },
+  "implementation_summary": "Backend-only gate for production worker identity, non-empty Rust test populations, pinned MiniLM evidence, isolated worker/adapter persistence and deletion, and ownership review.",
+  "journey": {
+    "delete": "absent",
+    "ltm_active_after_consolidate": 1,
+    "path_stripped_of_python": true,
+    "replay": "capability_unsupported",
+    "restart_after_delete": "absent",
+    "restart_recall": "persisted",
+    "restore_revocation": "not_resurrected",
+    "seam_note": "No public STM-mask seam exists at the engine/adapter boundary. The gate requires explicit consolidation, ltm_active > 0 inspection evidence, worker restart, and successful persisted recall.",
+    "state_root": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/target/test-profile/ncm-backend-69406-1788722718901118000",
+    "status": "pass",
+    "stm_exclusion_seam": false
+  },
+  "limitations": [
+    "The engine/adapter exposes no public STM-mask seam; LTM persistence is shown by explicit consolidation, ltm_active inspection, restart, and recall.",
+    "This is standalone backend evidence only; tasks 023-026 still gate host integration, Observer/active behavior, usefulness, packaging, and release."
+  ],
+  "negative_controls": [
+    "Removing fastembed or ONNX Runtime linkage fails required artifact-marker assertions.",
+    "Embedding literal test-double/hash in the production artifact fails backend_artifact_identity_test.",
+    "The same worker launched with --test-double must identify as test-double/hash; production launch must identify as pinned MiniLM.",
+    "An empty Cargo selection fails before a population can pass; ignored real-model coverage is executed explicitly with --ignored.",
+    "The adapter journey runs with PATH containing no Python executable; a PATH-resolved Python substitution cannot start.",
+    "Skipping consolidation makes ltm_active_after_consolidate remain zero.",
+    "Losing durable state makes restart recall miss ownership-record.",
+    "A deletion no-op leaves backend-acceptance-source in recall.",
+    "Enabling v1 replay changes CapabilityUnsupported and fails the replay assertion.",
+    "Ignoring live revocations on restore resurrects the deleted source and fails the final absent assertion."
+  ],
+  "numerical_difference_summary": {
+    "algorithm_corrections": {
+      "D01": {
+        "classification": "expected_difference",
+        "component": "terrain.blur",
+        "not_a_fidelity_failure": true,
+        "status": "corrected"
+      },
+      "D02": {
+        "classification": "reference_compatible",
+        "component": "centers.write sigma",
+        "not_a_fidelity_failure": true,
+        "status": "reference_compatible_documented"
+      },
+      "D03": {
+        "classification": "reference_compatible",
+        "component": "text recall terrain",
+        "not_a_fidelity_failure": true,
+        "status": "reference_compatible_documented"
+      },
+      "D04": {
+        "classification": "expected_difference",
+        "component": "recall dedup",
+        "not_a_fidelity_failure": true,
+        "status": "corrected"
+      },
+      "D05": {
+        "classification": "expected_difference",
+        "component": "read side effects",
+        "not_a_fidelity_failure": true,
+        "status": "corrected"
+      },
+      "D06": {
+        "classification": "expected_difference",
+        "component": "load failure",
+        "not_a_fidelity_failure": true,
+        "status": "corrected"
+      },
+      "D07": {
+        "classification": "expected_difference",
+        "component": "scheduler persistence",
+        "not_a_fidelity_failure": true,
+        "status": "corrected"
+      },
+      "D08": {
+        "classification": "expected_difference",
+        "component": "STM\u2192LTM key alignment",
+        "not_a_fidelity_failure": true,
+        "status": "corrected_pending_alignment_measurement"
+      },
+      "D09": {
+        "classification": "expected_difference",
+        "component": "terrain axis order",
+        "not_a_fidelity_failure": true,
+        "status": "corrected_confirmed_by_executable_oracle"
+      },
+      "D10": {
+        "classification": "expected_difference",
+        "component": "tick schedule",
+        "not_a_fidelity_failure": true,
+        "status": "corrected_schedule_frozen"
+      },
+      "D11": {
+        "classification": "reference_compatible",
+        "component": "namespace",
+        "not_a_fidelity_failure": true,
+        "status": "reference_compatible"
+      },
+      "D12": {
+        "classification": "expected_difference",
+        "component": "centers.merge tensor aliasing",
+        "not_a_fidelity_failure": true,
+        "status": "corrected"
+      },
+      "D13": {
+        "classification": "expected_difference",
+        "component": "top-k tie order",
+        "not_a_fidelity_failure": true,
+        "status": "corrected_tie_policy"
+      }
+    },
+    "deviations": [
+      {
+        "component": "terrain.blur",
+        "id": "D01",
+        "status": "corrected"
+      },
+      {
+        "component": "centers.write sigma",
+        "id": "D02",
+        "status": "reference_compatible_documented"
+      },
+      {
+        "component": "text recall terrain",
+        "id": "D03",
+        "status": "reference_compatible_documented"
+      },
+      {
+        "component": "recall dedup",
+        "id": "D04",
+        "status": "corrected"
+      },
+      {
+        "component": "read side effects",
+        "id": "D05",
+        "status": "corrected"
+      },
+      {
+        "component": "load failure",
+        "id": "D06",
+        "status": "corrected"
+      },
+      {
+        "component": "scheduler persistence",
+        "id": "D07",
+        "status": "corrected"
+      },
+      {
+        "component": "STM\u2192LTM key alignment",
+        "id": "D08",
+        "status": "corrected_pending_alignment_measurement"
+      },
+      {
+        "component": "terrain axis order",
+        "id": "D09",
+        "status": "corrected_confirmed_by_executable_oracle"
+      },
+      {
+        "component": "tick schedule",
+        "id": "D10",
+        "status": "corrected_schedule_frozen"
+      },
+      {
+        "component": "namespace",
+        "id": "D11",
+        "status": "reference_compatible"
+      },
+      {
+        "component": "centers.merge tensor aliasing",
+        "id": "D12",
+        "status": "corrected"
+      },
+      {
+        "component": "top-k tie order",
+        "id": "D13",
+        "status": "corrected_tie_policy"
+      }
+    ],
+    "evaluation_acceptance": {
+      "corrupt_rejected_with_reason": true,
+      "cross_scope_rejected_with_reason": true,
+      "deleted_rejected_with_reason": true,
+      "four_result_blocks_separate": true,
+      "improved_agent_outcomes_claimed": false,
+      "real_encoder_ltm_only_without_fallback": true,
+      "stale_rejected_with_reason": true
+    },
+    "kernel_fidelity": {
+      "full_capacity_interference": {
+        "attempts": 417,
+        "biomem_active_after_matched_inputs": 416,
+        "fill_terminal": "budget_exceeded",
+        "overflow_outcome": "not_run",
+        "passed": false,
+        "stm_active": 416,
+        "stm_active_after": 416,
+        "visible_failure": "storage budget prevented reaching configured STM capacity"
+      },
+      "paraphrase_recall": {
+        "biomem_top_value": "A successful reply is emitted only after COMMIT; transport loss may be effect-unknown.",
+        "passed": true,
+        "rust_top_record": 1
+      },
+      "passed": false,
+      "real_text_store_recall": {
+        "biomem_top_value": "A successful reply is emitted only after COMMIT; transport loss may be effect-unknown.",
+        "passed": true,
+        "projected_stm_key": {
+          "atol": 0.0005,
+          "max_abs_error": 1.0090693664532857e-06,
+          "passed": true,
+          "rtol": 0.0005
+        },
+        "projection_seed": 16679234583690838207,
+        "raw_activation": {
+          "abs_error": 1.0810977911501762e-07,
+          "biomem_matched_kernel": 0.11754616730100607,
+          "rust": 0.11754605919122696,
+          "tolerance": 0.005
+        },
+        "rust_record_id": 1,
+        "rust_top_value": "A successful reply is emitted only after COMMIT; transport loss may be effect-unknown."
+      }
+    },
+    "oracle_fixture_sha256": {
+      "compound_read.json": "31993651f92db2567db3d6784db8a094182f513c00fdac23f155c322e828f4fa",
+      "consolidation.json": "7d9c65343e8358dab6f6c9169a79841e1b2049ef1acd77b0cb06dfb1d2291bdf",
+      "merge_prune_normalize.json": "eb25d378e3f9dce3d92acfc1a37433d9ef40cc9bf2f32740c7575d7e2386af6e",
+      "projections.json": "121c28552a1dfa1790ab5f6804d774e6de6bdb171f44c76cbbee9d2ba718a81b",
+      "rbf_read.json": "44a44ea07133bc022285a78f856edada962b70b72e04220a2a46be71bd8b29a0",
+      "real_embeddings.json": "5c88a7fe9b4e2fb775d4e732f04cb5a3392ed4d399d1ce5b064733489628b762",
+      "terrain.json": "a2316283fd34ff497202c5b77c1b415672ebdb866f216c3269177300612ad055",
+      "trace_long.json": "171be9a3a356454e8e8060afe3dbffd98268b1aae564ccf8c9e2c00e4255cc9c",
+      "write.json": "8dae2b52e1790d4c9a294b14853c112a4f1b0d80a328786b23cb30d51c6bc4a6",
+      "write_strength.json": "d1f54ea45ca85435b5bff4daa1f9e3f7d226411600babe49a303de669dbf9094"
+    },
+    "reference_commit": "500847ff65b5d9548b3826fa29bf3ccf8d221147"
+  },
+  "reviewer_verdict": "pass",
+  "schema_version": 1,
+  "source_commit": "9e3a0bd5019cc15804c955f9f83d0bac3ecd76d4",
+  "source_tree": "04dcfa3ef849d0d56a5846196f26c8524d25fdd8",
+  "status": "pass",
+  "task_id": "ncm-rs-022",
+  "test_populations": [
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "tracedecay-memory-ncm-core",
+        "--no-default-features"
+      ],
+      "counts": {
+        "failed": 0,
+        "ignored": 0,
+        "passed": 85
+      },
+      "list_command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "tracedecay-memory-ncm-core",
+        "--no-default-features",
+        "--",
+        "--list"
+      ],
+      "name": "core_no_default",
+      "selected_test_ids": [
+        "advance_bound_rejects_without_mutation",
+        "affect_presets_dictionaries_and_keywords_match_executable_oracle",
+        "asymmetric_splat_and_sample_enforce_xyz_axis_order",
+        "canonical_ltm_transfer_survives_an_empty_stm_layer",
+        "capacity_exhaustion_leaves_state_byte_identical",
+        "compound_context_and_terrain_perturb_selection_and_none_is_zero",
+        "compound_oracle_matches_components_selection_and_readouts",
+        "consolidation_pours_a_real_blur_and_applies_fatigue_relief",
+        "construction_bounds_resolution_and_stability",
+        "d02_write_candidates_use_sigma_read_not_sigma_write",
+        "deleted_records_are_never_returned",
+        "deterministic_constructor_produces_unit_keys_and_zero_strength_is_ignored",
+        "digest_is_streaming_stable_hex_and_sensitive_to_bytes",
+        "direct_ltm_and_u_stm_projections_are_not_aligned",
+        "dot_cosine_and_squared_distance_are_checked_and_clamped",
+        "empty_and_singleton_reads_expose_relevance_not_certainty",
+        "every_updated_center_tracks_bounded_recency_support_and_reports_truncation",
+        "exact_fatigue_threshold_crossing_is_strict",
+        "exact_ties_resolve_by_ascending_center_index",
+        "executable_write_fixture_matches_created_reinforced_ignored_and_full_capacity",
+        "explicit_homeostasis_matches_closed_forms_through_one_thousand_ticks",
+        "explicit_record_path_reinforces_only_matching_center",
+        "fabricated_or_unknown_citation_fails_closed",
+        "failed_capacity_transfer_does_not_publish_partial_kernel_state",
+        "fatigue_uses_input_intensity_and_observe_tick_advances_once",
+        "fixture_corrected_blur_matches_and_reference_noop_differs",
+        "fixture_splat_and_corrected_sampling_match",
+        "fixture_step_and_corrected_sample_grid_match",
+        "generated_bundle_is_deterministic_and_has_the_frozen_shapes",
+        "generated_forward_outputs_have_expected_ranges_and_dimensions",
+        "generated_orthogonal_families_are_orthonormal",
+        "homeostasis_remains_finite_nonnegative_and_moves_toward_neutral",
+        "intensity_changes_normalized_weights_but_not_raw_rbf",
+        "intensity_rate_swap_mutant_is_discriminated",
+        "keyword_policy_characterizes_substring_repetition_and_negation_limits",
+        "malformed_and_nonfinite_inputs_fail_before_mutation",
+        "malformed_inputs_return_typed_errors_without_forward_state",
+        "malformed_matrices_fail_before_a_bundle_is_constructed",
+        "malformed_or_nonfinite_affect_and_signal_inputs_are_rejected",
+        "merge_refuses_conflicting_valid_assertions",
+        "merge_support_unions_both_sides_without_dropping_ids",
+        "merge_uses_corrected_blur_fixture_not_reference_clone",
+        "merge_uses_premerge_intensities_and_preserves_support_closure",
+        "metadata_moves_only_to_argmax_while_numeric_updates_reach_top_k",
+        "minkowski_half_matches_the_non_metric_reference_formula",
+        "neutral_explicit_vectors_and_exact_dictionary_spellings_are_preserved",
+        "normalize_zero_and_small_vectors_use_the_torch_floor",
+        "novelty_is_one_when_empty_and_one_minus_top_raw_rbf_when_populated",
+        "observe_advances_exactly_one_tick_and_reports_layer_effects",
+        "one_hundred_recalls_leave_center_digests_unchanged",
+        "operation_bounds_reject_more_than_sixteen_centers_or_candidates",
+        "over_budget_advance_fails_before_mutation",
+        "oversize_record_is_rejected_before_identity_or_storage_changes",
+        "projected_record_retains_the_direct_ltm_basis_key",
+        "projection_oracle_matches_all_forward_families",
+        "prune_uses_the_point_zero_one_one_floor_and_retains_records",
+        "rbf_oracle_matches_empty_five_boundary_distant_and_intensity_cases",
+        "rbf_uses_the_reference_sigma_denominator",
+        "read_only_recall_changes_neither_centers_nor_scheduler",
+        "real_blur_spreads_impulse_preserves_interior_mass_and_constants",
+        "recall_budget_truncates_candidate_prefix_without_truncating_text",
+        "recall_is_digest_stable",
+        "repeated_reads_leave_serialized_state_unchanged",
+        "rng_seed_splitmix_and_gaussian_sequences_are_reproducible",
+        "same_key_distinct_sources_remain_visible_and_correction_keeps_lineage",
+        "sample_covers_corners_faces_fractional_points_and_border_clamp",
+        "scalar_helpers_match_f32_math_and_reject_invalid_inputs",
+        "scheduler_serde_preserves_persisted_fields",
+        "serde_round_trip_preserves_the_digest",
+        "serialize_round_trip_preserves_matrices_and_identity",
+        "sleep_requires_strict_threshold_and_interval_boundary",
+        "slot_reuse_increments_incarnation_and_rejects_stale_handle",
+        "slot_reuse_makes_old_support_stale_and_old_record_absent",
+        "splat_validation_is_atomic_and_reset_restores_neutral_fields",
+        "split_advance_is_bit_for_bit_equivalent",
+        "stable_softmax_and_log_space_softmax_keep_reference_epsilons",
+        "step_is_double_buffered_against_the_old_generation",
+        "step_uses_replicate_boundaries_and_constant_laplacian_is_zero",
+        "top_k_is_deterministic_for_largest_and_smallest_ties",
+        "transfer_selection_uses_descending_intensity_and_ascending_ties",
+        "twenty_observations_consolidate_and_recall_from_ltm_only",
+        "unrelated_singleton_is_empty_not_softmax_confident_or_unavailable",
+        "validation_rejects_nonfinite_values_and_dimension_mismatches",
+        "write_strength_matches_all_executable_oracle_closed_form_cases",
+        "zero_external_intensity_forces_zero_write_strength"
+      ],
+      "status": "pass"
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "tracedecay-memory-ncm-runtime",
+        "--no-default-features"
+      ],
+      "counts": {
+        "failed": 0,
+        "ignored": 0,
+        "passed": 54
+      },
+      "list_command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "tracedecay-memory-ncm-runtime",
+        "--no-default-features",
+        "--",
+        "--list"
+      ],
+      "name": "runtime_no_default",
+      "selected_test_ids": [
+        "advance_over_the_frozen_bound_has_no_effect",
+        "bounded_mailbox_returns_busy_under_concurrent_backpressure",
+        "catalog_bound_rejects_the_thirty_third_namespace",
+        "checkpoint_failure_rolls_back_the_entire_maintenance_transaction",
+        "checkpoint_prune_keeps_newer_state",
+        "client_drop_reaps_worker_and_stdin_eof_exits_zero",
+        "commit_then_reopen_replays_exact_event_sequences_after_checkpoint",
+        "compact_preserves_the_privacy_reserve_unless_explicitly_authorized",
+        "corrupt_garbage_truncated_and_missing_table_fail_closed",
+        "crash_after_commit_before_publish_recovers_exactly_one_effect",
+        "crash_before_commit_rolls_back_and_reopen_matches_prior_state",
+        "create_open_round_trip_and_identity_match",
+        "deadline_kills_mutating_worker_and_next_call_respawns",
+        "deleting_an_unknown_source_is_successful_and_idempotent",
+        "deletion_rebuilds_mixed_state_and_physically_removes_source_text",
+        "disabled_provider_never_launches_and_spawn_failures_exhaust_budget",
+        "dropped_mutation_rolls_back_and_commit_survives_reopen",
+        "duplicate_delivery_replays_receipt_and_changes_nothing",
+        "engine_export_delegates_and_envelope_omits_revocation_authority",
+        "every_maintenance_kind_is_measured_bounded_and_idempotent",
+        "expired_deadline_before_encode_has_no_effect_or_namespace",
+        "explicit_create_refuses_an_existing_namespace",
+        "export_wipe_restore_round_trip_survives_restart_and_next_mutation",
+        "failed_embed_produces_no_receipt_event_or_capsule",
+        "feedback_correction_and_checkpoint_are_idempotent_and_recoverable",
+        "file_transport_exports_atomically_and_restore_consumes_the_file",
+        "full_pipe_backpressure_is_hard_cancelled_without_orphan",
+        "handshake_observe_and_recall_round_trip",
+        "idempotency_lookup_and_conflict_are_durable",
+        "identity_mismatch_is_incompatible_and_restore_is_idempotent",
+        "incompatible_identity_fields_fail_closed",
+        "interrupted_deletion_resumes_before_serving_and_bumps_epoch_once",
+        "loss_after_publication_replays_without_a_second_effect",
+        "malformed_json_gets_typed_error_and_next_request_works",
+        "malformed_worker_reply_is_detected_and_process_is_reaped",
+        "missing_open_does_not_create_namespace_directory",
+        "namespace_escape_and_uppercase_names_are_rejected_without_side_effects",
+        "observe_killed_after_commit_reconciles_without_second_record",
+        "observe_then_recall_returns_supported_text_and_changes_state",
+        "old_snapshot_cannot_resurrect_a_source_deleted_after_export",
+        "oversized_header_is_rejected_before_body_allocation_and_worker_continues",
+        "process_death_is_detected_then_lazily_restarted",
+        "protocol_and_handshake_identity_mismatches_fail_closed",
+        "quota_fill_has_no_partial_write_and_privacy_uses_reserve",
+        "recall_never_changes_commit_sequence_or_state_digest",
+        "recovery_digest_mismatch_fails_closed",
+        "resident_namespace_lru_is_bounded_to_four",
+        "restore_refuses_a_durably_fenced_namespace",
+        "same_key_with_different_payload_is_rejected",
+        "second_writer_is_busy",
+        "snapshot_file_transport_crosses_bounded_frames_and_cleans_files",
+        "status_fence_metadata_and_revocation_round_trip",
+        "tampering_is_rejected_without_changing_live_state",
+        "usage_reports_payload_components_and_wal"
+      ],
+      "status": "pass"
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "tracedecay-memory-provider-ncm",
+        "--no-default-features",
+        "--features",
+        "rust-backend"
+      ],
+      "counts": {
+        "failed": 0,
+        "ignored": 1,
+        "passed": 80
+      },
+      "list_command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "tracedecay-memory-provider-ncm",
+        "--no-default-features",
+        "--features",
+        "rust-backend",
+        "--",
+        "--list"
+      ],
+      "name": "adapter_rust_backend",
+      "selected_test_ids": [
+        "advertised_unknown_capability_never_satisfies_admission",
+        "cancellation_after_read_dispatch_prevents_success_publication",
+        "cancelled_request_never_reaches_surface",
+        "canonical_response_envelope_accepts_exact_limit_and_rejects_one_byte_over",
+        "committed_effect_metadata_cannot_leak_public_scope_or_opaque_aliases",
+        "constructor_rejects_a_non_ncm_surface",
+        "corrupt_payload_digest_is_rejected",
+        "corrupt_request_payload_never_reaches_surface",
+        "descriptor_identity_change_never_reaches_surface",
+        "empty_health_idempotency_key_never_panics_or_reaches_surface",
+        "empty_recall_idempotency_key_never_panics_or_reaches_surface",
+        "enabled::adapter_rejects_raw_project_identity_in_surface_reply",
+        "enabled::all_supported_operations_and_stale_snapshot_deletion_are_non_resurrecting",
+        "enabled::cancelled_calls_never_return_success_and_committed_observe_reconciles_once",
+        "enabled::corrupted_namespace_file_fails_closed_after_process_restart",
+        "enabled::deadline_after_commit_returns_effect_unknown_then_retry_replays",
+        "enabled::descriptor_and_handshake_expose_reserved_identity_and_exact_capabilities",
+        "enabled::every_supported_operation_rejects_all_wrong_scope_dimensions",
+        "enabled::feedback_correction_maintenance_inspection_and_delete_use_durable_state",
+        "enabled::mandatory_conformance_definition_runs_on_real_adapter",
+        "enabled::mutation_generation_requires_rehandshake_and_duplicate_replays_receipt",
+        "enabled::real_encoder_process_population",
+        "enabled::real_worker_mailbox_and_namespace_catalog_saturate_without_hanging",
+        "enabled::same_conformance_harness_rejects_foreign_scope_faulty_provider",
+        "enabled::snapshot_export_and_restore_replace_later_state",
+        "enabled::stale_generation_replay_conflict_and_contradictory_contracts_are_fail_closed",
+        "handshake_exposes_only_namespace_to_surface_and_reattaches_scope",
+        "handshake_only_accepts_exact_success_for_readiness",
+        "handshake_surface_contract_mismatch_is_fail_closed",
+        "invalid_replacement_handshakes_preserve_prior_readiness_without_contact",
+        "invoke_before_handshake_never_reaches_surface",
+        "invoke_rejects_handshake_operation",
+        "malformed_handshake_challenge_is_rejected",
+        "malformed_mutating_reply_reports_unknown_effect",
+        "malformed_mutation_extension_is_replaced_by_a_dispatch_witness",
+        "malformed_read_reply_becomes_contract_violation",
+        "malformed_read_reply_cannot_publish_untrusted_state_generation",
+        "malformed_replacement_handshake_revokes_prior_readiness",
+        "malformed_unknown_effect_reply_is_replaced_by_a_dispatch_witness",
+        "mandatory_operation_uses_opaque_ids_and_scope_safe_payload",
+        "mutation_dispatch_retires_the_accepted_ready_receipt",
+        "namespace_is_deterministic_and_opaque",
+        "namespace_isolates_worktree_branch_and_session",
+        "negotiated_concurrency_limit_is_nonblocking_and_raii_released",
+        "negotiated_host_response_limit_rejects_oversized_surface_payload",
+        "negotiated_operation_budget_caps_handshake_and_invoke_surface_controls",
+        "observation_total_extension_cap_is_enforced_before_dispatch",
+        "optional_extensions_round_trip_exactly",
+        "oversized_handshake_response_is_rejected_without_installing_readiness",
+        "post_construction_invalid_descriptor_never_reaches_handshake_surface",
+        "post_construction_invalid_descriptor_never_reaches_invoke_surface",
+        "post_construction_invalid_exact_scope_never_reaches_invoke_surface",
+        "post_construction_invalid_host_limits_never_reach_handshake_surface",
+        "projected_surface_handshake_accepts_exact_limit_and_rejects_one_byte_over",
+        "projected_surface_request_accepts_exact_limit_and_rejects_one_byte_over",
+        "provider_receipt_cannot_leak_public_scope_or_opaque_aliases",
+        "public_ready_receipt_binds_accepted_state_generation",
+        "public_scope_digest_and_ready_receipt_never_reach_surface_payload",
+        "raw_scope_outside_exact_scope_subtree_never_reaches_surface",
+        "replacement_handshake_linearizes_before_old_receipt_invoke",
+        "response_limit_counts_payload_extensions_and_warning_bytes_together",
+        "scope_and_registration_mismatches_never_reach_surface",
+        "snapshot_restore_request_is_measured_against_snapshot_bytes",
+        "state_generation_cannot_move_backward",
+        "structured_terminal_api_prevents_a_read_reply_from_claiming_a_committed_effect",
+        "successful_replacement_uses_a_new_public_epoch_receipt",
+        "surface_capture_contains_no_public_ids_scope_or_extension_bytes",
+        "surface_duplicate_acknowledgement_is_rebound_to_the_hosts_own_idempotency_key",
+        "surface_payload_identity_never_leaks_back_to_public_reply",
+        "surface_returned_extension_is_a_contract_violation",
+        "surface_terminal_using_public_operation_id_is_rejected",
+        "terminal_diagnostic_cannot_leak_public_scope_or_opaque_aliases",
+        "undeclared_additional_required_capability_never_reaches_surface",
+        "undeclared_optional_capability_never_reaches_surface",
+        "unknown_required_extension_never_reaches_surface",
+        "verification_digest_cannot_leak_public_scope_or_opaque_aliases",
+        "warning_overflow_is_rejected",
+        "warnings_cannot_leak_public_scope_or_opaque_aliases",
+        "wrong_contract_and_non_object_payloads_never_reach_surface",
+        "wrong_ready_receipt_never_reaches_surface",
+        "wrong_target_never_reaches_surface"
+      ],
+      "status": "pass"
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "tracedecay-memory-ncm-runtime",
+        "--test",
+        "real_embeddings"
+      ],
+      "counts": {
+        "failed": 0,
+        "ignored": 0,
+        "passed": 4
+      },
+      "list_command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "tracedecay-memory-ncm-runtime",
+        "--test",
+        "real_embeddings",
+        "--",
+        "--list"
+      ],
+      "name": "real_embeddings",
+      "selected_test_ids": [
+        "empty_root_is_missing_without_download_or_filesystem_mutation",
+        "hash_encoder_is_rejected_by_real_model_identity_gate",
+        "keyword_affect_heuristic_matches_the_versioned_reference_signal",
+        "real_encoder_install_open_and_fixture_behavior"
+      ],
+      "status": "pass"
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "tracedecay-memory-ncm-runtime",
+        "--test",
+        "engine_transactions",
+        "real_encoder_paraphrase_journey_returns_the_matching_record_first",
+        "--",
+        "--exact"
+      ],
+      "counts": {
+        "failed": 0,
+        "ignored": 0,
+        "passed": 1
+      },
+      "list_command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "tracedecay-memory-ncm-runtime",
+        "--test",
+        "engine_transactions",
+        "real_encoder_paraphrase_journey_returns_the_matching_record_first",
+        "--",
+        "--list"
+      ],
+      "name": "isolated_text_journey",
+      "selected_test_ids": [
+        "real_encoder_paraphrase_journey_returns_the_matching_record_first"
+      ],
+      "status": "pass"
+    },
+    {
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "tracedecay-memory-provider-ncm",
+        "--no-default-features",
+        "--features",
+        "rust-backend",
+        "--test",
+        "rust_backend_conformance",
+        "enabled::real_encoder_process_population",
+        "--",
+        "--exact",
+        "--ignored"
+      ],
+      "counts": {
+        "failed": 0,
+        "ignored": 0,
+        "passed": 1
+      },
+      "list_command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "tracedecay-memory-provider-ncm",
+        "--no-default-features",
+        "--features",
+        "rust-backend",
+        "--test",
+        "rust_backend_conformance",
+        "enabled::real_encoder_process_population",
+        "--",
+        "--list"
+      ],
+      "name": "adapter_real_encoder_population",
+      "selected_test_ids": [
+        "enabled::real_encoder_process_population"
+      ],
+      "status": "pass"
+    }
+  ],
+  "worker_artifact": {
+    "bytes": 38624824,
+    "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/target/ncm-backend-production/debug/tracedecay-ncm-worker",
+    "required_markers": {
+      "fastembed": true,
+      "onnxruntime": true
+    },
+    "sha256": "94b268c12f44c4cbe65eb857ec4fc66e9cf08ea2930c5b5d0a343cee82fa67fa"
+  }
+}

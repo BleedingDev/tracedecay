@@ -261,6 +261,10 @@ impl SessionTemporalQuery {
         &self.query
     }
 
+    pub fn direct_anchor(&self) -> Option<&RetrievalAnchorId> {
+        self.direct_anchor.as_ref()
+    }
+
     pub fn compatibility_filter_digest(&self) -> Option<&str> {
         self.compatibility_filter_digest.as_deref()
     }

@@ -1,0 +1,1779 @@
+{
+  "generated_at": "2026-09-10T09:03:47.924456+00:00",
+  "graph_id": "pluggable-memory-compat-v1",
+  "plan_set_hash": "5dafec1b89",
+  "selection_hash": "34a08b0497",
+  "plan_count": 36,
+  "edge_count": 55,
+  "plans_root": ".codex/plans",
+  "selected_globs": [
+    "pm-*.plan.md"
+  ],
+  "selected_plan_paths": [
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-admission.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-comparison-connect.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-comparison-harness.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-conformance-factories.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-conformance-native.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-conformance-ncm.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-conformance.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-context-policy.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-contract.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-dependency-checks.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-eval-protocol.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-heldout-a.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-heldout-b.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-heldout-c.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-history.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-host-audit.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-host-journeys.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-host-mount.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-host-recall.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-integrate.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-live-origin.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-measure.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-measurement-capture.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-native-audit.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-native-integrity.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-native.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-ncm-audit.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-ncm-cancel.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-ncm-delete-guard.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-ncm-portability.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-ncm-restore-identity.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-ncm.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-operations.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-provider-control-contract.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-provider-control-routing.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-registration.plan.md"
+  ],
+  "edges": [
+    {
+      "source": "pm-native-audit",
+      "target": "pm-contract"
+    },
+    {
+      "source": "pm-ncm-audit",
+      "target": "pm-contract"
+    },
+    {
+      "source": "pm-host-audit",
+      "target": "pm-contract"
+    },
+    {
+      "source": "pm-contract",
+      "target": "pm-native"
+    },
+    {
+      "source": "pm-contract",
+      "target": "pm-admission"
+    },
+    {
+      "source": "pm-contract",
+      "target": "pm-dependency-checks"
+    },
+    {
+      "source": "pm-dependency-checks",
+      "target": "pm-integrate"
+    },
+    {
+      "source": "pm-admission",
+      "target": "pm-host-recall"
+    },
+    {
+      "source": "pm-contract",
+      "target": "pm-ncm"
+    },
+    {
+      "source": "pm-contract",
+      "target": "pm-ncm-portability"
+    },
+    {
+      "source": "pm-ncm-restore-identity",
+      "target": "pm-ncm-portability"
+    },
+    {
+      "source": "pm-ncm-portability",
+      "target": "pm-host-recall"
+    },
+    {
+      "source": "pm-contract",
+      "target": "pm-registration"
+    },
+    {
+      "source": "pm-contract",
+      "target": "pm-history"
+    },
+    {
+      "source": "pm-contract",
+      "target": "pm-live-origin"
+    },
+    {
+      "source": "pm-live-origin",
+      "target": "pm-host-recall"
+    },
+    {
+      "source": "pm-contract",
+      "target": "pm-conformance"
+    },
+    {
+      "source": "pm-contract",
+      "target": "pm-comparison-harness"
+    },
+    {
+      "source": "pm-eval-protocol",
+      "target": "pm-comparison-harness"
+    },
+    {
+      "source": "pm-conformance",
+      "target": "pm-comparison-harness"
+    },
+    {
+      "source": "pm-native",
+      "target": "pm-host-recall"
+    },
+    {
+      "source": "pm-ncm",
+      "target": "pm-host-recall"
+    },
+    {
+      "source": "pm-registration",
+      "target": "pm-host-recall"
+    },
+    {
+      "source": "pm-registration",
+      "target": "pm-host-mount"
+    },
+    {
+      "source": "pm-host-mount",
+      "target": "pm-host-recall"
+    },
+    {
+      "source": "pm-contract",
+      "target": "pm-context-policy"
+    },
+    {
+      "source": "pm-context-policy",
+      "target": "pm-host-recall"
+    },
+    {
+      "source": "pm-contract",
+      "target": "pm-provider-control-contract"
+    },
+    {
+      "source": "pm-registration",
+      "target": "pm-provider-control-routing"
+    },
+    {
+      "source": "pm-provider-control-contract",
+      "target": "pm-host-recall"
+    },
+    {
+      "source": "pm-provider-control-routing",
+      "target": "pm-host-recall"
+    },
+    {
+      "source": "pm-history",
+      "target": "pm-host-recall"
+    },
+    {
+      "source": "pm-host-recall",
+      "target": "pm-host-journeys"
+    },
+    {
+      "source": "pm-conformance",
+      "target": "pm-host-journeys"
+    },
+    {
+      "source": "pm-host-recall",
+      "target": "pm-operations"
+    },
+    {
+      "source": "pm-host-journeys",
+      "target": "pm-comparison-connect"
+    },
+    {
+      "source": "pm-comparison-harness",
+      "target": "pm-comparison-connect"
+    },
+    {
+      "source": "pm-comparison-connect",
+      "target": "pm-measure"
+    },
+    {
+      "source": "pm-measure",
+      "target": "pm-integrate"
+    },
+    {
+      "source": "pm-operations",
+      "target": "pm-integrate"
+    },
+    {
+      "source": "pm-ncm-cancel",
+      "target": "pm-ncm"
+    },
+    {
+      "source": "pm-ncm-delete-guard",
+      "target": "pm-ncm"
+    },
+    {
+      "source": "pm-native-integrity",
+      "target": "pm-native"
+    },
+    {
+      "source": "pm-ncm-restore-identity",
+      "target": "pm-ncm"
+    },
+    {
+      "source": "pm-heldout-a",
+      "target": "pm-comparison-harness"
+    },
+    {
+      "source": "pm-heldout-b",
+      "target": "pm-comparison-harness"
+    },
+    {
+      "source": "pm-heldout-c",
+      "target": "pm-comparison-harness"
+    },
+    {
+      "source": "pm-measurement-capture",
+      "target": "pm-comparison-harness"
+    },
+    {
+      "source": "pm-conformance",
+      "target": "pm-conformance-factories"
+    },
+    {
+      "source": "pm-conformance-factories",
+      "target": "pm-conformance-native"
+    },
+    {
+      "source": "pm-native",
+      "target": "pm-conformance-native"
+    },
+    {
+      "source": "pm-conformance-factories",
+      "target": "pm-conformance-ncm"
+    },
+    {
+      "source": "pm-ncm",
+      "target": "pm-conformance-ncm"
+    },
+    {
+      "source": "pm-conformance-native",
+      "target": "pm-measure"
+    },
+    {
+      "source": "pm-conformance-ncm",
+      "target": "pm-measure"
+    }
+  ],
+  "plans": [
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-admission.plan.md",
+      "slug": "pm-admission",
+      "name": "pm-admission",
+      "overview": "Align existing host recall admission with the frozen common temporal and source-attribution contract while provider implementations proceed independently.",
+      "todos": [
+        {
+          "id": "align-canonical-temporal-and-source-admission",
+          "content": "Implement root-approved requested-time lifecycle admission, explicit-null source revision handling and structurally validated original source DTOs without changing scope or granting provider claims authority.",
+          "status": "in_progress",
+          "ordinal": 1
+        },
+        {
+          "id": "verify-common-admission-vectors",
+          "content": "Verify all temporal modes, mixed known/unknown validity, strict candidate claims, legacy decoding, source metadata and original-source structural invariants with focused registry tests.",
+          "status": "pending",
+          "ordinal": 2
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-comparison-connect.plan.md",
+      "slug": "pm-comparison-connect",
+      "name": "pm-comparison-connect",
+      "overview": "Connect the prepared comparison runner to the verified real host journey seam and prove actual selection, delivered content, restart and measurement attribution before comparative runs.",
+      "todos": [
+        {
+          "id": "bind-real-host-comparison",
+          "content": "Bind the prepared runner to the reusable Claude/Codex host controls and both independently selected real providers, preserving identical canonical inputs and actual delivered output.",
+          "status": "pending",
+          "ordinal": 1
+        },
+        {
+          "id": "prove-comparison-host-boundary",
+          "content": "Run one bounded positive and negative smoke per host/provider proving nonempty admitted source, real process restart, exact tokenizer counts and correct provider/control attribution without opening held-out results.",
+          "status": "pending",
+          "ordinal": 2
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-comparison-harness.plan.md",
+      "slug": "pm-comparison-harness",
+      "name": "pm-comparison-harness",
+      "overview": "Prepare the provider-neutral comparison runner, metric joins and measurement capture behind the shared host execution interface while production host integration proceeds.",
+      "todos": [
+        {
+          "id": "prepare-host-comparison-runner",
+          "content": "Implement the shared scenario-action and delivered-context interface for Native, real NCM, no-memory and documentation with identical inputs and existing metric joins, ready for the actual host fixture connection.",
+          "status": "completed",
+          "ordinal": 1
+        },
+        {
+          "id": "capture-cost-and-resource-boundaries",
+          "content": "Record cold and warm phase timings, p50/p95/p99 populations, exact tokenizer counts, source admission, incremental RSS, worker counts, queue pressure, disk and cancellation completion.",
+          "status": "completed",
+          "ordinal": 2
+        },
+        {
+          "id": "verify-comparison-integrity",
+          "content": "Test mismatched inputs, missing or censored samples, provider substitution, vacuous safety, unmeasured labels and phase attribution so the runner cannot report a false win.",
+          "status": "completed",
+          "ordinal": 3
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-conformance-factories.plan.md",
+      "slug": "pm-conformance-factories",
+      "name": "pm-conformance-factories",
+      "overview": "Supply shared real-adapter fixture authority and lossless test transport without reconstructing provider replies from host context.",
+      "todos": [
+        {
+          "id": "shared-real-fixture-support",
+          "content": "Implement bounded provider-neutral fixture authority and typed subprocess DTO support; correct foreign-scope isolation to accept actual effect-free ScopeMismatch alongside an empty successful recall.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-conformance-native.plan.md",
+      "slug": "pm-conformance-native",
+      "name": "pm-conformance-native",
+      "overview": "Run the common compatibility program against real Native storage across actual process lifetimes.",
+      "todos": [
+        {
+          "id": "real-native-common-factory",
+          "content": "Build the concrete Native factory and actual test-child lifecycle, then require the common report to be compatible with no unresolved evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-conformance-ncm.plan.md",
+      "slug": "pm-conformance-ncm",
+      "name": "pm-conformance-ncm",
+      "overview": "Run the same common compatibility program against the production NCM worker and real model.",
+      "todos": [
+        {
+          "id": "real-ncm-common-factory",
+          "content": "Build the concrete NCM factory with actual worker lifecycle and physical legacy/corruption evidence, then require common compatibility without unresolved evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-conformance.plan.md",
+      "slug": "pm-conformance",
+      "name": "pm-conformance",
+      "overview": "Create one discriminating provider compatibility suite whose assertions are identical for Native and NCM and cannot pass through empty or unsupported results.",
+      "todos": [
+        {
+          "id": "common-profile-fixtures",
+          "content": "Extend the existing conformance runner with complete common-profile request, temporal, provenance, source lifecycle, replay and effect-accounting fixtures.",
+          "status": "completed",
+          "ordinal": 1
+        },
+        {
+          "id": "adversarial-profile-controls",
+          "content": "Add mutation and negative controls for dropped exclusions or time, forged origin, unsupported required operations, successful no-ops, scope leaks and deleted-source resurrection.",
+          "status": "completed",
+          "ordinal": 2
+        },
+        {
+          "id": "provider-agnostic-runner-output",
+          "content": "Expose one reusable invocation/report contract for real Native and real NCM adapters, preserving nondeterministic timing separately and counting unresolved assertions explicitly.",
+          "status": "completed",
+          "ordinal": 3
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-context-policy.plan.md",
+      "slug": "pm-context-policy",
+      "name": "pm-context-policy",
+      "overview": "Preserve explicit context time/exclusions and typed canonical fact contribution before the shared advisory merge.",
+      "todos": [
+        {
+          "id": "context-policy-and-canonical-contribution",
+          "content": "Carry validated temporal/exclusion inputs through the public context contract and preserve canonical owner/fact/revision identities with explicit current-only temporal coverage in the existing tool result.",
+          "status": "in_progress",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-contract.plan.md",
+      "slug": "pm-contract",
+      "name": "pm-contract",
+      "overview": "Turn the audited gaps into one versioned common memory profile and shared data contracts that both adapters and host wiring can implement independently.",
+      "todos": [
+        {
+          "id": "settle-common-memory-semantics",
+          "content": "Resolve the audit matrices into the common capability profile, authority and temporal rules, neutral source/candidate attribution, provider-local feedback semantics and compatibility migration decisions.",
+          "status": "completed",
+          "ordinal": 1
+        },
+        {
+          "id": "implement-shared-contract-seams",
+          "content": "Add the minimum shared typed request, response and history-authorization contracts and registration metadata needed by both implementations while preserving existing caller/data compatibility.",
+          "status": "completed",
+          "ordinal": 2
+        },
+        {
+          "id": "validate-contract-consumers",
+          "content": "Update canonical schema/binding consumers and discriminating fixtures for required fields, unsupported extensions, scope, time, mutation outcomes and source-attribution validation.",
+          "status": "completed",
+          "ordinal": 3
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-dependency-checks.plan.md",
+      "slug": "pm-dependency-checks",
+      "name": "pm-dependency-checks",
+      "overview": "Keep dependency enforcement precise for the test-only registry edge and the runtime numeric API imports without weakening adapter or registry capability boundaries.",
+      "todos": [
+        {
+          "id": "enforce-reviewed-edge-kinds",
+          "content": "Preserve dependency kinds in the footprint checker and add exact import-only edge contracts that cannot replace mandatory full source contracts.",
+          "status": "in_progress",
+          "ordinal": 1
+        },
+        {
+          "id": "verify-boundary-negative-controls",
+          "content": "Reject production registry reachability, unlisted runtime API imports and any attempt to bypass the existing forbidden-symbol or executor-site floors.",
+          "status": "pending",
+          "ordinal": 2
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-eval-protocol.plan.md",
+      "slug": "pm-eval-protocol",
+      "name": "pm-eval-protocol",
+      "overview": "Pin a fair, non-vacuous comparison protocol that reuses the existing corpus and evaluator and separates correctness, usefulness and resource cost.",
+      "todos": [
+        {
+          "id": "inventory-comparison-surfaces",
+          "content": "Map existing corpus, baseline runner, metrics, annotations, real Native/NCM runners and benchmark populations to a single host comparison input/output contract.",
+          "status": "completed",
+          "ordinal": 1
+        },
+        {
+          "id": "pin-matched-trials",
+          "content": "Specify identical provider inputs and host budgets, fresh held-out cases, labels, safety thresholds, latency/resource sampling and failure accounting before any new comparative run.",
+          "status": "completed",
+          "ordinal": 2
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-heldout-a.plan.md",
+      "slug": "pm-heldout-a",
+      "name": "pm-heldout-a",
+      "overview": "Author six fresh paired comparison cases for stale changes, failed approaches and cross-session reuse.",
+      "todos": [
+        {
+          "id": "author-heldout-a",
+          "content": "Author six fresh paired comparison cases for stale changes, failed approaches and cross-session reuse.",
+          "status": "completed",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-heldout-b.plan.md",
+      "slug": "pm-heldout-b",
+      "name": "pm-heldout-b",
+      "overview": "Author six fresh paired comparison cases for scope isolation, contradiction and restart/replay.",
+      "todos": [
+        {
+          "id": "author-heldout-b",
+          "content": "Author six fresh paired comparison cases for scope isolation, contradiction and restart/replay.",
+          "status": "completed",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-heldout-c.plan.md",
+      "slug": "pm-heldout-c",
+      "name": "pm-heldout-c",
+      "overview": "Author six fresh paired comparison cases for cancellation, corruption and privacy deletion.",
+      "todos": [
+        {
+          "id": "author-heldout-c",
+          "content": "Author six fresh paired comparison cases for cancellation, corruption and privacy deletion.",
+          "status": "completed",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-history.plan.md",
+      "slug": "pm-history",
+      "name": "pm-history",
+      "overview": "Provide one host-authorized canonical history replay/share path so either provider can reuse prior-session knowledge without weakening exact session namespaces.",
+      "todos": [
+        {
+          "id": "produce-source-authority-and-deletion-state",
+          "content": "Implement the admitted repository identity bridge and bounded current canonical disposition projection, plus a durable provider-specific source-deletion fence in the existing host observation journal that survives provider unavailability and fresh-namespace restore.",
+          "status": "completed",
+          "ordinal": 1
+        },
+        {
+          "id": "authorize-history-source-selection",
+          "content": "Bridge authoritative canonical repository provenance to the mounted coding scope, then select bounded eligible history and bind requesting scope to original same-checkout sources without comparing incompatible identity hashes.",
+          "status": "completed",
+          "ordinal": 2
+        },
+        {
+          "id": "replay-history-with-origin",
+          "content": "Deliver eligible history into the selected provider's exact namespace with stable idempotency, original-source attribution, independent progress and truthful partial coverage.",
+          "status": "completed",
+          "ordinal": 3
+        },
+        {
+          "id": "history-correction-deletion-fences",
+          "content": "Propagate source corrections and deletion/tombstone state through replay and provider switching, proving no branch/worktree leak or deleted-source resurrection after restart.",
+          "status": "completed",
+          "ordinal": 4
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-host-audit.plan.md",
+      "slug": "pm-host-audit",
+      "name": "pm-host-audit",
+      "overview": "Locate Native-specific host assumptions and the existing authority paths needed for neutral selection, authorized history reuse and provenance.",
+      "todos": [
+        {
+          "id": "host-seam-map",
+          "content": "Map registration through context packing and feedback, identify Native-only decisions, and specify a single-owner file map for neutral mounting and authorized cross-session reuse.",
+          "status": "completed",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-host-journeys.plan.md",
+      "slug": "pm-host-journeys",
+      "name": "pm-host-journeys",
+      "overview": "Prove interchangeable Native and NCM behavior through shipped CLI/daemon hooks across sessions, lifecycle operations and provider changes.",
+      "todos": [
+        {
+          "id": "parameterize-real-provider-journeys",
+          "content": "Drive the same Claude and Codex host journey with Native active and NCM active, including authorized session A to B recall with original source attribution.",
+          "status": "pending",
+          "ordinal": 1
+        },
+        {
+          "id": "prove-provider-lifecycle-and-switching",
+          "content": "Verify feedback, correction, deletion, worker/daemon restart, replay, snapshot anti-resurrection and Native-to-NCM-to-Native switching without losing canonical facts.",
+          "status": "pending",
+          "ordinal": 2
+        },
+        {
+          "id": "prove-isolation-and-failure-matrix",
+          "content": "Verify observer on/off output equality, disabled zero work, forbidden scope denial, missing model, corrupt state, cancellation, timeouts and no hidden provider substitution.",
+          "status": "pending",
+          "ordinal": 3
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-host-mount.plan.md",
+      "slug": "pm-host-mount",
+      "name": "pm-host-mount",
+      "overview": "Connect the tested neutral registration seam to the existing host recall mount while the disjoint history reader finishes its bounded source window.",
+      "todos": [
+        {
+          "id": "selected-provider-recall-mount",
+          "content": "Mount the explicitly selected provider using its registered readiness, execution shape, limits and scope bindings, retain the same selected history authority and journey for the later recall call, and remove Native-specific active recall assumptions.",
+          "status": "completed",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-host-recall.plan.md",
+      "slug": "pm-host-recall",
+      "name": "pm-host-recall",
+      "overview": "Wire either compatible provider through the actual host recall and feedback path with shared authority, provenance, budgets and lifecycle control.",
+      "todos": [
+        {
+          "id": "shared-admission-provenance-pack",
+          "content": "Map shared temporal/exclusion inputs and carry both providers through the same source/time/scope admission, hydration, normalization and context selection, preserving typed common-fact identity and time-aware duplicate attribution.",
+          "status": "pending",
+          "ordinal": 1
+        },
+        {
+          "id": "provider-feedback-and-lifecycle-routing",
+          "content": "Route attributed feedback and required lifecycle operations to the producing provider with stable identity and no canonical fact mutation or silent provider fallback.",
+          "status": "pending",
+          "ordinal": 2
+        },
+        {
+          "id": "active-recall-cancellation-recovery",
+          "content": "Prove live cancellation and deadlines across provider execution, source lookup and trace persistence, with bounded shutdown/quarantine and truthful unavailable or partial outcomes.",
+          "status": "pending",
+          "ordinal": 3
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-integrate.plan.md",
+      "slug": "pm-integrate",
+      "name": "pm-integrate",
+      "overview": "Complete graph-level compatibility verification and publish the fully working pluggable memory implementation and measured comparison.",
+      "todos": [
+        {
+          "id": "aggregate-compatibility-verification",
+          "content": "Run focused common conformance, real host parity, dependency/feature/migration and recovery checks on the integrated tree with stable representative results and no unsupported required capability.",
+          "status": "pending",
+          "ordinal": 1
+        },
+        {
+          "id": "reconcile-user-facing-contract",
+          "content": "Reconcile provider capability tables, compatibility promises, operator instructions and comparison conclusions with actual behavior and explicitly list any incomplete required outcome.",
+          "status": "pending",
+          "ordinal": 2
+        },
+        {
+          "id": "publish-reviewed-memory-system",
+          "content": "Commit and push coherent verified changes and provide the user exact selection examples, comparison results, remaining platform limits and a clean worktree.",
+          "status": "pending",
+          "ordinal": 3
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-live-origin.plan.md",
+      "slug": "pm-live-origin",
+      "name": "pm-live-origin",
+      "overview": "Record bounded live transcript origin evidence so delayed catch-up cannot inherit a later checkout or branch identity.",
+      "todos": [
+        {
+          "id": "record-live-origin-boundaries",
+          "content": "Extend existing durable hook admission metadata with bounded transcript identity/frontier and monotonic worktree branch-transition evidence, then seal only continuously authorized new frames.",
+          "status": "completed",
+          "ordinal": 1
+        },
+        {
+          "id": "verify-origin-discontinuity",
+          "content": "Prove old prefixes and partial frames cannot gain origin, branch A-to-B-to-A and generation changes invalidate open intervals, and unavailable evidence degrades safely.",
+          "status": "completed",
+          "ordinal": 2
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-measure.plan.md",
+      "slug": "pm-measure",
+      "name": "pm-measure",
+      "overview": "Run the matched real-provider comparison and report usefulness, correctness, latency and memory cost with reproducible evidence.",
+      "todos": [
+        {
+          "id": "run-matched-quality-comparison",
+          "content": "Execute accepted regression and fresh held-out host retrieval populations through all comparison lanes and compute real usefulness, safety, provenance and token metrics, with downstream model task benefit separately identified when authorized and measured.",
+          "status": "pending",
+          "ordinal": 1
+        },
+        {
+          "id": "run-latency-resource-populations",
+          "content": "Measure paired cold/warm host and backend phases across declared scales and namespace/concurrency populations, retaining failures and actual sample/resource counts.",
+          "status": "pending",
+          "ordinal": 2
+        },
+        {
+          "id": "resolve-measured-defects",
+          "content": "Fix substantive compatibility or performance defects in their owning lanes and repeat only affected populations, then publish a qualified Native-versus-NCM comparison without changing thresholds.",
+          "status": "pending",
+          "ordinal": 3
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-measurement-capture.plan.md",
+      "slug": "pm-measurement-capture",
+      "name": "pm-measurement-capture",
+      "overview": "Implement reusable process phase timing and resource capture for the accepted host comparison protocol.",
+      "todos": [
+        {
+          "id": "implement-phase-resource-capture",
+          "content": "Implement reusable process phase timing and resource capture for the accepted host comparison protocol.",
+          "status": "completed",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-native-audit.plan.md",
+      "slug": "pm-native-audit",
+      "name": "pm-native-audit",
+      "overview": "Establish the exact Native provider lifecycle gaps and safe provider-local implementation seams without changing canonical fact authority.",
+      "todos": [
+        {
+          "id": "native-gap-map",
+          "content": "Produce a code-referenced operation matrix and bounded write plan for Native feedback, correction, deletion, temporal recall, inspection, maintenance, snapshots and replay.",
+          "status": "completed",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-native-integrity.plan.md",
+      "slug": "pm-native-integrity",
+      "name": "pm-native-integrity",
+      "overview": "Reject corrupt staged payloads whose actual bytes do not match their stored digest.",
+      "todos": [
+        {
+          "id": "validate-native-stored-content",
+          "content": "Reject corrupt staged payloads whose actual bytes do not match their stored digest.",
+          "status": "completed",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-native.plan.md",
+      "slug": "pm-native",
+      "name": "pm-native",
+      "overview": "Complete Native's provider-local lifecycle and temporal behavior under the common profile without changing canonical fact trust or ownership.",
+      "todos": [
+        {
+          "id": "native-source-state-and-time",
+          "content": "Migrate the existing v1 staged database in place, preserving original references and duplicate evidence while adding real source revisions, retained validity, correction lineage, feedback and durable generation.",
+          "status": "in_progress",
+          "ordinal": 1
+        },
+        {
+          "id": "native-recall-time-exclusions-provenance",
+          "content": "Implement every temporal mode and exclusion before ranking and truncation, validate stored content digests, and return truthful scan coverage and source provenance without treating admission time as historical validity.",
+          "status": "in_progress",
+          "ordinal": 2
+        },
+        {
+          "id": "native-feedback-correction-delete",
+          "content": "Implement real idempotent provider-local feedback, correction and source deletion with lineage, read-after-write behavior, tombstones and restart anti-resurrection checks.",
+          "status": "in_progress",
+          "ordinal": 3
+        },
+        {
+          "id": "native-inspect-maintain-recover",
+          "content": "Implement bounded redacted inspection, maintenance, snapshot export/restore and replay with truthful state generation and failure/effect semantics.",
+          "status": "in_progress",
+          "ordinal": 4
+        },
+        {
+          "id": "native-common-profile-tests",
+          "content": "Verify all required temporal modes, lifecycle operations, legacy store reopen and direct Native authority parity through the real application port.",
+          "status": "in_progress",
+          "ordinal": 5
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-ncm-audit.plan.md",
+      "slug": "pm-ncm-audit",
+      "name": "pm-ncm-audit",
+      "overview": "Establish the precise gap between the real NCM backend payloads and the host's complete canonical memory contracts.",
+      "todos": [
+        {
+          "id": "ncm-gap-map",
+          "content": "Trace real NCM operation translation and response mapping and document every dropped or unsupported temporal, exclusion, provenance, feedback and lifecycle field with exact implementation seams.",
+          "status": "completed",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-ncm-cancel.plan.md",
+      "slug": "pm-ncm-cancel",
+      "name": "pm-ncm-cancel",
+      "overview": "Forward live cancellation through the existing NCM adapter worker call without changing public contracts.",
+      "todos": [
+        {
+          "id": "forward-adapter-cancellation",
+          "content": "Forward live cancellation through the existing NCM adapter worker call without changing public contracts.",
+          "status": "completed",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-ncm-delete-guard.plan.md",
+      "slug": "pm-ncm-delete-guard",
+      "name": "pm-ncm-delete-guard",
+      "overview": "Enforce existing NCM source revocations on ordinary observation and erase sensitive retained provenance during deletion.",
+      "todos": [
+        {
+          "id": "enforce-runtime-source-revocation",
+          "content": "Enforce existing NCM source revocations on ordinary observation and erase sensitive retained provenance during deletion.",
+          "status": "completed",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-ncm-portability.plan.md",
+      "slug": "pm-ncm-portability",
+      "name": "pm-ncm-portability",
+      "overview": "Finish canonical NCM snapshot and replay through the existing opaque adapter boundary and durable namespace store.",
+      "todos": [
+        {
+          "id": "implement-canonical-portability",
+          "content": "Map snapshot export/restore and canonical replay with current source dispositions, original-source deduplication and exact partial accounting in two independently owned modules.",
+          "status": "in_progress",
+          "ordinal": 1
+        },
+        {
+          "id": "verify-portability-anti-resurrection",
+          "content": "Prove fresh-namespace restore and repeated replay cannot resurrect deleted sources or alias prior provider-local references, preserving explicit unknown outcomes.",
+          "status": "pending",
+          "ordinal": 2
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-ncm-restore-identity.plan.md",
+      "slug": "pm-ncm-restore-identity",
+      "name": "pm-ncm-restore-identity",
+      "overview": "Prevent snapshot rollback from reusing discarded NCM record identities for different content.",
+      "todos": [
+        {
+          "id": "preserve-restored-record-identity",
+          "content": "Prevent snapshot rollback from reusing discarded NCM record identities for different content.",
+          "status": "completed",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-ncm.plan.md",
+      "slug": "pm-ncm",
+      "name": "pm-ncm",
+      "overview": "Make the real NCM adapter and worker implement the complete common memory semantics instead of accepting a reduced private recall payload.",
+      "todos": [
+        {
+          "id": "ncm-canonical-recall-translation",
+          "content": "Translate complete canonical recall requests into real NCM execution with exact scope, evaluation time, every required temporal mode, exclusions and budgets implemented; reject malformed inputs before dispatch.",
+          "status": "completed",
+          "ordinal": 1
+        },
+        {
+          "id": "ncm-admissible-recall-output",
+          "content": "Return canonical candidates with honest content digests, original-source provenance, validity, ordering, coverage and accepted state generation that pass host admission without Native fallback.",
+          "status": "completed",
+          "ordinal": 2
+        },
+        {
+          "id": "ncm-common-lifecycle",
+          "content": "Complete common feedback, correction, deletion, inspection, maintenance, snapshot and replay mappings using opaque restart-stable identities and truthful idempotent effects.",
+          "status": "completed",
+          "ordinal": 3
+        },
+        {
+          "id": "ncm-cancellation-and-resurrection-fences",
+          "content": "Carry live OperationControl into the existing cancellable worker call, fence revoked sources before new observation or replay, exclude superseded records by policy, and prevent snapshot restore from aliasing old public record references.",
+          "status": "completed",
+          "ordinal": 4
+        },
+        {
+          "id": "ncm-real-profile-tests",
+          "content": "Prove real-model recall and lifecycle behavior across worker restart, correction, deleted-source replay, corrupted state, cancellation and bounded resource pressure.",
+          "status": "completed",
+          "ordinal": 5
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-operations.plan.md",
+      "slug": "pm-operations",
+      "name": "pm-operations",
+      "overview": "Make provider selection, status, disablement, recovery and packaging usable through the existing product surfaces without provider-specific transport coupling.",
+      "todos": [
+        {
+          "id": "operator-provider-controls",
+          "content": "Expose truthful supported provider selection, capabilities, readiness, degradation and lifecycle controls through existing configuration and CLI/MCP surfaces.",
+          "status": "pending",
+          "ordinal": 1
+        },
+        {
+          "id": "feature-and-packaging-compatibility",
+          "content": "Validate default and Native-only builds plus NCM-enabled packaging, worker/model availability, legacy settings/data reopen and disable/rollback behavior on supported targets.",
+          "status": "pending",
+          "ordinal": 2
+        },
+        {
+          "id": "publish-operator-instructions",
+          "content": "Document exact Native/NCM selection, installation prerequisites, replay-based switching, provider-specific snapshots, measured costs and recovery using the tested product paths.",
+          "status": "pending",
+          "ordinal": 3
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-provider-control-contract.plan.md",
+      "slug": "pm-provider-control-contract",
+      "name": "pm-provider-control-contract",
+      "overview": "Define the provider-local retained control family independently of canonical fact operations.",
+      "todos": [
+        {
+          "id": "retained-provider-control-contract",
+          "content": "Add bounded typed requests/results and a separately mounted execution port for the nine common provider controls, preserving host-intent and provider-effect distinctions.",
+          "status": "in_progress",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-provider-control-routing.plan.md",
+      "slug": "pm-provider-control-routing",
+      "name": "pm-provider-control-routing",
+      "overview": "Route authorized controls to the original registered provider while retaining common-profile admission policy.",
+      "todos": [
+        {
+          "id": "original-provider-control-admission",
+          "content": "Reuse fabric validation for the nine explicit control operations in Active or Observer mode, refuse Disabled/stale targets, and retain the host common-profile decision in registration metadata.",
+          "status": "completed",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-registration.plan.md",
+      "slug": "pm-registration",
+      "name": "pm-registration",
+      "overview": "Remove Native-only active-registration assumptions and expose neutral configured providers without scattering implementation names through the host or transports.",
+      "todos": [
+        {
+          "id": "neutral-provider-registration",
+          "content": "Replace Native-only active mounting assumptions with injected provider registrations carrying actual limits, execution shape, scope bindings and lifecycle ownership.",
+          "status": "completed",
+          "ordinal": 1
+        },
+        {
+          "id": "neutral-selection-configuration",
+          "content": "Support explicit Native or NCM active selection plus independent disabled or observer participation, with legacy setting migration and no implicit fallback or Native-advisory prerequisite.",
+          "status": "completed",
+          "ordinal": 2
+        },
+        {
+          "id": "registration-isolation-tests",
+          "content": "Verify disabled creates no worker, observer contributes no active output, NCM active is independent of Native advisory activation, and unknown or incompatible providers fail explicitly.",
+          "status": "completed",
+          "ordinal": 3
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    }
+  ],
+  "frontier": [
+    {
+      "plan_slug": "pm-admission",
+      "plan_name": "pm-admission",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-admission.plan.md",
+      "plan_status": "in_progress",
+      "state": "in_progress",
+      "blocked_by": [],
+      "active": [
+        {
+          "id": "align-canonical-temporal-and-source-admission",
+          "content": "Implement root-approved requested-time lifecycle admission, explicit-null source revision handling and structurally validated original source DTOs without changing scope or granting provider claims authority.",
+          "status": "in_progress",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [
+        {
+          "id": "verify-common-admission-vectors",
+          "content": "Verify all temporal modes, mixed known/unknown validity, strict candidate claims, legacy decoding, source metadata and original-source structural invariants with focused registry tests.",
+          "status": "pending",
+          "ordinal": 2
+        }
+      ],
+      "completed": 0,
+      "total": 2
+    },
+    {
+      "plan_slug": "pm-context-policy",
+      "plan_name": "pm-context-policy",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-context-policy.plan.md",
+      "plan_status": "in_progress",
+      "state": "in_progress",
+      "blocked_by": [],
+      "active": [
+        {
+          "id": "context-policy-and-canonical-contribution",
+          "content": "Carry validated temporal/exclusion inputs through the public context contract and preserve canonical owner/fact/revision identities with explicit current-only temporal coverage in the existing tool result.",
+          "status": "in_progress",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "pm-dependency-checks",
+      "plan_name": "pm-dependency-checks",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-dependency-checks.plan.md",
+      "plan_status": "in_progress",
+      "state": "in_progress",
+      "blocked_by": [],
+      "active": [
+        {
+          "id": "enforce-reviewed-edge-kinds",
+          "content": "Preserve dependency kinds in the footprint checker and add exact import-only edge contracts that cannot replace mandatory full source contracts.",
+          "status": "in_progress",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [
+        {
+          "id": "verify-boundary-negative-controls",
+          "content": "Reject production registry reachability, unlisted runtime API imports and any attempt to bypass the existing forbidden-symbol or executor-site floors.",
+          "status": "pending",
+          "ordinal": 2
+        }
+      ],
+      "completed": 0,
+      "total": 2
+    },
+    {
+      "plan_slug": "pm-native",
+      "plan_name": "pm-native",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-native.plan.md",
+      "plan_status": "in_progress",
+      "state": "in_progress",
+      "blocked_by": [],
+      "active": [
+        {
+          "id": "native-source-state-and-time",
+          "content": "Migrate the existing v1 staged database in place, preserving original references and duplicate evidence while adding real source revisions, retained validity, correction lineage, feedback and durable generation.",
+          "status": "in_progress",
+          "ordinal": 1
+        },
+        {
+          "id": "native-recall-time-exclusions-provenance",
+          "content": "Implement every temporal mode and exclusion before ranking and truncation, validate stored content digests, and return truthful scan coverage and source provenance without treating admission time as historical validity.",
+          "status": "in_progress",
+          "ordinal": 2
+        },
+        {
+          "id": "native-feedback-correction-delete",
+          "content": "Implement real idempotent provider-local feedback, correction and source deletion with lineage, read-after-write behavior, tombstones and restart anti-resurrection checks.",
+          "status": "in_progress",
+          "ordinal": 3
+        },
+        {
+          "id": "native-inspect-maintain-recover",
+          "content": "Implement bounded redacted inspection, maintenance, snapshot export/restore and replay with truthful state generation and failure/effect semantics.",
+          "status": "in_progress",
+          "ordinal": 4
+        },
+        {
+          "id": "native-common-profile-tests",
+          "content": "Verify all required temporal modes, lifecycle operations, legacy store reopen and direct Native authority parity through the real application port.",
+          "status": "in_progress",
+          "ordinal": 5
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 5
+    },
+    {
+      "plan_slug": "pm-ncm-portability",
+      "plan_name": "pm-ncm-portability",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-ncm-portability.plan.md",
+      "plan_status": "in_progress",
+      "state": "in_progress",
+      "blocked_by": [],
+      "active": [
+        {
+          "id": "implement-canonical-portability",
+          "content": "Map snapshot export/restore and canonical replay with current source dispositions, original-source deduplication and exact partial accounting in two independently owned modules.",
+          "status": "in_progress",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [
+        {
+          "id": "verify-portability-anti-resurrection",
+          "content": "Prove fresh-namespace restore and repeated replay cannot resurrect deleted sources or alias prior provider-local references, preserving explicit unknown outcomes.",
+          "status": "pending",
+          "ordinal": 2
+        }
+      ],
+      "completed": 0,
+      "total": 2
+    },
+    {
+      "plan_slug": "pm-provider-control-contract",
+      "plan_name": "pm-provider-control-contract",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-provider-control-contract.plan.md",
+      "plan_status": "in_progress",
+      "state": "in_progress",
+      "blocked_by": [],
+      "active": [
+        {
+          "id": "retained-provider-control-contract",
+          "content": "Add bounded typed requests/results and a separately mounted execution port for the nine common provider controls, preserving host-intent and provider-effect distinctions.",
+          "status": "in_progress",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "pm-conformance-factories",
+      "plan_name": "pm-conformance-factories",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-conformance-factories.plan.md",
+      "plan_status": "pending",
+      "state": "ready",
+      "blocked_by": [],
+      "active": [
+        {
+          "id": "shared-real-fixture-support",
+          "content": "Implement bounded provider-neutral fixture authority and typed subprocess DTO support; correct foreign-scope isolation to accept actual effect-free ScopeMismatch alongside an empty successful recall.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "pm-comparison-connect",
+      "plan_name": "pm-comparison-connect",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-comparison-connect.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "pm-host-journeys"
+      ],
+      "active": [
+        {
+          "id": "bind-real-host-comparison",
+          "content": "Bind the prepared runner to the reusable Claude/Codex host controls and both independently selected real providers, preserving identical canonical inputs and actual delivered output.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [
+        {
+          "id": "prove-comparison-host-boundary",
+          "content": "Run one bounded positive and negative smoke per host/provider proving nonempty admitted source, real process restart, exact tokenizer counts and correct provider/control attribution without opening held-out results.",
+          "status": "pending",
+          "ordinal": 2
+        }
+      ],
+      "completed": 0,
+      "total": 2
+    },
+    {
+      "plan_slug": "pm-conformance-native",
+      "plan_name": "pm-conformance-native",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-conformance-native.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "pm-conformance-factories",
+        "pm-native"
+      ],
+      "active": [
+        {
+          "id": "real-native-common-factory",
+          "content": "Build the concrete Native factory and actual test-child lifecycle, then require the common report to be compatible with no unresolved evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "pm-conformance-ncm",
+      "plan_name": "pm-conformance-ncm",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-conformance-ncm.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "pm-conformance-factories"
+      ],
+      "active": [
+        {
+          "id": "real-ncm-common-factory",
+          "content": "Build the concrete NCM factory with actual worker lifecycle and physical legacy/corruption evidence, then require common compatibility without unresolved evidence.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "pm-host-journeys",
+      "plan_name": "pm-host-journeys",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-host-journeys.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "pm-host-recall"
+      ],
+      "active": [
+        {
+          "id": "parameterize-real-provider-journeys",
+          "content": "Drive the same Claude and Codex host journey with Native active and NCM active, including authorized session A to B recall with original source attribution.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [
+        {
+          "id": "prove-provider-lifecycle-and-switching",
+          "content": "Verify feedback, correction, deletion, worker/daemon restart, replay, snapshot anti-resurrection and Native-to-NCM-to-Native switching without losing canonical facts.",
+          "status": "pending",
+          "ordinal": 2
+        },
+        {
+          "id": "prove-isolation-and-failure-matrix",
+          "content": "Verify observer on/off output equality, disabled zero work, forbidden scope denial, missing model, corrupt state, cancellation, timeouts and no hidden provider substitution.",
+          "status": "pending",
+          "ordinal": 3
+        }
+      ],
+      "completed": 0,
+      "total": 3
+    },
+    {
+      "plan_slug": "pm-host-recall",
+      "plan_name": "pm-host-recall",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-host-recall.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "pm-admission",
+        "pm-ncm-portability",
+        "pm-native",
+        "pm-context-policy",
+        "pm-provider-control-contract"
+      ],
+      "active": [
+        {
+          "id": "shared-admission-provenance-pack",
+          "content": "Map shared temporal/exclusion inputs and carry both providers through the same source/time/scope admission, hydration, normalization and context selection, preserving typed common-fact identity and time-aware duplicate attribution.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [
+        {
+          "id": "provider-feedback-and-lifecycle-routing",
+          "content": "Route attributed feedback and required lifecycle operations to the producing provider with stable identity and no canonical fact mutation or silent provider fallback.",
+          "status": "pending",
+          "ordinal": 2
+        },
+        {
+          "id": "active-recall-cancellation-recovery",
+          "content": "Prove live cancellation and deadlines across provider execution, source lookup and trace persistence, with bounded shutdown/quarantine and truthful unavailable or partial outcomes.",
+          "status": "pending",
+          "ordinal": 3
+        }
+      ],
+      "completed": 0,
+      "total": 3
+    },
+    {
+      "plan_slug": "pm-integrate",
+      "plan_name": "pm-integrate",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-integrate.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "pm-dependency-checks",
+        "pm-measure",
+        "pm-operations"
+      ],
+      "active": [
+        {
+          "id": "aggregate-compatibility-verification",
+          "content": "Run focused common conformance, real host parity, dependency/feature/migration and recovery checks on the integrated tree with stable representative results and no unsupported required capability.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [
+        {
+          "id": "reconcile-user-facing-contract",
+          "content": "Reconcile provider capability tables, compatibility promises, operator instructions and comparison conclusions with actual behavior and explicitly list any incomplete required outcome.",
+          "status": "pending",
+          "ordinal": 2
+        },
+        {
+          "id": "publish-reviewed-memory-system",
+          "content": "Commit and push coherent verified changes and provide the user exact selection examples, comparison results, remaining platform limits and a clean worktree.",
+          "status": "pending",
+          "ordinal": 3
+        }
+      ],
+      "completed": 0,
+      "total": 3
+    },
+    {
+      "plan_slug": "pm-measure",
+      "plan_name": "pm-measure",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-measure.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "pm-comparison-connect",
+        "pm-conformance-native",
+        "pm-conformance-ncm"
+      ],
+      "active": [
+        {
+          "id": "run-matched-quality-comparison",
+          "content": "Execute accepted regression and fresh held-out host retrieval populations through all comparison lanes and compute real usefulness, safety, provenance and token metrics, with downstream model task benefit separately identified when authorized and measured.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [
+        {
+          "id": "run-latency-resource-populations",
+          "content": "Measure paired cold/warm host and backend phases across declared scales and namespace/concurrency populations, retaining failures and actual sample/resource counts.",
+          "status": "pending",
+          "ordinal": 2
+        },
+        {
+          "id": "resolve-measured-defects",
+          "content": "Fix substantive compatibility or performance defects in their owning lanes and repeat only affected populations, then publish a qualified Native-versus-NCM comparison without changing thresholds.",
+          "status": "pending",
+          "ordinal": 3
+        }
+      ],
+      "completed": 0,
+      "total": 3
+    },
+    {
+      "plan_slug": "pm-operations",
+      "plan_name": "pm-operations",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-operations.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "pm-host-recall"
+      ],
+      "active": [
+        {
+          "id": "operator-provider-controls",
+          "content": "Expose truthful supported provider selection, capabilities, readiness, degradation and lifecycle controls through existing configuration and CLI/MCP surfaces.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [
+        {
+          "id": "feature-and-packaging-compatibility",
+          "content": "Validate default and Native-only builds plus NCM-enabled packaging, worker/model availability, legacy settings/data reopen and disable/rollback behavior on supported targets.",
+          "status": "pending",
+          "ordinal": 2
+        },
+        {
+          "id": "publish-operator-instructions",
+          "content": "Document exact Native/NCM selection, installation prerequisites, replay-based switching, provider-specific snapshots, measured costs and recovery using the tested product paths.",
+          "status": "pending",
+          "ordinal": 3
+        }
+      ],
+      "completed": 0,
+      "total": 3
+    },
+    {
+      "plan_slug": "pm-comparison-harness",
+      "plan_name": "pm-comparison-harness",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-comparison-harness.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 3,
+      "total": 3
+    },
+    {
+      "plan_slug": "pm-conformance",
+      "plan_name": "pm-conformance",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-conformance.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 3,
+      "total": 3
+    },
+    {
+      "plan_slug": "pm-contract",
+      "plan_name": "pm-contract",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-contract.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 3,
+      "total": 3
+    },
+    {
+      "plan_slug": "pm-eval-protocol",
+      "plan_name": "pm-eval-protocol",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-eval-protocol.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 2,
+      "total": 2
+    },
+    {
+      "plan_slug": "pm-heldout-a",
+      "plan_name": "pm-heldout-a",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-heldout-a.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 1,
+      "total": 1
+    },
+    {
+      "plan_slug": "pm-heldout-b",
+      "plan_name": "pm-heldout-b",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-heldout-b.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 1,
+      "total": 1
+    },
+    {
+      "plan_slug": "pm-heldout-c",
+      "plan_name": "pm-heldout-c",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-heldout-c.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 1,
+      "total": 1
+    },
+    {
+      "plan_slug": "pm-history",
+      "plan_name": "pm-history",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-history.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 4,
+      "total": 4
+    },
+    {
+      "plan_slug": "pm-host-audit",
+      "plan_name": "pm-host-audit",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-host-audit.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 1,
+      "total": 1
+    },
+    {
+      "plan_slug": "pm-host-mount",
+      "plan_name": "pm-host-mount",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-host-mount.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 1,
+      "total": 1
+    },
+    {
+      "plan_slug": "pm-live-origin",
+      "plan_name": "pm-live-origin",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-live-origin.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 2,
+      "total": 2
+    },
+    {
+      "plan_slug": "pm-measurement-capture",
+      "plan_name": "pm-measurement-capture",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-measurement-capture.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 1,
+      "total": 1
+    },
+    {
+      "plan_slug": "pm-native-audit",
+      "plan_name": "pm-native-audit",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-native-audit.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 1,
+      "total": 1
+    },
+    {
+      "plan_slug": "pm-native-integrity",
+      "plan_name": "pm-native-integrity",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-native-integrity.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 1,
+      "total": 1
+    },
+    {
+      "plan_slug": "pm-ncm",
+      "plan_name": "pm-ncm",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-ncm.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 5,
+      "total": 5
+    },
+    {
+      "plan_slug": "pm-ncm-audit",
+      "plan_name": "pm-ncm-audit",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-ncm-audit.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 1,
+      "total": 1
+    },
+    {
+      "plan_slug": "pm-ncm-cancel",
+      "plan_name": "pm-ncm-cancel",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-ncm-cancel.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 1,
+      "total": 1
+    },
+    {
+      "plan_slug": "pm-ncm-delete-guard",
+      "plan_name": "pm-ncm-delete-guard",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-ncm-delete-guard.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 1,
+      "total": 1
+    },
+    {
+      "plan_slug": "pm-ncm-restore-identity",
+      "plan_name": "pm-ncm-restore-identity",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-ncm-restore-identity.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 1,
+      "total": 1
+    },
+    {
+      "plan_slug": "pm-provider-control-routing",
+      "plan_name": "pm-provider-control-routing",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-provider-control-routing.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 1,
+      "total": 1
+    },
+    {
+      "plan_slug": "pm-registration",
+      "plan_name": "pm-registration",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/pm-registration.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 3,
+      "total": 3
+    }
+  ],
+  "errors": [],
+  "warnings": []
+}

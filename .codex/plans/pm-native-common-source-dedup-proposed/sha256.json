@@ -1,0 +1,9 @@
+{
+  "file": "crates/tracedecay/src/daemon/retained_owner/native_provider.rs",
+  "before_live_sha256": "28b25500d5d917e922bd369e4926db77754a4877d4b64781e26f084f3477b802",
+  "before_index_sha256": "28b25500d5d917e922bd369e4926db77754a4877d4b64781e26f084f3477b802",
+  "before_index_git_blob": "64e12fcee1375780a4eccdae3aade86b90810ac9",
+  "after_live_sha256": "73528c31e542b270729546f5137716519a50770fe86e421f7432d5febe859269",
+  "after_index_sha256": "28b25500d5d917e922bd369e4926db77754a4877d4b64781e26f084f3477b802",
+  "delta_patch_sha256": "21f1e96418d41ffb2d4f3bca594220bd481aa65b6c0550b4ba9654dd78787565"
+}

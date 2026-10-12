@@ -1,5 +1,7 @@
 load("@rules_python//python:defs.bzl", "py_binary", "py_test")
-load("//scripts:bazel/rust_test.bzl", "rust_test")
+load("//scripts:bazel/rust_test.bzl", "compiler_fixture_test", "rust_test")
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 py_test(
     name = "native_provider_startup_test",
@@ -29,19 +31,73 @@ py_test(
     main = "test-measure-unused-tool-context.py",
 )
 
+py_binary(
+    name = "distribution_feature_wiring_test__binary",
+    srcs = [
+        "test-check-distribution-feature-wiring.py",
+        "check-distribution-feature-wiring.py",
+        "resolve-release-source-profile.py",
+        "product/ncm/worker_platform_policy.py",
+    ],
+    main = "test-check-distribution-feature-wiring.py",
+    data = [
+        "//:.github/workflows/release.yml",
+        "//:.github/workflows/release-beta.yml",
+    ],
+    legacy_create_init = 0,
+    tags = ["manual"],
+    visibility = ["//visibility:private"],
+)
+
+compiler_fixture_test(
+    name = "distribution_feature_wiring_test",
+    size = "small",
+    test_binary = ":distribution_feature_wiring_test__binary",
+)
+
 exports_files(
     [
         "bazel/rust_test.bzl",
         "bazel/gen_builds.py",
+        "bazel/ncm_worker_bundle.bzl",
         "bazel/rust_test_environment_probe.txt",
         "check-dashboard-bundle.py",
         "check-github-hosted-runners.py",
         "run-session-temporal-benchmark.sh",
         "test-check-github-hosted-runners.py",
         "test-gen-builds-default-alias.py",
+        "product/ncm/build-worker-bundle.py",
+        "product/ncm/check-backend.py",
+        "product/ncm/test-build-worker-bundle.py",
+        "product/generate-memory-provider-rust.py",
         "test-measure-ranked-tail-trim.py",
     ],
     visibility = ["//visibility:public"],
+)
+
+write_file(
+    name = "ncm_worker_bundle_test_runner",
+    out = "ncm_worker_bundle_test.sh",
+    is_executable = True,
+    content = [
+        "#!/bin/sh",
+        "set -eu",
+        'export TMPDIR="$TEST_TMPDIR"',
+        'for py in python3 python; do "$py" -S -c \'\' 2>/dev/null && break; done',
+        'exec "$py" -B -S "$TEST_SRCDIR/$TEST_WORKSPACE/scripts/product/ncm/test-build-worker-bundle.py" "$@"',
+    ],
+)
+
+sh_test(
+    name = "ncm_worker_bundle_test",
+    srcs = [":ncm_worker_bundle_test_runner"],
+    size = "small",
+    data = [
+        "product/ncm/test-build-worker-bundle.py",
+        "product/ncm/build-worker-bundle.py",
+        "//product/ncm:reference/worker-manifest.json",
+        "//product/ncm:release/model-acquisition-manifest.json",
+    ],
 )
 
 rust_test(

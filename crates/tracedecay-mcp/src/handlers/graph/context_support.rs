@@ -3,11 +3,13 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use serde_json::Value;
+use tracedecay_contracts::memory::CognitiveRecallTemporalMode;
 use tracedecay_contracts::retained_surfaces::{
     FactCategoryV1, FactSearchGraphCoverageV1, FactSearchGraphDegradationV1, FactSearchHitV1,
 };
-use tracedecay_contracts::retrieval::ContextStageV1;
+use tracedecay_contracts::retrieval::{
+    ContextMemoryTemporalCoverageV1, ContextStageV1, ContextSurfaceRequestV1,
+};
 use tracedecay_contracts::{
     CancellationSignal, ContextMemoryAnalyticsV1, Deadline, now_micros,
     retained_surface_execution_problem,
@@ -105,9 +107,12 @@ fn context_lane_budget(lane_key: &str) -> usize {
 pub(super) fn insert_context_memory_section(
     output: &mut String,
     memory_matches: &[FactSearchHitV1],
+    temporal_coverage: Option<&ContextMemoryTemporalCoverageV1>,
     memory_matches_error: Option<&str>,
 ) {
-    let Some(section) = context_memory_section(memory_matches, memory_matches_error) else {
+    let Some(section) =
+        context_memory_section(memory_matches, temporal_coverage, memory_matches_error)
+    else {
         return;
     };
     if let Some(idx) = output.find(&format!("\n{CONTEXT_ENTRY_POINTS_HEADING}")) {
@@ -119,6 +124,7 @@ pub(super) fn insert_context_memory_section(
 
 pub(super) fn context_memory_section(
     memory_matches: &[FactSearchHitV1],
+    temporal_coverage: Option<&ContextMemoryTemporalCoverageV1>,
     memory_matches_error: Option<&str>,
 ) -> Option<String> {
     let mut section = String::new();
@@ -140,6 +146,13 @@ pub(super) fn context_memory_section(
         section.push('\n');
         section.push_str(CONTEXT_MEMORY_FEEDBACK_HINT);
         section.push('\n');
+        return Some(section);
+    }
+    if temporal_coverage.is_some() {
+        let _ = writeln!(
+            section,
+            "\n{CONTEXT_MEMORY_MATCHES_HEADING}\nUnavailable: canonical fact search supports only current memory."
+        );
         return Some(section);
     }
     if let Some(err) = memory_matches_error {
@@ -167,32 +180,38 @@ pub(super) struct ContextMemoryOptions {
     include_memory: bool,
     limit: usize,
     min_trust: f64,
+    temporal_coverage: Option<ContextMemoryTemporalCoverageV1>,
 }
 
-pub(super) fn context_memory_options(args: &Value) -> ContextMemoryOptions {
-    let include_memory = args
-        .get("include_memory")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let limit = args
-        .get("memory_limit")
-        .and_then(Value::as_u64)
+pub(super) fn context_memory_options(request: &ContextSurfaceRequestV1) -> ContextMemoryOptions {
+    let include_memory = request.include_memory.unwrap_or(true);
+    let limit = request
+        .memory_limit
         .map_or(CONTEXT_MEMORY_MATCH_LIMIT, |value| value as usize)
         .clamp(1, CONTEXT_MEMORY_MATCH_LIMIT_MAX);
-    let min_trust = args
-        .get("memory_min_trust")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.5)
-        .clamp(0.0, 1.0);
+    let min_trust = request.memory_min_trust.unwrap_or(0.5).clamp(0.0, 1.0);
+    // The canonical fact store has no historical assertion-validity authority.
+    // It must not contribute today's facts to a historical context request.
+    let temporal_coverage = request
+        .temporal_query
+        .as_ref()
+        .map(|query| query.mode())
+        .filter(|mode| include_memory && *mode != CognitiveRecallTemporalMode::Current)
+        .map(
+            |requested_mode| ContextMemoryTemporalCoverageV1::WithheldCurrentOnly {
+                requested_mode,
+            },
+        );
     ContextMemoryOptions {
         include_memory,
         limit,
         min_trust,
+        temporal_coverage,
     }
 }
 
 pub(super) fn context_memory_enabled(options: &ContextMemoryOptions) -> bool {
-    options.include_memory
+    options.include_memory && options.temporal_coverage.is_none()
 }
 
 pub(super) fn context_memory_read_control(
@@ -243,7 +262,7 @@ pub(super) fn context_memory_stage(
 ) -> ContextStageV1 {
     if !options.include_memory {
         ContextStageV1::NotRequested
-    } else if memory_matches_error.is_some() {
+    } else if options.temporal_coverage.is_some() || memory_matches_error.is_some() {
         ContextStageV1::Unavailable
     } else {
         ContextStageV1::ran(
@@ -262,6 +281,7 @@ pub(super) struct ContextMemoryMatches {
 pub(super) struct ContextMemoryOutcome {
     pub(super) hits: Vec<FactSearchHitV1>,
     pub(super) graph_coverage: Option<FactSearchGraphCoverageV1>,
+    pub(super) temporal_coverage: Option<ContextMemoryTemporalCoverageV1>,
     pub(super) error: Option<String>,
 }
 
@@ -276,6 +296,7 @@ pub(super) async fn context_memory_outcome(
         return ContextMemoryOutcome {
             hits: Vec::new(),
             graph_coverage: None,
+            temporal_coverage: options.temporal_coverage,
             error: None,
         };
     };
@@ -283,6 +304,7 @@ pub(super) async fn context_memory_outcome(
         Ok(matches) => ContextMemoryOutcome {
             hits: matches.hits,
             graph_coverage: Some(matches.graph_coverage),
+            temporal_coverage: None,
             error: None,
         },
         Err(error) => ContextMemoryOutcome {
@@ -290,6 +312,7 @@ pub(super) async fn context_memory_outcome(
             graph_coverage: Some(FactSearchGraphCoverageV1::Degraded {
                 reason: FactSearchGraphDegradationV1::Unavailable,
             }),
+            temporal_coverage: None,
             error: Some(error.to_string()),
         },
     }

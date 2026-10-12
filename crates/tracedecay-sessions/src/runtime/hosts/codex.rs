@@ -87,8 +87,8 @@ use crate::runtime::jsonl_observation_admission::{
 };
 use crate::runtime::shared::{ProjectMembership, TranscriptScopeMatcher};
 use crate::runtime::source::{
-    FileDiscoveryLimit, FileDiscoveryReport, TranscriptCursorKey, TranscriptDiscoveryBounds,
-    TranscriptIngestError, TranscriptIngestResult, TranscriptSource,
+    FileDiscoveryLimit, FileDiscoveryReport, HostCoverageReason, TranscriptCursorKey,
+    TranscriptDiscoveryBounds, TranscriptIngestError, TranscriptIngestResult, TranscriptSource,
     run_blocking_transcript_section,
 };
 
@@ -105,6 +105,7 @@ pub use observation::{
     try_admit_codex_jsonl_observations_for_profile_with_admission,
     try_admit_codex_jsonl_observations_for_profile_with_admission_and_cancellation,
     try_admit_codex_jsonl_observations_for_project,
+    try_admit_codex_jsonl_observations_for_project_session_window,
     try_admit_codex_jsonl_observations_for_project_with_admission,
     try_admit_codex_jsonl_observations_for_project_with_admission_and_cancellation,
 };
@@ -675,13 +676,13 @@ impl CodexDiscoveryHub {
         frontier: CodexDiscoveryFrontier,
     ) -> TranscriptIngestResult<CodexDiscoveryDelivery> {
         let hub = self.clone();
-        let consumer = consumer.to_owned();
+        let discovery_consumer = consumer.to_owned();
         let source = source.clone();
         let (delivery, prefetch) = tokio::task::spawn_blocking(move || {
-            let delivery = hub.discover_blocking(&consumer, &source, bounds, frontier)?;
+            let delivery = hub.discover_blocking(&discovery_consumer, &source, bounds, frontier)?;
             let prefetch = match &delivery {
                 CodexDiscoveryDelivery::Ready(pass) if pass._shared_page_pin.is_some() => {
-                    hub.paths_needing_source_read(&consumer, &pass.report.paths)?
+                    hub.paths_needing_source_read(&discovery_consumer, &pass.report.paths)?
                 }
                 _ => Vec::new(),
             };
@@ -691,6 +692,22 @@ impl CodexDiscoveryHub {
         .map_err(|_| TranscriptIngestError::InvalidCodexDiscoveryFrontier {
             detail: "Codex discovery blocking task failed",
         })??;
+        match &delivery {
+            CodexDiscoveryDelivery::Ready(pass) => tracing::debug!(
+                consumer,
+                delivery = "ready",
+                paths = pass.report.paths.len(),
+                files_considered = pass.report.files_considered,
+                truncated = ?pass.report.truncated,
+                next_frontier = ?pass.next_frontier,
+                "Codex transcript discovery delivery"
+            ),
+            CodexDiscoveryDelivery::Waiting => tracing::debug!(
+                consumer,
+                delivery = "waiting",
+                "Codex transcript discovery delivery"
+            ),
+        }
         if let CodexDiscoveryDelivery::Ready(pass) = &delivery
             && let Some(pin) = &pass._shared_page_pin
         {
@@ -1355,7 +1372,7 @@ const EXACT_HOOK_DISCOVERY_UNITS_PER_CALL: usize = 64;
 const MAX_EXACT_HOOK_SOURCE_AUTHORITIES: usize = 8;
 const MAX_EXACT_HOOK_SESSION_REQUESTS: usize = 64;
 
-pub(crate) struct CodexExactSessionLookupOutcome {
+pub struct CodexExactSessionLookupOutcome {
     pub paths: Vec<PathBuf>,
     pub source_deferred: bool,
     #[cfg(test)]
@@ -1544,7 +1561,7 @@ impl CodexSource {
     /// rollout filename used by a Codex hook event. Repeated calls continue the
     /// same iterator instead of rereading the corpus prefix.
     #[tracing::instrument(name = "sessions.hosts.codex.find_session", level = "trace", skip_all)]
-    pub(crate) fn find_session_transcript_paths_bounded(
+    pub fn find_session_transcript_paths_bounded(
         &self,
         session_id: &str,
     ) -> TranscriptIngestResult<CodexExactSessionLookupOutcome> {
@@ -1854,7 +1871,13 @@ impl CodexSource {
     /// Source rooted at the real `~/.codex`. Returns `None` when the
     /// home directory cannot be resolved.
     pub fn new() -> Option<Self> {
-        let home = crate::runtime::home_dir()?;
+        let Some(home) = crate::runtime::home_dir() else {
+            tracing::debug!(
+                reason = ?HostCoverageReason::SourceIdentityUnavailable,
+                "Codex transcript source has no captured home"
+            );
+            return None;
+        };
         Some(Self::with_home(&home))
     }
 
@@ -1877,6 +1900,16 @@ impl CodexSource {
         frontier: CodexDiscoveryFrontier,
         state: &mut CodexDiscoveryState,
     ) -> TranscriptIngestResult<CodexDiscoveryPass> {
+        tracing::debug!(
+            sessions_dir = %self.sessions_dir.display(),
+            archived_sessions_dir = %self.archived_sessions_dir.display(),
+            ?bounds,
+            ?frontier,
+            retained_scan = state.scan.is_some(),
+            pending_pass = state.pending.is_some(),
+            idle_probe = state.idle.is_some(),
+            "Codex transcript discovery started"
+        );
         if let Some(pending) = &state.pending {
             let mut valid = true;
             for source in &pending.sources {
@@ -2049,6 +2082,13 @@ impl CodexSource {
             state.reset_for(self, frontier.is_complete());
         }
         let pass = retained_scan_step(self, state, bounds, frontier)?;
+        tracing::debug!(
+            paths = pass.report.paths.len(),
+            files_considered = pass.report.files_considered,
+            truncated = ?pass.report.truncated,
+            next_frontier = ?pass.next_frontier,
+            "Codex transcript discovery completed"
+        );
         let sources = pass.selected_sources.clone();
         state.pending = Some(CodexPendingPass {
             pass: pass.clone(),

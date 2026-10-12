@@ -8,7 +8,7 @@ use std::sync::{Arc, Weak};
 use tracedecay_contracts::ApplicationProblem;
 use tracedecay_contracts::ResolvedScope;
 use tracedecay_contracts::graph_tool::GraphToolResultV1;
-use tracedecay_contracts::retrieval::HookRuntimeResultV1;
+use tracedecay_contracts::retrieval::{HookCompactionResultV1, HookRuntimeResultV1};
 use tracedecay_daemon_service::{
     DaemonInvocationService, GraphToolFuture, GraphToolInvocationV1, ProjectGraphToolPortV1,
     RegisteredGraphToolOwnerV1,
@@ -158,7 +158,7 @@ impl McpServer {
             options,
         );
         // This server's profile owns every transcript a hook action ingests.
-        let completion = match self.profile.clone() {
+        let mut completion = match self.profile.clone() {
             Some(profile) => {
                 tracedecay_sessions::runtime::with_transcript_source_profile(profile, computed)
                     .await
@@ -176,6 +176,22 @@ impl McpServer {
                 self.user_session_refresh_wake.as_deref(),
             )
             .await?;
+        }
+        if let GraphToolResultV1::HookRuntime(HookRuntimeResultV1::CodexCompact(
+            HookCompactionResultV1::NotRun { status, reason, .. },
+        )) = &mut completion.result
+        {
+            // The hook admits a bounded source window; its store's mounted
+            // worker owns projection and durable summary convergence.
+            if matches!(status.as_str(), "pending" | "deferred")
+                && !self
+                    .project_session_refresh_wake
+                    .as_deref()
+                    .is_some_and(|wake| wake.wake())
+            {
+                *status = "unavailable".to_owned();
+                *reason = "session_refresh_worker_unavailable".to_owned();
+            }
         }
         Ok(completion)
     }

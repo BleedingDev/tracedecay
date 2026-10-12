@@ -21,6 +21,7 @@ pub use invocation::{
     parse_application_surface_invocation_payload,
 };
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -57,7 +58,66 @@ use crate::output_format::{RequestedOutputFormat, requested_output_format};
 use crate::surface::GitReadSurfaceRequest;
 use tracedecay_contracts::context_scout::ContextScoutSurfaceRequestV1;
 use tracedecay_contracts::retained_surfaces::{RetainedSurfaceOperation, RetainedSurfaceRequestV1};
-use tracedecay_domain::errors::TraceDecayError;
+use tracedecay_domain::errors::{Result as TraceDecayResult, TraceDecayError};
+
+/// Rejects tool arguments that are not a JSON object.
+pub fn require_object_args(args: &Value, tool_name: &str) -> TraceDecayResult<()> {
+    if args.is_object() {
+        return Ok(());
+    }
+    Err(TraceDecayError::Config {
+        message: format!("invalid arguments: {tool_name} expects a JSON object"),
+    })
+}
+
+/// Decode one catalog-owned primitive request after removing keys owned by
+/// the MCP transport rather than the application operation. The session and
+/// thread keys are host route identity: the server routes the call by them
+/// before dispatch, so they never belong to the request body.
+pub fn decode_primitive_request<T: DeserializeOwned>(
+    args: &Value,
+    tool_name: &str,
+) -> TraceDecayResult<T> {
+    decode_request_without(args, tool_name, &["project_selector"])
+}
+
+/// [`decode_primitive_request`] for a request whose own contract names a
+/// registered project through `project_selector`, so routing never consumed
+/// it.
+pub fn decode_selector_request<T: DeserializeOwned>(
+    args: &Value,
+    tool_name: &str,
+) -> TraceDecayResult<T> {
+    decode_request_without(args, tool_name, &[])
+}
+
+fn decode_request_without<T: DeserializeOwned>(
+    args: &Value,
+    tool_name: &str,
+    routed_keys: &[&str],
+) -> TraceDecayResult<T> {
+    require_object_args(args, tool_name)?;
+    let mut request = args.clone();
+    if let Some(object) = request.as_object_mut() {
+        for key in [
+            "format",
+            "__mcp_request_id",
+            "_meta",
+            "session_id",
+            "sessionId",
+            "thread_id",
+            "threadId",
+        ]
+        .iter()
+        .chain(routed_keys)
+        {
+            object.remove(*key);
+        }
+    }
+    serde_json::from_value(request).map_err(|error| TraceDecayError::Config {
+        message: format!("invalid arguments for {tool_name}: {error}"),
+    })
+}
 
 #[derive(Debug, Error)]
 pub enum ApplicationSurfaceAdapterError {
@@ -847,6 +907,15 @@ pub fn parse_application_surface_request(
         | ApplicationSurfaceOperation::FactStoreList
         | ApplicationSurfaceOperation::FactFeedback
         | ApplicationSurfaceOperation::MemoryStatus
+        | ApplicationSurfaceOperation::ProviderFeedback
+        | ApplicationSurfaceOperation::ProviderCorrection
+        | ApplicationSurfaceOperation::ProviderDeleteBySource
+        | ApplicationSurfaceOperation::ProviderHealth
+        | ApplicationSurfaceOperation::ProviderInspection
+        | ApplicationSurfaceOperation::ProviderMaintenance
+        | ApplicationSurfaceOperation::ProviderSnapshotExport
+        | ApplicationSurfaceOperation::ProviderSnapshotRestore
+        | ApplicationSurfaceOperation::ProviderReplay
         | ApplicationSurfaceOperation::SessionRefreshStatus
         | ApplicationSurfaceOperation::SessionRefreshCancel
         | ApplicationSurfaceOperation::SessionRefreshBegin
@@ -951,7 +1020,34 @@ pub fn parse_application_surface_request(
 mod tests {
     use super::*;
     use serde_json::json;
+    use tracedecay_contracts::retrieval::NodeSurfaceRequestV1;
     use tracedecay_tool_catalog::ApplicationSurfaceOperation;
+
+    #[test]
+    fn request_decoders_distinguish_routed_and_contract_owned_project_selectors() {
+        let arguments = json!({
+            "node_id": "function:canonical",
+            "project_selector": {"project_id": "project.fixture"},
+            "format": "json",
+            "__mcp_request_id": "request.fixture",
+            "_meta": {"threadId": "thread.route"},
+            "session_id": "session.route",
+            "sessionId": "session.route",
+            "thread_id": "thread.route",
+            "threadId": "thread.route",
+        });
+        let decoded =
+            decode_primitive_request::<NodeSurfaceRequestV1>(&arguments, "tracedecay_node")
+                .expect("the primitive request consumes its routed project selector");
+        assert_eq!(decoded.node_id, "function:canonical");
+        let error = decode_selector_request::<NodeSurfaceRequestV1>(&arguments, "tracedecay_node")
+            .expect_err("selector decoding retains the project selector for schema validation");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `project_selector`")
+        );
+    }
 
     #[test]
     fn separate_application_tool_request_strips_transport_keys() {

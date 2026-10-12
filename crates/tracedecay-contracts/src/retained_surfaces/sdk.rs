@@ -81,7 +81,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracedecay_domain::{FactEventId, FactId, ProjectId, TemporalModeV1};
 
-use super::RetainedSurfaceOperation;
+use super::{ProviderControlRequestV1, RetainedSurfaceOperation};
 
 /// Exact registered-project selector. Reads and fact effects run against the
 /// selected project.
@@ -850,6 +850,7 @@ pub enum RetainedSurfaceRequestV1 {
     FactStoreList(FactStoreListRequestV1),
     FactFeedback(FactFeedbackRequestV1),
     MemoryStatus(MemoryStatusRequestV1),
+    ProviderControl(ProviderControlRequestV1),
     SessionRefresh(SessionRefreshRequestV1),
     MessageSearch(MessageSearchRequestV1),
     SessionsFor(SessionsForRequestV1),
@@ -880,6 +881,7 @@ impl RetainedSurfaceRequestV1 {
             Self::FactStoreList(_) => RetainedSurfaceOperation::FactStoreList,
             Self::FactFeedback(_) => RetainedSurfaceOperation::FactFeedback,
             Self::MemoryStatus(_) => RetainedSurfaceOperation::MemoryStatus,
+            Self::ProviderControl(request) => request.operation(),
             Self::SessionRefresh(request) => request.operation(),
             Self::MessageSearch(_) => RetainedSurfaceOperation::MessageSearch,
             Self::SessionsFor(_) => RetainedSurfaceOperation::SessionsFor,

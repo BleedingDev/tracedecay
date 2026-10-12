@@ -1,0 +1,16 @@
+{
+  "plans_root": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/research",
+  "glob": "*.plan.md",
+  "depends": [
+    "rn-audit-source:rn-audit-review",
+    "rn-audit-facts:rn-audit-review",
+    "rn-audit-sessions:rn-audit-review",
+    "rn-audit-interface:rn-audit-review",
+    "rn-audit-adapter:rn-audit-review",
+    "rn-audit-delivery:rn-audit-review",
+    "rn-audit-data:rn-audit-review",
+    "rn-audit-ncm:rn-audit-review",
+    "rn-audit-verification:rn-audit-review"
+  ],
+  "graph_id": "native-original-research-20260910"
+}

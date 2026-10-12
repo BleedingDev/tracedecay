@@ -652,6 +652,18 @@ fn claude_and_kiro_hooks_skip_startup_maintenance() {
     ));
 }
 
+#[test]
+fn pressure_hooks_skip_interactive_startup_maintenance() {
+    for command in [
+        Commands::HookClaudePostCompact,
+        Commands::HookCodexPostCompact,
+    ] {
+        assert!(should_skip_startup_maintenance(&command));
+        assert!(should_skip_agent_install_check(&command));
+        assert!(!runs_worldwide_counter_flush(&command));
+    }
+}
+
 // These tests intentionally stay on pure parse/dispatch guard seams. Direct
 // invocation of blocking or destructive run arms (serve/dashboard/upgrade,
 // install mutations, status network paths, and hook process outcomes) is

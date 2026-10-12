@@ -53,6 +53,8 @@ BANNER = (
 # (`rules_rust++crate+<hub>__<crate>-<version>/_bs.cargo_runfiles/` again), so
 # it stays one letter to keep vendored C headers under MAX_PATH.
 CRATE_HUB = "c"
+NCM_RUNTIME = "tracedecay-memory-ncm-runtime"
+NCM_WORKER = "tracedecay-ncm-worker"
 # External crates the binaries must build with Cargo's target-side features.
 # crate_universe folds a host triple's build-dependency features into that
 # triple's normal build, so a build-dependency can widen the shipped crate:
@@ -88,6 +90,12 @@ BUILD_SCRIPT_DATA_EXTRA = {
     "tracedecay-code-extraction": ['glob(["vendor/**"])'],
 }
 
+# Repository files read by member build scripts, registered through the same
+# filegroups as out-of-package compile data.
+BUILD_SCRIPT_REPO_FILES = {
+    "tracedecay-memory-ncm-runtime": ["product/ncm/reference/worker-manifest.json"],
+}
+
 # Extra compile-time data (include_str!/include_bytes! outside src/).
 COMPILE_DATA_EXTRA = {
     "tracedecay-agent-hosts": [
@@ -121,6 +129,9 @@ TEST_DATA = {
         ":build-support/watched_input_file.rs",
     ],
     ("tracedecay-cli", "tracedecay_unit_test"): ["//:.github/release-targets.json"],
+    ("tracedecay-memory-conformance", "baseline"): [
+        "product/evaluation/coding-memory-scenarios.v1.json",
+    ],
     ("tracedecay-code-index", "code_index_suite"): [
         "crates/tracedecay-code-extraction/fixtures/sample.astro",
     ],
@@ -192,6 +203,16 @@ RUNTIME_BINARIES = (
         "//crates/tracedecay-cli:tracedecay-host-cli-fixture",
         r'\bcompiled_host_cli_fixture\(\)',
     ),
+    (
+        "TRACEDECAY_NCM_WORKER",
+        "//crates/tracedecay-memory-ncm-runtime:tracedecay-ncm-worker__test",
+        r'var(?:_os)?\("TRACEDECAY_NCM_WORKER"\)',
+    ),
+    (
+        "TRACEDECAY_NCM_PRODUCTION_WORKER",
+        "//product/ncm:worker",
+        r'var(?:_os)?\("TRACEDECAY_NCM_PRODUCTION_WORKER"\)',
+    ),
 )
 
 
@@ -217,6 +238,31 @@ def normalize_default_alias(feats, feature_table):
     if defaults and all(name in feature_table and name in feats for name in defaults):
         feats.add("default")
     return feats
+
+
+def target_features(package, target):
+    """Cargo requirements plus the named binary's explicit Bazel selection."""
+    features = set(target.get("required-features") or [])
+    if "bin" in target["kind"]:
+        selections = (package.get("metadata") or {}).get("bazel", {}).get("binary_features", {})
+        features.update(selections.get(target["name"], []))
+    return frozenset(features)
+
+
+def validate_binary_features(package):
+    """Reject stale target names and misspelled feature selections."""
+    selections = (package.get("metadata") or {}).get("bazel", {}).get("binary_features", {})
+    binaries = {t["name"] for t in package["targets"] if "bin" in t["kind"]}
+    if not isinstance(selections, dict):
+        sys.exit(f"{package['name']}: package.metadata.bazel.binary_features must map binaries to feature lists")
+    for binary, features in selections.items():
+        if binary not in binaries:
+            sys.exit(f"{package['name']}: binary_features names unknown binary {binary!r}")
+        if not isinstance(features, list) or any(
+            not isinstance(feature, str) or feature not in package["features"]
+            for feature in features
+        ):
+            sys.exit(f"{package['name']}: binary_features.{binary} must list declared package features")
 
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -577,12 +623,13 @@ def main():
     # Every feature-resolution context a generated target needs.
     contexts = {}
     for p in meta["packages"]:
+        validate_binary_features(p)
         name = p["name"]
         contexts[(name, "normal,build", frozenset())] = None
         contexts[(name, "normal,build,dev", frozenset())] = None
         reqs = set()
         for t in p["targets"]:
-            req = t.get("required-features") or []
+            req = target_features(p, t)
             if not req:
                 continue
             edges = (
@@ -591,6 +638,8 @@ def main():
                 else "normal,build"
             )
             reqs.add((edges, frozenset(req)))
+            if "bin" in t["kind"]:
+                reqs.add(("normal,build,dev", frozenset(req)))
         for edges, req in reqs:
             contexts[(name, edges, req)] = None
     # The lean root build (`cargo check -p tracedecay --no-default-features`).
@@ -608,8 +657,8 @@ def main():
         f"{p['name']}/{f}"
         for p in meta["packages"]
         for t in p["targets"]
-        if {"test", "bench", "example"} & set(t["kind"])
-        for f in t.get("required-features") or []
+        if {"bin", "test", "bench", "example"} & set(t["kind"])
+        for f in target_features(p, t)
     ) | frozenset(
         f"{p['name']}/test-transport"
         for p in meta["packages"]
@@ -730,10 +779,14 @@ def main():
 
     def owner_pkg(repo_rel):
         """Package dir that owns repo_rel plus the group dir inside it. Crates
-        members own their subtree. Other top-level dirs own theirs."""
+        members own their subtree; shared files use their nearest package."""
         parts = repo_rel.parts
         if parts[0] == "crates":
             return "/".join(parts[:2]), "/".join(parts[2:-1])
+        for count in range(len(parts) - 1, 1, -1):
+            directory = Path(*parts[:count])
+            if (REPO / directory / "BUILD.bazel").exists():
+                return directory.as_posix(), "/".join(parts[count:-1])
         return parts[0], "/".join(parts[1:-1])
 
     def group_label(repo_rel, *, sources=False):
@@ -986,6 +1039,11 @@ def main():
         md = member_deps_of[name]
         lib_t = next((t for t in p["targets"] if "lib" in t["kind"]), None)
         has_build = any("custom-build" in t["kind"] for t in p["targets"])
+        worker_closure = None
+        if name == NCM_RUNTIME:
+            worker_target = next(t for t in p["targets"] if t["name"] == NCM_WORKER and "bin" in t["kind"])
+            worker_resolution = contexts[(name, "normal,build", target_features(p, worker_target))]
+            worker_closure = closure_of(name, worker_resolution)
 
         out = [BANNER]
         out.append('package(default_visibility = ["//visibility:public"])\n')
@@ -1012,7 +1070,11 @@ def main():
                     )
                 )
                 if has_build:
-                    deps.append(":build_script_build")
+                    deps.append(
+                        ":build_script_build_host"
+                        if name == NCM_RUNTIME
+                        else ":build_script_build"
+                    )
                 lib_extra, lib_mod_labels, lib_pulled = extra_mod_srcs(
                     p, lib_t, covered=(Path(p["manifest_path"]).parent / "src",)
                 )
@@ -1023,7 +1085,7 @@ def main():
                 if lib_mod_labels:
                     srcs_expr_lib += " + [" + q(lib_mod_labels) + "]"
                 format_sources(srcs_expr_lib, lib_t["edition"])
-                out += [
+                library_rule = [
                     "rust_library(",
                     f'    name = "{tgt}",',
                     "    srcs = " + srcs_expr_lib + ",",
@@ -1046,6 +1108,22 @@ def main():
                 + "],",
                     ")\n",
                 ]
+                out += library_rule
+                if name == NCM_RUNTIME and vkind == "norm" and closure == worker_closure:
+                    # The worker cannot embed its own byte pin. Only its runtime
+                    # rlib differs from the host; external dependencies are shared.
+                    worker_library = unique_name(tgt + "__worker")
+                    unpinned_deps = [
+                        ":build_script_build" if dep == ":build_script_build_host" else dep
+                        for dep in deps
+                    ]
+                    out += [
+                        f'    name = "{worker_library}",' if line == f'    name = "{tgt}",'
+                        else "    deps = all_crate_deps(normal = True) + [" + q(unpinned_deps) + "],"
+                        if line.startswith("    deps = ")
+                        else line
+                        for line in library_rule
+                    ]
 
         if has_build:
             srcs = srcs_expr(["build.rs"] + BUILD_SCRIPT_SRCS_EXTRA.get(name, []))
@@ -1066,13 +1144,33 @@ def main():
                 f'    version = "{p["version"]}",',
                 f"    crate_features = [{q(sorted(build_tree[name]))}],",
             ]
-            data_labels = q(BUILD_SCRIPT_DATA.get(name, []))
+            data_labels = q(dedup(
+                BUILD_SCRIPT_DATA.get(name, [])
+                + [group_label(Path(f))[0] for f in BUILD_SCRIPT_REPO_FILES.get(name, [])]
+            ))
             data_expr = " + ".join([f"[{data_labels}]"] + BUILD_SCRIPT_DATA_EXTRA.get(name, []))
             if data_labels or BUILD_SCRIPT_DATA_EXTRA.get(name):
                 out.append(f"    data = {data_expr},")
             if BUILD_SCRIPT_ENV.get(name):
                 out.append(f"    build_script_env = {env_dict(BUILD_SCRIPT_ENV[name])},")
             out.append(")\n")
+            if name == NCM_RUNTIME:
+                out += [
+                    "cargo_build_script(",
+                    '    name = "build_script_build_host",',
+                    '    crate_name = "build_script_build",',
+                    '    crate_root = "build.rs",',
+                    "    srcs = " + srcs + ",",
+                    "    deps = all_crate_deps(build = True, build_proc_macro = True) + [" + q(build_edges) + "],",
+                    '    edition = crate_edition(),',
+                    f'    pkg_name = "{name}",',
+                    f'    version = "{p["version"]}",',
+                    f"    crate_features = [{q(sorted(build_tree[name]))}],",
+                    '    data = ["//product/ncm:worker_manifest"],',
+                    '    rundir = ".",',
+                    '    build_script_env = {"TRACEDECAY_NCM_BAZEL_WORKER_MANIFEST": "$(execpath //product/ncm:worker_manifest)"},',
+                    ")\n",
+                ]
 
         for t in p["targets"]:
             kinds = t["kind"]
@@ -1097,7 +1195,7 @@ def main():
             if bin_labels:
                 srcs += " + [" + q(bin_labels) + "]"
             format_sources(srcs, t["edition"])
-            req = frozenset(t.get("required-features") or [])
+            req = target_features(p, t)
             # Cargo builds examples against the dev resolution, and builds the
             # binaries a test run spawns with that run's features too (test
             # hooks, test-transport). `<bin>__test` is that build; the plain
@@ -1121,7 +1219,10 @@ def main():
                     sorted({label(d, fmap, vkind) for d in edges if d in fmap})
                 )
                 if lib_t and name in fmap:
-                    deps = dedup([label(name, fmap, vkind)] + deps)
+                    own_library = label(name, fmap, vkind)
+                    if name == NCM_RUNTIME and t["name"] == NCM_WORKER and vkind == "norm":
+                        own_library += "__worker"
+                    deps = dedup([own_library] + deps)
                 if has_build:
                     deps.append(":build_script_build")
                 out += [
@@ -1319,7 +1420,7 @@ def main():
                 )
             )
             if has_build:
-                deps.append(":build_script_build")
+                deps.append(":build_script_build_host" if name == NCM_RUNTIME else ":build_script_build")
             out += [
                 "rust_test(",
                 '    name = "unit_test",',

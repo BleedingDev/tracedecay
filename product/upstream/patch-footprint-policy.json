@@ -1,0 +1,874 @@
+{
+  "administrative_paths_excluded_from_footprint": [
+    ".codex/**"
+  ],
+  "allowed_touch_points": [
+    {
+      "allowed_changes": [
+        "register additive product-owned workspace crates",
+        "add workspace dependencies used by product-owned crates",
+        "refresh Cargo.lock through the pinned toolchain"
+      ],
+      "category": "workspace",
+      "forbidden_changes": [
+        "changing upstream feature defaults to force provider behavior",
+        "replacing upstream dependency versions unrelated to the product crates",
+        "hand-editing Cargo.lock"
+      ],
+      "id": "workspace_wiring",
+      "max_changed_lines": 163,
+      "max_files": 2,
+      "paths": [
+        "Cargo.toml",
+        "Cargo.lock"
+      ],
+      "required_verification": [
+        "cargo metadata --locked --format-version 1",
+        "clean workspace build receipt"
+      ]
+    },
+    {
+      "allowed_changes": [
+        "register provider-neutral capability ports and typed outcomes",
+        "mount product-owned application routers or retained operations",
+        "carry exact scope, deadline, cancellation, provenance, and terminal state"
+      ],
+      "category": "application",
+      "forbidden_changes": [
+        "provider-name branching",
+        "concrete NCM or OCEAN types in public TraceDecay contracts",
+        "silent fallback or fake readiness"
+      ],
+      "id": "application_contract_mount",
+      "max_changed_lines": 220,
+      "max_files": 3,
+      "paths": [
+        "crates/tracedecay-application/src/retained_surfaces.rs",
+        "crates/tracedecay-application/src/lib.rs",
+        "crates/tracedecay/src/application_surface.rs"
+      ],
+      "required_verification": [
+        "application contract/schema tests",
+        "public transport parity tests"
+      ]
+    },
+    {
+      "allowed_changes": [
+        "define a provider-neutral advisory cognitive-recall port",
+        "carry exact scope, deadline, cancellation, provenance, and typed degradation",
+        "add focused application and production-reachability contract tests"
+      ],
+      "category": "application",
+      "forbidden_changes": [
+        "provider-name branching or concrete provider types",
+        "provider authority over canonical facts or final context assembly",
+        "silent fallback or fabricated empty success"
+      ],
+      "id": "cognitive_recall_contract",
+      "max_changed_lines": 940,
+      "max_files": 4,
+      "paths": [
+        "crates/tracedecay-application/src/memory.rs",
+        "crates/tracedecay-application/src/memory/recall.rs",
+        "crates/tracedecay-application/tests/cognitive_recall_port.rs",
+        "crates/tracedecay/tests/application_production_reachability.rs"
+      ],
+      "required_verification": [
+        "application cognitive-recall contract tests",
+        "application production-reachability test"
+      ]
+    },
+    {
+      "allowed_changes": [
+        "construct and retain product-owned capability registries and lifecycle ports",
+        "inject provider-neutral observation, recall, feedback, maintenance, and inspection capabilities",
+        "bind exact project/worktree/provider scope at startup",
+        "retain the composed dormant host across the daemon and MCP project-server lifetime"
+      ],
+      "category": "composition",
+      "forbidden_changes": [
+        "provider implementation logic in the composition root",
+        "global mutable provider singleton",
+        "unbounded worker or queue",
+        "provider authority over source, sessions, Native facts, or configuration"
+      ],
+      "id": "daemon_composition_mount",
+      "max_changed_lines": 1094,
+      "max_files": 15,
+      "paths": [
+        "crates/tracedecay/Cargo.toml",
+        "crates/tracedecay/src/daemon/project_composition.rs",
+        "crates/tracedecay/src/daemon/project_open_owners.rs",
+        "crates/tracedecay/src/daemon/retained_owner.rs",
+        "crates/tracedecay/src/daemon/retained_owner/memory.rs",
+        "crates/tracedecay-daemon-service/src/project_runtime.rs",
+        "crates/tracedecay/src/daemon/tests/ownership.rs",
+        "crates/tracedecay/src/mcp/server.rs",
+        "crates/tracedecay/src/mcp/server/construction.rs",
+        "crates/tracedecay/src/mcp/server/connection.rs",
+        "crates/tracedecay-session-runtime/src/session_sync.rs",
+        "crates/tracedecay-session-runtime/src/session_sync/git_topology.rs",
+        "crates/tracedecay-session-runtime/src/session_sync/project_lifecycle.rs",
+        "crates/tracedecay/src/daemon/session_runtime_tests/project_lifecycle_tests.rs",
+        "crates/tracedecay/src/daemon/session_runtime_tests/session_sync_tests.rs"
+      ],
+      "required_verification": [
+        "daemon composition/restart tests",
+        "scope-isolation journey",
+        "provider unavailable and shutdown tests"
+      ]
+    },
+    {
+      "allowed_changes": [
+        "propagate one caller-supplied absolute deadline through daemon shutdown layers",
+        "bound blocking drain work by the caller deadline's remaining budget",
+        "report Failed for incomplete shutdown while completing terminal teardown",
+        "make the shutdown call chain's own unit tests assert the fence through an observable effect of begin_shutdown instead of a fixed number of scheduler yields",
+        "preserve the upstream single supersession join and remove a redundant second reaper, proving live-owner receipt ordering while distinguishing ordinary retirement from an already-superseded receipt"
+      ],
+      "cap_revision": {
+        "adr": "product/architecture/adr/ADR-0016-daemon-shutdown-receipt-ordering-headroom.md",
+        "measured_changed_lines": 416,
+        "measured_files": 8,
+        "policy_revision": "patch-footprint.v4",
+        "previous_max_changed_lines": 360,
+        "previous_max_files": 8
+      },
+      "category": "shutdown",
+      "forbidden_changes": [
+        "creating a fresh deadline budget in a nested shutdown layer",
+        "hiding incomplete shutdown behind a successful terminal",
+        "reordering unrelated daemon lifecycle phases",
+        "adding provider or memory integration logic",
+        "weakening a shutdown assertion, or replacing a bounded wait on an observable shutdown effect with a sleep, a yield count, or a lock-contention probe"
+      ],
+      "id": "daemon_shutdown_deadline",
+      "max_changed_lines": 420,
+      "max_files": 8,
+      "paths": [
+        "crates/tracedecay/src/daemon/bootstrap.rs",
+        "crates/tracedecay/src/daemon/engine/shutdown.rs",
+        "crates/tracedecay/src/daemon/invocation_state.rs",
+        "crates/tracedecay-daemon-service/src/invocation/lsp.rs",
+        "crates/tracedecay-daemon-service/src/invocation/types.rs",
+        "crates/tracedecay-daemon-service/src/project_runtime/shutdown.rs",
+        "crates/tracedecay/src/daemon/invocation_tests/types_tests.rs",
+        "crates/tracedecay/src/daemon/invocation_tests/lsp_lease_tests.rs",
+        "crates/tracedecay/src/daemon/invocation_tests/project_lifecycle_tests.rs"
+      ],
+      "required_verification": [
+        "blocking drain deadline regression test",
+        "exhausted runtime deadline regression test",
+        "feature ownership shutdown journey",
+        "superseded blocking hook work receipt-ordering regression test"
+      ]
+    },
+    {
+      "allowed_changes": [
+        "use the deadline-aware shutdown API in the production test-transport harness",
+        "reuse one absolute deadline across invocation and detached-server teardown"
+      ],
+      "category": "shutdown",
+      "forbidden_changes": [
+        "creating a fresh deadline budget between production-harness teardown stages",
+        "reordering unrelated production-harness teardown phases",
+        "adding provider or memory integration logic"
+      ],
+      "id": "production_harness_shutdown",
+      "max_changed_lines": 106,
+      "max_files": 1,
+      "paths": [
+        "crates/tracedecay/src/daemon/production_harness.rs"
+      ],
+      "required_verification": [
+        "test-transport library compilation",
+        "production harness shutdown journey"
+      ]
+    },
+    {
+      "allowed_changes": [
+        "select an explicit or Cargo-provided same-checkout CLI and otherwise fail closed",
+        "clear inherited daemon routing and share one isolated bounded production-equivalent socket and command environment",
+        "initialize fixture projects through their already-owned daemon instead of competing database writers",
+        "assert canonical path identity and use the authoritative project ID for fixture message search",
+        "pause virtual time only for lease TTL expiry and resume it before draining real SQLite workers",
+        "decode the CLI application envelope once and validate the retained result schema without changing behavioral result assertions",
+        "expect the exact unavailable-daemon Claude Stop diagnostic while retaining stdout, spool, and no-direct-database assertions",
+        "remove only the reverse registered-tool prose inventory and obsolete Hermes command-prose markers, preserving mentioned-tool validity, the readOnly allowlist, installed-template equality, and executable behavior"
+      ],
+      "cap_revision": {
+        "adr": "product/architecture/adr/ADR-0017-patch-footprint-revision-v4.md",
+        "measured_changed_lines": 325,
+        "measured_files": 9,
+        "policy_revision": "patch-footprint.v4",
+        "previous_max_changed_lines": 240,
+        "previous_max_files": 3
+      },
+      "category": "integration_test",
+      "forbidden_changes": [
+        "guessing a sibling profile binary or silently mixing checkout revisions",
+        "reusing an installed daemon or global profile",
+        "changing production behavior or its ownership and admission rules",
+        "weakening behavioral assertions, accepting multiple terminal outcomes, or skipping executable tests to hide a failure",
+        "loosening mentioned-tool validity, the readOnly allowlist, or exact installed-template equality"
+      ],
+      "id": "integration_test_runtime_isolation",
+      "max_changed_lines": 373,
+      "max_files": 9,
+      "paths": [
+        "crates/tracedecay/tests/common/mod.rs",
+        "crates/tracedecay/tests/memory_suite/memory_eval_test.rs",
+        "crates/tracedecay-daemon-control/src/service/tests.rs",
+        "crates/tracedecay/src/runtime_ports.rs",
+        "crates/tracedecay/tests/transcript_ingest_suite/hermes.rs",
+        "crates/tracedecay/src/daemon/invocation_tests/lsp_tests.rs",
+        "crates/tracedecay/src/daemon/tests/rmcp_route.rs",
+        "crates/tracedecay/tests/hooks_lsp_suite/hook_lifecycle_lease_test.rs",
+        "crates/tracedecay/src/mcp/tools/plugin_conformance_tests.rs",
+        "crates/tracedecay/tests/hermes_suite/lcm_bridge.rs"
+      ],
+      "required_verification": [
+        "memory-suite harness isolation tests",
+        "same-checkout CLI resolution tests",
+        "daemon socket isolation tests",
+        "cargo nextest run --workspace --profile ci --locked --features tracedecay/test-helpers --no-tests=fail"
+      ]
+    },
+    {
+      "allowed_changes": [
+        "fan out an already-admitted normalized observation into a bounded product-owned dispatcher",
+        "attach stable operation identity and exact scope after canonical ingest or settlement"
+      ],
+      "category": "observation",
+      "forbidden_changes": [
+        "blocking or changing canonical host ingest in observer mode",
+        "host-specific provider logic",
+        "provider output affecting prompts or external actions"
+      ],
+      "id": "normalized_observation_mount",
+      "max_changed_lines": 160,
+      "max_files": 2,
+      "paths": [
+        "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest.rs",
+        "crates/tracedecay/src/mcp/server/hook_writes.rs",
+        "crates/tracedecay-daemon-service/src/invocation/observability_producer.rs"
+      ],
+      "required_verification": [
+        "observer non-interference tests",
+        "queue capacity and crash-recovery tests",
+        "host ingest parity tests"
+      ]
+    },
+    {
+      "allowed_changes": [
+        "invoke provider-neutral bounded advisory recall",
+        "carry an advisory, provenance-labelled provider-memory lane into MCP context assembly",
+        "validate provenance, freshness, exact scope, policy, deadline, and cancellation before context assembly",
+        "report typed per-lane coverage and degradation"
+      ],
+      "category": "recall",
+      "forbidden_changes": [
+        "provider constructing the final context envelope",
+        "provider candidate replacing current code truth",
+        "cross-worktree or cross-session candidate reuse",
+        "silent fallback to another provider"
+      ],
+      "id": "recall_context_mount",
+      "max_changed_lines": 340,
+      "max_files": 5,
+      "paths": [
+        "crates/tracedecay-session-runtime/src/session_retrieval/admitted.rs",
+        "crates/tracedecay-session-runtime/src/session_retrieval/contract.rs",
+        "crates/tracedecay/src/mcp/server/requests/tool_dispatch.rs",
+        "crates/tracedecay-session-memory/src/context/mod.rs",
+        "crates/tracedecay-graph-query/src/context/read_modes.rs",
+        "crates/tracedecay-usecases/src/diagnostics_query.rs",
+        "crates/tracedecay-usecases/src/diagnostics_store.rs",
+        "crates/tracedecay-usecases/src/primitives/production.rs",
+        "crates/tracedecay-usecases/src/primitives/runtime.rs"
+      ],
+      "required_verification": [
+        "context compiler conformance",
+        "stale-memory and provider-failure journeys",
+        "multi-worktree scope isolation"
+      ]
+    },
+    {
+      "allowed_changes": [
+        "emit idempotent provider feedback/outcome observations after canonical settlement",
+        "record typed dispatch receipts without changing the settled result"
+      ],
+      "category": "feedback",
+      "forbidden_changes": [
+        "provider directly changing Native trust",
+        "post-commit provider failure becoming canonical operation failure",
+        "provider-specific transport schema"
+      ],
+      "id": "post_settlement_feedback_mount",
+      "max_changed_lines": 160,
+      "max_files": 2,
+      "paths": [
+        "crates/tracedecay-daemon-service/src/invocation/feedback.rs",
+        "crates/tracedecay-session-memory/src/memory_tracking.rs",
+        "crates/tracedecay/src/daemon/scheduler/automation_observation.rs"
+      ],
+      "required_verification": [
+        "Native feedback parity tests",
+        "post-settlement failure isolation tests"
+      ]
+    },
+    {
+      "allowed_changes": [
+        "register provider-neutral configuration keys and capability selection",
+        "pin explicit observer/active mode and provider instance scope"
+      ],
+      "category": "configuration",
+      "forbidden_changes": [
+        "provider self-activation",
+        "provider names outside registry/adapter construction",
+        "credentials embedded in public configuration values",
+        "configuration bypassing transactional revision and audit"
+      ],
+      "id": "configuration_registry_mount",
+      "max_changed_lines": 718,
+      "max_files": 5,
+      "paths": [
+        "crates/tracedecay/src/config.rs",
+        "crates/tracedecay-configuration/src/configuration/runtime.rs",
+        "crates/tracedecay-configuration/src/configuration/operations.rs",
+        "crates/tracedecay-domain/src/configuration.rs",
+        "crates/tracedecay-usecases/src/config/mod.rs",
+        "crates/tracedecay/src/config/tests.rs",
+        "crates/tracedecay-configuration/src/config/mod.rs"
+      ],
+      "required_verification": [
+        "configuration authorization and rollback tests",
+        "provider selection and no-silent-fallback tests"
+      ]
+    },
+    {
+      "allowed_changes": [
+        "call the existing host-neutral transcript ingest route from a host lifecycle event under an explicit, bounded time budget",
+        "register an additional project-scoped transcript-capture kernel for a host that already has a profile-scoped kernel, reusing the session-sync ingest pass",
+        "declare an opt-in, default-off product test target and the feature it requires in the tracedecay-cli manifest",
+        "extend the existing host lifecycle acceptance test with repeated-install idempotence and interrupted-reinstall rollback assertions",
+        "provide an executable fake Codex CLI fixture that models the exact non-interactive plugin grammar so the acceptance test drives the production Codex invocation path"
+      ],
+      "category": "host_hook_ingest",
+      "forbidden_changes": [
+        "naming a provider, registry, or fabric type on the hook or kernel path",
+        "letting an ingest failure, timeout, or unreachable daemon change the host's own hook answer",
+        "unbounded or unbudgeted ingest work on a host lifecycle event",
+        "minting a second admission or scope-identity path instead of reusing the host-neutral one the session-sync worker uses",
+        "turning the product test target or its feature on by default"
+      ],
+      "id": "host_hook_ingest",
+      "max_changed_lines": 486,
+      "max_files": 5,
+      "paths": [
+        "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest/kernels.rs",
+        "crates/tracedecay-cli/Cargo.toml",
+        "crates/tracedecay-cli/tests/host_lifecycle_cli_acceptance.rs",
+        "crates/tracedecay-cli/tests/host_lifecycle_cli_acceptance/native_plugin_fixture.rs",
+        "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest/tests.rs"
+      ],
+      "required_verification": [
+        "cargo test --locked -p tracedecay --features memory-provider-host hook_runtime",
+        "cargo test --locked -p tracedecay-cli --features test-transport --test host_lifecycle_cli_acceptance",
+        "python3 scripts/product/check-patch-footprint-policy.py"
+      ]
+    },
+    {
+      "allowed_changes": [
+        "acknowledge a hook event carrying a request id only after its canonical effect completed, leaving id-less notifications response-free",
+        "strip route-only host metadata from handler arguments after routing while preserving the original identity view",
+        "select the retained project server a published private route names for a projectless reader socket, under the projectless profile admission",
+        "forward route-only metadata through the CLI validation gate without weakening declared tool fields",
+        "test the bridge in process and through the shipped binary over the real broker socket"
+      ],
+      "category": "hook_route_bridge",
+      "forbidden_changes": [
+        "creating or mutating a project route anywhere but the hook publication path",
+        "serving a private route to a socket authenticated for another profile",
+        "stripping a field the called tool declares in its input schema",
+        "naming a provider, registry, or fabric type on the bridge path",
+        "blocking a hook client beyond the existing hook timeout"
+      ],
+      "id": "hook_route_bridge",
+      "max_changed_lines": 1046,
+      "max_files": 12,
+      "paths": [
+        "crates/tracedecay/src/daemon/projectless.rs",
+        "crates/tracedecay/src/daemon/connection_serving.rs",
+        "crates/tracedecay/src/daemon/core_hooks.rs",
+        "crates/tracedecay/src/mcp/server/requests.rs",
+        "crates/tracedecay/src/mcp/project_route.rs",
+        "crates/tracedecay/src/mcp/server/host_admission_tests.rs",
+        "crates/tracedecay/src/daemon/tests.rs",
+        "crates/tracedecay/src/daemon/tests/projectless.rs",
+        "crates/tracedecay-cli/src/tool_command/args.rs",
+        "crates/tracedecay-cli/src/tool_command/tests.rs",
+        "crates/tracedecay/tests/daemon_suite/indexing_lifecycle_test.rs",
+        "crates/tracedecay/tests/daemon_suite/code_index_journey.rs"
+      ],
+      "required_verification": [
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib daemon::tests::projectless::",
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib mcp::project_route::",
+        "cargo test --locked -p tracedecay --features memory-provider-host,test-helpers,test-transport --lib mcp::server::host_admission_tests::",
+        "cargo test --locked -p tracedecay-cli --lib tool_command::",
+        "cargo test --locked -p tracedecay --features test-helpers,test-transport --test daemon_suite cold_registered_project_hook_ack_preserves_route_and_terminal_receipt",
+        "python3 scripts/product/check-patch-footprint-policy.py"
+      ]
+    },
+    {
+      "allowed_changes": [
+        "return a typed SemanticUnseated outcome from code-generation retention and treat it as an ordinary quiet completion",
+        "delete the offline protection set and its serving-generation pin helper",
+        "bind the vector writer lane to the durable code scope and let the blocking deletion own the writer freeze",
+        "replace or add retention tests and harness helpers that prove the online-only authority"
+      ],
+      "category": "vector_retention_authority",
+      "forbidden_changes": [
+        "deleting a source generation without an exact, complete vector inventory",
+        "treating a missing or offline inventory as empty",
+        "introducing a new lock, sleep, or fixed poll count as synchronization",
+        "changing the fail-closed handling of reset, corrupt, or denied vector authorities"
+      ],
+      "id": "vector_retention_authority",
+      "max_changed_lines": 517,
+      "max_files": 5,
+      "paths": [
+        "crates/tracedecay/src/daemon/store_maintenance/mod.rs",
+        "crates/tracedecay/src/daemon/maintenance/generation.rs",
+        "crates/tracedecay/src/daemon/store_maintenance/vector_retention_tests.rs",
+        "crates/tracedecay/src/daemon/production_harness/generation_retention_test.rs",
+        "crates/tracedecay-usecases/src/semantic_runtime/production.rs"
+      ],
+      "required_verification": [
+        "cargo nextest run -p tracedecay -p tracedecay-usecases --lib --features tracedecay/test-helpers,tracedecay/test-transport,tracedecay/memory-provider-host --locked --no-fail-fast --no-tests=fail -E 'test(/^daemon::store_maintenance::vector_retention_tests::/) | test(/^daemon::production_harness::generation_retention_test::/) | test(=vector_writer_fence_survives_runtime_remount)'",
+        "python3 scripts/product/check-patch-footprint-policy.py"
+      ]
+    },
+    {
+      "allowed_changes": [
+        "replace a private field access with the public accessor upstream introduced for it, inside a file upstream only compiles under a feature",
+        "add a crate-level recursion_limit attribute so hotpath-instrumented async bodies compile under a feature set upstream does not build for that crate"
+      ],
+      "category": "feature_gated_build_repair",
+      "forbidden_changes": [
+        "changing what a repaired expression reads or the behavior of the feature",
+        "touching a file whose relevant shipped feature build already compiles without the repair"
+      ],
+      "id": "feature_gated_build_repair",
+      "max_changed_lines": 27,
+      "max_files": 4,
+      "paths": [
+        "crates/tracedecay/src/dashboard.rs",
+        "crates/tracedecay-host-admission/src/lib.rs",
+        "crates/tracedecay-host-admission/tests/host_capture_background_cpu_admission.rs",
+        "crates/tracedecay-session-temporal-store/src/lib.rs"
+      ],
+      "required_verification": [
+        "cargo check --workspace --all-targets --features test-transport --locked",
+        "cargo check --workspace --all-targets --features hotpath,hotpath-mcp --locked",
+        "python3 scripts/product/check-patch-footprint-policy.py"
+      ]
+    }
+  ],
+  "bead_id": "tdmem-0105",
+  "convergence_map": {
+    "entry_required_for_every_upstream_existing_file": true,
+    "exception_required_fields": [
+      "zone",
+      "adr",
+      "why_unavoidable",
+      "alternatives_rejected",
+      "policy_revision",
+      "rollback_plan"
+    ],
+    "path": "product/upstream/convergence-map.json",
+    "required_entry_fields": [
+      "path",
+      "touch_point",
+      "rationale",
+      "semantic_invariants",
+      "verification",
+      "bead_ids",
+      "line_budget",
+      "rebase_or_removal_plan",
+      "status"
+    ]
+  },
+  "dependency_direction_exception_contract": {
+    "adr_prefix": "product/architecture/adr/",
+    "exact_edge_only": true,
+    "required_fields": [
+      "id",
+      "rule_id",
+      "from_package",
+      "to_package",
+      "adr",
+      "rationale",
+      "reviewed_by",
+      "status"
+    ],
+    "status_values": [
+      "active",
+      "retired"
+    ]
+  },
+  "dependency_direction_exceptions": [],
+  "dependency_direction_rules": [
+    {
+      "forbidden_dependencies": [
+        "tracedecay",
+        "tracedecay-*",
+        "tracedecay-runtime-core",
+        "tracedecay-runtime*",
+        "tracedecay-automation*",
+        "tracedecay-*store*",
+        "tracedecay-storage*",
+        "tracedecay-*-db",
+        "tracedecay-rusqlite-runtime",
+        "tracedecay-code-*",
+        "tracedecay-*query*",
+        "rusqlite",
+        "grafeo*",
+        "libsql*",
+        "private-fs*"
+      ],
+      "from_packages": [
+        "tracedecay-memory-provider-api"
+      ],
+      "id": "provider_api_is_inward",
+      "reason": "The capability contract cannot depend on fabric, any upper memory layer, root composition, or TraceDecay persistence, code-index, query, or semantic internals."
+    },
+    {
+      "allowed_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-memory-provider-*",
+        "biomem*",
+        "ncm*",
+        "ocean*"
+      ],
+      "from_packages": [
+        "tracedecay-memory-fabric"
+      ],
+      "id": "memory_fabric_is_provider_neutral",
+      "reason": "Fabric orchestrates capability contracts and cannot import or name a concrete provider implementation or SDK."
+    },
+    {
+      "allowed_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-memory-provider-*",
+        "biomem*",
+        "ncm*",
+        "ocean*"
+      ],
+      "from_packages": [
+        "tracedecay-memory-context"
+      ],
+      "id": "context_compiler_is_provider_neutral",
+      "reason": "Final context assembly depends only on provider API/capability registry and TraceDecay application ports."
+    },
+    {
+      "allowed_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-memory-provider-*",
+        "tracedecay-memory-fabric",
+        "biomem*",
+        "ncm*",
+        "ocean*",
+        "tracedecay"
+      ],
+      "from_packages": [
+        "tracedecay-memory-provider-native"
+      ],
+      "id": "adapters_do_not_depend_on_each_other",
+      "reason": "The Native adapter stays below fabric and cannot know external providers or the root binary crate."
+    },
+    {
+      "except_packages": [
+        "tracedecay-memory-provider-api",
+        "tracedecay-memory-provider-registry"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay",
+        "tracedecay-memory-fabric",
+        "tracedecay-runtime-core",
+        "tracedecay-runtime*",
+        "tracedecay-automation*",
+        "tracedecay-*store*",
+        "tracedecay-storage*",
+        "tracedecay-*-db",
+        "tracedecay-rusqlite-runtime",
+        "tracedecay-code-*",
+        "tracedecay-*query*",
+        "rusqlite",
+        "grafeo*",
+        "libsql*",
+        "private-fs*"
+      ],
+      "from_packages": [
+        "tracedecay-memory-provider-*"
+      ],
+      "id": "concrete_adapters_do_not_reach_tracedecay_internals",
+      "reason": "Concrete adapters depend on the provider API and narrow application ports, never fabric, root composition, storage, database, code-index, query, or semantic internals; the provider registry is an explicit composition-layer exception."
+    },
+    {
+      "allowed_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-memory-provider-*",
+        "tracedecay-memory-fabric",
+        "tracedecay",
+        "ncm*",
+        "tracedecay-runtime-core",
+        "tracedecay-runtime*",
+        "tracedecay-automation*",
+        "tracedecay-*store*",
+        "tracedecay-storage*",
+        "tracedecay-*-db",
+        "tracedecay-rusqlite-runtime",
+        "tracedecay-code-*",
+        "tracedecay-*query*",
+        "rusqlite",
+        "grafeo*",
+        "libsql*",
+        "private-fs*",
+        "ocean*"
+      ],
+      "from_packages": [
+        "tracedecay-memory-provider-ncm"
+      ],
+      "id": "ncm_adapter_does_not_reach_native_store",
+      "dependency_kinds": [
+        "normal",
+        "build"
+      ],
+      "reason": "NCM uses provider contracts and its licensed Biomem SDK/transport, never Native persistence, raw storage/private-filesystem engines, TraceDecay runtime internals, or a separate NCM/OCEAN adapter SDK."
+    },
+    {
+      "allowed_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-memory-provider-*",
+        "biomem*",
+        "ncm*",
+        "ocean*"
+      ],
+      "from_packages": [
+        "tracedecay-cli",
+        "tracedecay-mcp",
+        "tracedecay-dashboard-api",
+        "tracedecay-sdk"
+      ],
+      "id": "transports_are_adapter_blind",
+      "reason": "Public transports expose provider-neutral application contracts."
+    },
+    {
+      "allowed_dependencies": [
+        "tracedecay-memory-provider-api"
+      ],
+      "except_packages": [
+        "tracedecay",
+        "tracedecay-memory-provider-registry",
+        "tracedecay-memory-provider-native",
+        "tracedecay-memory-provider-ncm",
+        "tracedecay-memory-conformance"
+      ],
+      "forbidden_dependencies": [
+        "tracedecay-memory-provider-*",
+        "biomem*",
+        "ncm*",
+        "ocean*"
+      ],
+      "from_packages": [
+        "tracedecay-*"
+      ],
+      "id": "upstream_crates_do_not_import_concrete_adapters",
+      "reason": "Only the narrow composition/registry layer may construct concrete adapters."
+    }
+  ],
+  "exception_zones": [
+    {
+      "default_policy": "forbidden",
+      "id": "native_database_internals",
+      "paths": [
+        "crates/tracedecay-runtime-core/src/store/**",
+        "crates/tracedecay-store/**",
+        "crates/tracedecay-global-db/**",
+        "crates/tracedecay-graph-db/**",
+        "crates/tracedecay-rusqlite-runtime/**"
+      ],
+      "reason": "These crates own canonical Native persistence, lineage, schemas, transactions, graph publication, and recovery. Cognitive providers must sit above them.",
+      "required_exception_evidence": [
+        "ADR proving no application/composition seam can satisfy the requirement",
+        "convergence-map entry with semantic invariants and rollback plan",
+        "Native parity and migration/recovery tests",
+        "policy revision if the zero-file zone cap is raised"
+      ]
+    },
+    {
+      "default_policy": "forbidden",
+      "id": "code_index_internals",
+      "paths": [
+        "crates/tracedecay-code-index/**",
+        "crates/tracedecay-code-index-runtime/**",
+        "crates/tracedecay-code-index-retention/**",
+        "crates/tracedecay-code-extraction/**",
+        "crates/tracedecay-query/**"
+      ],
+      "reason": "TraceDecay remains authority for current code and verified code projections; provider integration must consume ports rather than alter indexing semantics.",
+      "required_exception_evidence": [
+        "ADR with rejected port-level alternatives",
+        "generation/staleness invariant tests",
+        "convergence-map entry and rebase plan",
+        "policy revision if the zero-file zone cap is raised"
+      ]
+    },
+    {
+      "default_policy": "generated_only",
+      "id": "generated_contracts",
+      "paths": [
+        "crates/tracedecay-sdk/src/operations.rs",
+        "crates/tracedecay-dashboard-api/src/contract_schema.rs",
+        "Cargo.lock"
+      ],
+      "reason": "Generated outputs must come from their owning catalog/generator or pinned dependency resolver, never manual provider edits.",
+      "required_exception_evidence": [
+        "generator/catalog source touch in the same change",
+        "reproduction command and zero-drift receipt",
+        "convergence-map entry identifying generated output",
+        "ADR only when the generator contract itself changes"
+      ]
+    },
+    {
+      "default_policy": "forbidden",
+      "id": "host_specific_adapters",
+      "paths": [
+        "crates/tracedecay-agent-hosts/**",
+        "crates/tracedecay-host-integration/**",
+        "crates/tracedecay-hooks/**",
+        "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/hermes.rs",
+        "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/context_scout.rs"
+      ],
+      "reason": "Provider observation belongs after host-neutral admission. Host-specific edits multiply patch cost and risk different authority semantics per agent.",
+      "required_exception_evidence": [
+        "ADR proving normalized host-neutral observation is insufficient",
+        "parity tests for every supported coding-agent host",
+        "convergence-map entry with removal plan",
+        "policy revision if the zero-file zone cap is raised"
+      ]
+    },
+    {
+      "default_policy": "forbidden",
+      "id": "toolchain_build_and_ci_policy",
+      "paths": [
+        "rust-toolchain.toml",
+        ".cargo/config.toml",
+        "deny.toml",
+        ".github/workflows/ci*.yml",
+        ".github/workflows/release*.yml"
+      ],
+      "reason": "Provider work must not weaken or silently reshape Zack's supported build, lint, test, or release lanes.",
+      "required_exception_evidence": [
+        "ADR with upstream compatibility impact",
+        "clean baseline and cross-platform evidence",
+        "convergence-map entry and revert plan",
+        "policy revision if the zero-file zone cap is raised"
+      ]
+    }
+  ],
+  "initial_budget": {
+    "default_max_exception_zone_files": 6,
+    "manual_generated_file_edits": 0,
+    "max_allowed_touch_point_files_per_category": 15,
+    "max_changed_lines_per_upstream_file": 830,
+    "max_composition_root_files": 15,
+    "max_exception_files_per_adr": 2,
+    "max_total_upstream_changed_lines": 6430,
+    "max_upstream_existing_production_files": 56,
+    "max_upstream_existing_test_or_fixture_files": 26,
+    "max_workspace_manifest_files": 2,
+    "notes": [
+      "Revision patch-footprint.v2 is approved by product/architecture/adr/ADR-0011-patch-footprint-revision-v2.md: every cap equals the M4 observation-journey mount, M5 cognitive-recall port, Native configuration registration, and session-sync exact-scope footprint measured at that revision's tree plus at most roughly fifteen percent headroom. Per-entry line_budget values in the convergence map remain the binding limit for an individual file.",
+      "Revision patch-footprint.v3 is approved by product/architecture/adr/ADR-0014-host-hook-ingest-footprint-revision-v3.md: it carries every v2 cap forward unchanged except the three the Claude Code host hook ingest journey moves - upstream existing production files 34 -> 37, total upstream changed lines 3300 -> 3500, and exception-zone files 2 -> 4 - each set from the footprint measured at this revision's tree (37 production files, 3393 total changed lines, 4 exception-zone files) plus at most roughly fifteen percent headroom.",
+      "Revision patch-footprint.v4 is approved by product/architecture/adr/ADR-0017-patch-footprint-revision-v4.md: it re-measures every aggregate cap against the tree that carries the hook-route bridge, the online-only retention authority, the feature-gated build repair, and the executable Codex fixture at upstream head 3b59bb7eb - upstream existing production files 37 -> 56, test/fixture files 9 -> 18, total upstream changed lines 3500 -> 6430, changed lines per upstream file 560 -> 830, and exception-zone files 4 -> 5 - each the measurement plus at most roughly fifteen percent headroom. It adds the hook_route_bridge, vector_retention_authority, and feature_gated_build_repair touch points, widens host_hook_ingest to the Codex fixture, and admits one more host_specific_adapters file (agents/claude.rs) under this ADR.",
+      "ADR-0016 supersedes only ADR-0015 as the approving decision for the daemon_shutdown_deadline touch point, retaining 8 files and raising only its line cap from 360 to 420 against a measured 8 files and 416 lines for the deterministic types_tests.rs supersession receipt-ordering regression. Root commits this policy slice before the implementation slice. It changes no aggregate cap and keeps patch-footprint.v3.",
+      "The 2026-09-08 ADR-0017 reconciliation supersedes the original v4 snapshot with 54 production files, 23 test/fixture files, 5715 changed lines, and 6 explicit exception-zone files at the same pinned head. It retains production and line caps, revises the test/fixture cap to 26 and exception cap to 6, and binds the expanded fixture seam to measured behavior repairs.",
+      "Added files under product_owned_paths are excluded from the upstream footprint totals.",
+      "Renaming or copying an upstream file counts as touching the destination and source.",
+      "Changed lines are additions plus deletions from git numstat against the immutable upstream floor.",
+      "Cargo.lock is a generated dependency-resolution output: it may change only with a workspace-manifest touch and a focused cargo metadata/build receipt; it is not a manually editable contract."
+    ]
+  },
+  "policy_revision": "patch-footprint.v4",
+  "principles": [
+    "Add product-owned crates and tests instead of embedding provider logic in Zack-owned crates.",
+    "Mount product behavior only at narrow application, daemon-composition, observation, recall, feedback, and configuration seams.",
+    "Every intentional edit to an upstream-owned existing file has one convergence-map entry with rationale, semantic invariants, focused verification, line budget, and rebase/removal plan.",
+    "Provider names are confined to product registry and adapters; upstream public transports and stores depend on capability contracts only.",
+    "Database internals, code-index internals, generated contracts, host-specific adapters, and toolchain/build policy are zero-touch zones unless an ADR proves the seam cannot be mounted elsewhere.",
+    "An exception does not silently raise the global budget: it requires both an ADR and an explicit policy revision when a hard cap would be exceeded."
+  ],
+  "product_owned_paths": [
+    ".beads/**",
+    "product/**",
+    "scripts/product/**",
+    "scripts/check-product-upstream-floor.py",
+    "tests/product_*",
+    ".github/workflows/apply-beads-operation.yml",
+    ".github/workflows/materialize-beads.yml",
+    ".github/workflows/product-*.yml",
+    "crates/tracedecay-memory-provider-api/**",
+    "crates/tracedecay-memory-fabric/**",
+    "crates/tracedecay-memory-provider-registry/**",
+    "crates/tracedecay-memory-provider-native/**",
+    "crates/tracedecay-memory-provider-ncm/**",
+    "crates/tracedecay-memory-ncm-core/**",
+    "crates/tracedecay-memory-ncm-runtime/**",
+    "crates/tracedecay-memory-observation/**",
+    "crates/tracedecay-memory-hygiene/**",
+    "crates/tracedecay-memory-context/**",
+    "crates/tracedecay-memory-conformance/**",
+    "crates/tracedecay-memory-evaluation/**",
+    "crates/tracedecay/tests/product_memory_provider/**",
+    "crates/tracedecay/tests/product_memory_provider_*.rs",
+    "crates/tracedecay-cli/tests/product_memory_provider_*.rs",
+    "crates/tracedecay/src/daemon/retained_owner/native_provider.rs",
+    "crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs",
+    "crates/tracedecay/src/daemon/retained_owner/native_provider_parity_tests.rs",
+    "crates/tracedecay/src/daemon/retained_owner/native_baseline_tests.rs",
+    "crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs",
+    "crates/tracedecay/src/daemon/retained_owner/observation_journey.rs",
+    "crates/tracedecay/src/daemon/retained_owner/claude_host_journey_tests.rs",
+    "crates/tracedecay/src/daemon/retained_owner/observation_journey/tests/crash_restart_fuzz.rs",
+    "crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs"
+  ],
+  "schema_version": 1,
+  "scope": "Pluggable-memory implementation through Native parity, NCM observer admission, the mounted observation journey (M4), cognitive recall integration (M5), and evaluation baselines (M8). Revision patch-footprint.v2 (ADR-0011) replaced the v1 caps with the footprint measured at its revision tree plus bounded headroom, and revision patch-footprint.v3 (ADR-0014) does the same for the Claude Code host hook ingest journey, which also adds the host_hook_ingest touch point and a two-file host-adapter exception. Later phases must either remain inside these caps or approve a new policy revision by ADR. Revision patch-footprint.v4 (ADR-0017) re-measures every cap for the hook-route bridge, the online-only retention authority, the feature-gated build repair, and the executable Codex fixture at upstream head 3b59bb7eb.",
+  "title": "TraceDecay V2 provider patch-footprint policy",
+  "upstream_floor": {
+    "metadata": "product/upstream/tracedecay-v2-pr707.json",
+    "pull_request": 707,
+    "repository": "ScriptedAlchemy/tracedecay",
+    "sha": "5749e4fcfe268e17bd19a0e6ef90c646f7b37289"
+  },
+  "verification": {
+    "branch_diff_command": "git diff --numstat 5749e4fcfe268e17bd19a0e6ef90c646f7b37289...HEAD --",
+    "checker": "scripts/product/check-patch-footprint-policy.py",
+    "convergence_map": "product/upstream/convergence-map.json",
+    "tests": [
+      "tests/product_patch_footprint_policy_test.py"
+    ]
+  }
+}

@@ -1,0 +1,451 @@
+{
+  "schema_version": 1,
+  "catalog_id": "tracedecay.coding-memory.metrics.v1",
+  "catalog_version": 1,
+  "bead_id": "tdmem-0904",
+  "title": "Coding-memory quality, safety, cost, and latency metric catalog",
+  "corpus_binding": {
+    "corpus_id": "tracedecay.coding-memory.scenarios.v1",
+    "schema_version": 1,
+    "bead_id": "tdmem-0901"
+  },
+  "terminal_contract_binding": {
+    "contract_id": "tracedecay.memory.provider.terminal.v1",
+    "schema_version": 1
+  },
+  "label_vocabulary": {
+    "version": 1,
+    "labels": [
+      "useful",
+      "harmful",
+      "stale",
+      "irrelevant",
+      "unverifiable",
+      "indeterminate",
+      "missing"
+    ],
+    "resolved_labels": [
+      "useful",
+      "harmful",
+      "stale",
+      "irrelevant",
+      "unverifiable"
+    ],
+    "unresolved_labels": [
+      "indeterminate",
+      "missing"
+    ],
+    "reconciliation": "The provider feedback vocabulary (tdmem-0802) is not yet a typed enum in tracedecay-memory-provider-api; this catalog pins the label set metrics are computed over, and the feedback capability must map onto it when it lands. An unresolved label is never coerced to zero or to pass."
+  },
+  "task_outcome_vocabulary": [
+    "pass",
+    "fail",
+    "indeterminate"
+  ],
+  "provenance_state_vocabulary": {
+    "complete": [
+      "available",
+      "redacted"
+    ],
+    "incomplete": [
+      "unavailable",
+      "missing"
+    ],
+    "rationale": "The recall contract requires provenance to be explicit; a redacted provenance record is explicit and policy-bound, an unavailable or missing one is not."
+  },
+  "percentile_method": {
+    "name": "nearest_rank",
+    "definition": "Sort samples ascending; the P-th percentile of N samples is the sample at one-based rank ceil(P / 100 * N). Zero samples yield an indeterminate value; timings are never fabricated."
+  },
+  "unresolved_label_policies": {
+    "exclude_and_report": "Candidates with an unresolved label leave the denominator; the report carries labeled, unlabeled, and indeterminate counts next to the value. When candidates exist but every label is unresolved the value is indeterminate, never zero.",
+    "indeterminate_if_any": "One unresolved label makes the whole metric indeterminate; a safety metric that is indeterminate fails the safety gate.",
+    "not_label_based": "The metric is mechanical and ignores labels."
+  },
+  "zero_population_policies": {
+    "not_applicable": "An empty population is reported as not applicable with a reason; it neither passes nor fails.",
+    "indeterminate": "An empty population is reported as indeterminate with a reason."
+  },
+  "safety_gate": {
+    "rule": "The safety gate fails when any safety_gating metric of any scenario exceeds its ceiling or is indeterminate, when any rubric check listed in safety_critical_checks is not a pass, or when a scenario's terminal gate failed. Not-applicable safety metrics do not fail the gate.",
+    "indeterminate_policy": "record_indeterminate_and_fail_the_safety_gate",
+    "missing_evidence_policy": "indeterminate",
+    "provider_failure_policy": "record_typed_failure_without_inference",
+    "aggregate_task_score_can_hide_safety": false
+  },
+  "aggregate_task_score": {
+    "definition": "Mean of task_outcome over scenarios whose task outcome is resolved (pass or fail), in [0, 1]; absent when no scenario resolved.",
+    "coverage_fields": [
+      "resolved_scenarios",
+      "indeterminate_scenarios"
+    ]
+  },
+  "verdict_rule": "verdict is fail whenever the safety gate fails, regardless of aggregate_task_score; otherwise pass. No report surface exposes aggregate_task_score without the safety gate and verdict beside it.",
+  "safety_critical_checks": [
+    {"scenario_id": "stale_project_change", "check_ids": ["stale_claim_marked", "scope_exact"]},
+    {"scenario_id": "failed_approach", "check_ids": ["negative_outcome_visible", "scope_and_provenance"]},
+    {"scenario_id": "cross_agent_reuse", "check_ids": ["exact_scope_match"]},
+    {"scenario_id": "project_worktree_scope", "check_ids": ["sibling_isolation", "project_isolation", "identity_fields"]},
+    {"scenario_id": "contradiction", "check_ids": ["current_authority", "no_blended_rule"]},
+    {"scenario_id": "restart", "check_ids": ["replay_idempotent", "scope_preserved"]},
+    {"scenario_id": "cancellation", "check_ids": ["terminal_is_cancelled", "effect_boundary", "no_pre_reconcile_retry"]},
+    {"scenario_id": "provider_corruption", "check_ids": ["corruption_visible", "no_corrupt_recall", "no_implicit_repair", "authority_unchanged"]},
+    {"scenario_id": "privacy_deletion", "check_ids": ["exact_source_target", "verified_absence", "restart_persistence", "unrelated_state_preserved"]}
+  ],
+  "metrics": [
+    {
+      "metric_id": "task_outcome",
+      "version": 1,
+      "class": "quality",
+      "title": "Task outcome",
+      "description": "Whether the scenario task passed its rubric and terminal gate.",
+      "numerator": "1 when the task outcome is pass, 0 when fail",
+      "denominator": {
+        "population": "one scenario with a resolved task outcome",
+        "unresolved_label_policy": "not_label_based",
+        "zero_population_policy": "indeterminate"
+      },
+      "unit": "ratio",
+      "direction": "higher_is_better",
+      "aggregation": {
+        "per_scenario": "single_value",
+        "per_provider": "pooled_ratio"
+      },
+      "determinism": "deterministic",
+      "safety_gating": false,
+      "ceiling": null,
+      "inputs": ["task_outcome"],
+      "applicable_scenarios": null,
+      "rubric_check_bindings": [
+        {"scenario_id": "failed_approach", "check_ids": ["bounded_claim"]},
+        {"scenario_id": "restart", "check_ids": ["replay_idempotent", "identity_handled"]},
+        {"scenario_id": "cancellation", "check_ids": ["terminal_is_cancelled", "effect_boundary", "resume_is_bounded", "no_pre_reconcile_retry"]}
+      ]
+    },
+    {
+      "metric_id": "useful_recall_precision",
+      "version": 1,
+      "class": "quality",
+      "title": "Useful recall precision",
+      "description": "Share of admitted candidates with a resolved label that were useful for the task.",
+      "numerator": "admitted candidates labeled useful",
+      "denominator": {
+        "population": "admitted candidates with a resolved label (useful, harmful, stale, irrelevant, unverifiable)",
+        "unresolved_label_policy": "exclude_and_report",
+        "zero_population_policy": "not_applicable"
+      },
+      "unit": "ratio",
+      "direction": "higher_is_better",
+      "aggregation": {
+        "per_scenario": "ratio",
+        "per_provider": "pooled_ratio"
+      },
+      "determinism": "deterministic",
+      "safety_gating": false,
+      "ceiling": null,
+      "inputs": ["candidates.label"],
+      "applicable_scenarios": null,
+      "rubric_check_bindings": [
+        {"scenario_id": "stale_project_change", "check_ids": ["current_revision_wins"]},
+        {"scenario_id": "failed_approach", "check_ids": ["successful_replacement_preferred"]},
+        {"scenario_id": "cross_agent_reuse", "check_ids": ["reuse_is_available"]},
+        {"scenario_id": "project_worktree_scope", "check_ids": ["target_worktree_wins"]},
+        {"scenario_id": "contradiction", "check_ids": ["current_authority"]},
+        {"scenario_id": "restart", "check_ids": ["state_survives"]}
+      ]
+    },
+    {
+      "metric_id": "harmful_stale_recall_rate",
+      "version": 1,
+      "class": "safety",
+      "title": "Harmful or stale recall rate",
+      "description": "Share of admitted candidates that were harmful or stale; one unlabeled admitted candidate makes the metric indeterminate.",
+      "numerator": "admitted candidates labeled harmful or stale",
+      "denominator": {
+        "population": "all admitted candidates; requires every admitted candidate to carry a resolved label",
+        "unresolved_label_policy": "indeterminate_if_any",
+        "zero_population_policy": "not_applicable"
+      },
+      "unit": "ratio",
+      "direction": "lower_is_better",
+      "aggregation": {
+        "per_scenario": "ratio",
+        "per_provider": "pooled_ratio"
+      },
+      "determinism": "deterministic",
+      "safety_gating": true,
+      "ceiling": 0.0,
+      "inputs": ["candidates.label"],
+      "applicable_scenarios": null,
+      "rubric_check_bindings": [
+        {"scenario_id": "stale_project_change", "check_ids": ["stale_claim_marked"]},
+        {"scenario_id": "failed_approach", "check_ids": ["negative_outcome_visible"]},
+        {"scenario_id": "contradiction", "check_ids": ["conflict_visible", "no_blended_rule"]}
+      ]
+    },
+    {
+      "metric_id": "correction_latency",
+      "version": 1,
+      "class": "quality",
+      "title": "Correction latency",
+      "description": "Wall-clock time between a stale claim being contradicted by current evidence and the corrected claim being the one admitted.",
+      "numerator": "microseconds from the correcting evidence revision to the first admission of the corrected claim",
+      "denominator": {
+        "population": "one measured correction event per scenario that contains a stale-then-corrected claim",
+        "unresolved_label_policy": "not_label_based",
+        "zero_population_policy": "indeterminate"
+      },
+      "unit": "microseconds",
+      "direction": "lower_is_better",
+      "aggregation": {
+        "per_scenario": "single_value",
+        "per_provider": "mean"
+      },
+      "determinism": "nondeterministic",
+      "safety_gating": false,
+      "ceiling": null,
+      "inputs": ["correction"],
+      "applicable_scenarios": ["stale_project_change", "failed_approach", "contradiction"],
+      "rubric_check_bindings": []
+    },
+    {
+      "metric_id": "repeated_discovery_rate",
+      "version": 1,
+      "class": "cost",
+      "title": "Repeated discovery rate",
+      "description": "Share of facts the task required that the agent had to rediscover from source despite memory.",
+      "numerator": "required facts rediscovered from source",
+      "denominator": {
+        "population": "facts the task required, as enumerated by the runner",
+        "unresolved_label_policy": "not_label_based",
+        "zero_population_policy": "not_applicable"
+      },
+      "unit": "ratio",
+      "direction": "lower_is_better",
+      "aggregation": {
+        "per_scenario": "ratio",
+        "per_provider": "pooled_ratio"
+      },
+      "determinism": "deterministic",
+      "safety_gating": false,
+      "ceiling": null,
+      "inputs": ["discovery"],
+      "applicable_scenarios": null,
+      "rubric_check_bindings": []
+    },
+    {
+      "metric_id": "context_tokens",
+      "version": 1,
+      "class": "cost",
+      "title": "Context tokens",
+      "description": "Tokens of admitted context under the runner's pinned token estimator; indeterminate when no estimator was pinned.",
+      "numerator": "tokens of admitted context",
+      "denominator": {
+        "population": "one scenario",
+        "unresolved_label_policy": "not_label_based",
+        "zero_population_policy": "indeterminate"
+      },
+      "unit": "tokens",
+      "direction": "lower_is_better",
+      "aggregation": {
+        "per_scenario": "single_value",
+        "per_provider": "sum"
+      },
+      "determinism": "nondeterministic",
+      "safety_gating": false,
+      "ceiling": null,
+      "inputs": ["context_tokens"],
+      "applicable_scenarios": null,
+      "rubric_check_bindings": []
+    },
+    {
+      "metric_id": "recall_latency_p50",
+      "version": 1,
+      "class": "latency",
+      "title": "Recall latency p50",
+      "description": "Nearest-rank 50th percentile of recall wall-clock samples.",
+      "numerator": "50th percentile sample in microseconds",
+      "denominator": {
+        "population": "recall wall-clock samples supplied by the runner",
+        "unresolved_label_policy": "not_label_based",
+        "zero_population_policy": "indeterminate"
+      },
+      "unit": "microseconds",
+      "direction": "lower_is_better",
+      "aggregation": {
+        "per_scenario": "nearest_rank_percentile",
+        "per_provider": "pooled_nearest_rank_percentile"
+      },
+      "determinism": "nondeterministic",
+      "safety_gating": false,
+      "ceiling": null,
+      "inputs": ["recall_latency_micros"],
+      "applicable_scenarios": null,
+      "rubric_check_bindings": []
+    },
+    {
+      "metric_id": "recall_latency_p95",
+      "version": 1,
+      "class": "latency",
+      "title": "Recall latency p95",
+      "description": "Nearest-rank 95th percentile of recall wall-clock samples.",
+      "numerator": "95th percentile sample in microseconds",
+      "denominator": {
+        "population": "recall wall-clock samples supplied by the runner",
+        "unresolved_label_policy": "not_label_based",
+        "zero_population_policy": "indeterminate"
+      },
+      "unit": "microseconds",
+      "direction": "lower_is_better",
+      "aggregation": {
+        "per_scenario": "nearest_rank_percentile",
+        "per_provider": "pooled_nearest_rank_percentile"
+      },
+      "determinism": "nondeterministic",
+      "safety_gating": false,
+      "ceiling": null,
+      "inputs": ["recall_latency_micros"],
+      "applicable_scenarios": null,
+      "rubric_check_bindings": []
+    },
+    {
+      "metric_id": "human_curation_time",
+      "version": 1,
+      "class": "cost",
+      "title": "Human curation time",
+      "description": "Seconds a person spent curating, correcting, or deleting memory for the scenario; indeterminate when not measured.",
+      "numerator": "curation seconds measured by the runner",
+      "denominator": {
+        "population": "one scenario",
+        "unresolved_label_policy": "not_label_based",
+        "zero_population_policy": "indeterminate"
+      },
+      "unit": "seconds",
+      "direction": "lower_is_better",
+      "aggregation": {
+        "per_scenario": "single_value",
+        "per_provider": "sum"
+      },
+      "determinism": "nondeterministic",
+      "safety_gating": false,
+      "ceiling": null,
+      "inputs": ["curation_seconds"],
+      "applicable_scenarios": null,
+      "rubric_check_bindings": []
+    },
+    {
+      "metric_id": "provenance_completeness",
+      "version": 1,
+      "class": "quality",
+      "title": "Provenance completeness",
+      "description": "Share of admitted candidates whose provenance state is explicit (available or redacted).",
+      "numerator": "admitted candidates with provenance state available or redacted",
+      "denominator": {
+        "population": "all admitted candidates",
+        "unresolved_label_policy": "not_label_based",
+        "zero_population_policy": "not_applicable"
+      },
+      "unit": "ratio",
+      "direction": "higher_is_better",
+      "aggregation": {
+        "per_scenario": "ratio",
+        "per_provider": "pooled_ratio"
+      },
+      "determinism": "deterministic",
+      "safety_gating": false,
+      "ceiling": null,
+      "inputs": ["candidates.provenance"],
+      "applicable_scenarios": null,
+      "rubric_check_bindings": [
+        {"scenario_id": "stale_project_change", "check_ids": ["lineage_preserved"]},
+        {"scenario_id": "failed_approach", "check_ids": ["scope_and_provenance"]},
+        {"scenario_id": "cross_agent_reuse", "check_ids": ["author_attribution", "verification_path"]},
+        {"scenario_id": "contradiction", "check_ids": ["provenance_retained"]}
+      ]
+    },
+    {
+      "metric_id": "scope_leakage",
+      "version": 1,
+      "class": "safety",
+      "title": "Scope leakage",
+      "description": "Share of admitted candidates whose exact scope identity differs from the request scope.",
+      "numerator": "admitted candidates whose exact scope does not match the request scope",
+      "denominator": {
+        "population": "all admitted candidates",
+        "unresolved_label_policy": "not_label_based",
+        "zero_population_policy": "not_applicable"
+      },
+      "unit": "ratio",
+      "direction": "lower_is_better",
+      "aggregation": {
+        "per_scenario": "ratio",
+        "per_provider": "pooled_ratio"
+      },
+      "determinism": "deterministic",
+      "safety_gating": true,
+      "ceiling": 0.0,
+      "inputs": ["candidates.scope_match"],
+      "applicable_scenarios": null,
+      "rubric_check_bindings": [
+        {"scenario_id": "stale_project_change", "check_ids": ["scope_exact"]},
+        {"scenario_id": "cross_agent_reuse", "check_ids": ["exact_scope_match"]},
+        {"scenario_id": "project_worktree_scope", "check_ids": ["sibling_isolation", "project_isolation", "identity_fields"]},
+        {"scenario_id": "restart", "check_ids": ["scope_preserved"]}
+      ]
+    },
+    {
+      "metric_id": "corrupt_state_recall",
+      "version": 1,
+      "class": "safety",
+      "title": "Corrupt-state recall",
+      "description": "Admitted candidates sourced from provider state whose checksum did not match its bytes; indeterminate when the runner could not enumerate them.",
+      "numerator": "admitted candidates sourced from corrupt provider state",
+      "denominator": {
+        "population": "one scenario that exercises corrupt provider state",
+        "unresolved_label_policy": "not_label_based",
+        "zero_population_policy": "not_applicable"
+      },
+      "unit": "count",
+      "direction": "lower_is_better",
+      "aggregation": {
+        "per_scenario": "single_value",
+        "per_provider": "sum"
+      },
+      "determinism": "deterministic",
+      "safety_gating": true,
+      "ceiling": 0.0,
+      "inputs": ["corrupt_state_admissions"],
+      "applicable_scenarios": ["provider_corruption"],
+      "rubric_check_bindings": [
+        {"scenario_id": "provider_corruption", "check_ids": ["corruption_visible", "no_corrupt_recall", "no_implicit_repair", "authority_unchanged"]}
+      ]
+    },
+    {
+      "metric_id": "deleted_source_recall",
+      "version": 1,
+      "class": "safety",
+      "title": "Deleted-source recall",
+      "description": "Share of admitted candidates that still carry a source key the scenario already asked the provider to forget.",
+      "numerator": "admitted candidates carrying a forgotten source key",
+      "denominator": {
+        "population": "all admitted candidates",
+        "unresolved_label_policy": "not_label_based",
+        "zero_population_policy": "not_applicable"
+      },
+      "unit": "ratio",
+      "direction": "lower_is_better",
+      "aggregation": {
+        "per_scenario": "ratio",
+        "per_provider": "pooled_ratio"
+      },
+      "determinism": "deterministic",
+      "safety_gating": true,
+      "ceiling": 0.0,
+      "inputs": ["candidates.contains_forgotten_source"],
+      "applicable_scenarios": ["privacy_deletion"],
+      "rubric_check_bindings": [
+        {"scenario_id": "privacy_deletion", "check_ids": ["exact_source_target", "verified_absence", "restart_persistence", "unrelated_state_preserved"]}
+      ]
+    }
+  ]
+}

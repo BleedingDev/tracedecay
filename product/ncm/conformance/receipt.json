@@ -1,0 +1,76 @@
+{
+  "commands": [
+    "cargo test --locked -p tracedecay-memory-provider-ncm --features rust-backend --test rust_backend_conformance -- --list",
+    "cargo test --locked -p tracedecay-memory-provider-ncm --features rust-backend --test rust_backend_conformance",
+    "cargo test --locked -p tracedecay-memory-provider-ncm --features rust-backend --test rust_backend_conformance -- --ignored --exact enabled::real_encoder_process_population"
+  ],
+  "identity": {
+    "algorithm_profile": "ncm-biomem-rs.v1",
+    "embedding_manifest_sha256": "8177baea44e400c431cd4c179c917ef917487ce40401f026e7abd6d2faaa9346",
+    "model": "paraphrase-multilingual-MiniLM-L12-v2",
+    "model_artifact_sha256": "185ae63f47e17a7e8d30d0e6a3cde6a6e4b79bc5b81666ecffc279a6856ca113",
+    "model_root": "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/ncm-backend-model-root",
+    "state_schema_version": "1"
+  },
+  "source": {
+    "branch": "feat/ncm-biomem-rust-v1",
+    "commit": "c48220b371159af00360978f9581833c0c2b3621",
+    "dirty": false,
+    "tree": "1ad7aeb4ba77d37b316ccaf569be0bcbfe979d48"
+  },
+  "status": "pass",
+  "suite": {
+    "counts": {
+      "fail": 0,
+      "not_run": 0,
+      "pass": 9,
+      "skip": 0
+    },
+    "crate": "tracedecay-memory-provider-ncm",
+    "test_target": "rust_backend_conformance",
+    "tests": [
+      {
+        "id": "enabled::all_supported_operations_and_stale_snapshot_deletion_are_non_resurrecting",
+        "outcome": "pass"
+      },
+      {
+        "id": "enabled::cancelled_calls_never_return_success_and_committed_observe_reconciles_once",
+        "outcome": "pass"
+      },
+      {
+        "id": "enabled::corrupted_namespace_file_fails_closed_after_process_restart",
+        "outcome": "pass"
+      },
+      {
+        "id": "enabled::every_supported_operation_rejects_all_wrong_scope_dimensions",
+        "outcome": "pass"
+      },
+      {
+        "id": "enabled::mandatory_conformance_definition_runs_on_real_adapter",
+        "outcome": "pass"
+      },
+      {
+        "id": "enabled::real_encoder_process_population",
+        "outcome": "pass"
+      },
+      {
+        "id": "enabled::real_worker_mailbox_and_namespace_catalog_saturate_without_hanging",
+        "outcome": "pass"
+      },
+      {
+        "id": "enabled::same_conformance_harness_rejects_foreign_scope_faulty_provider",
+        "outcome": "pass"
+      },
+      {
+        "id": "enabled::stale_generation_replay_conflict_and_contradictory_contracts_are_fail_closed",
+        "outcome": "pass"
+      }
+    ]
+  },
+  "task": "ncm-rs-019",
+  "worker": {
+    "path": "/Users/satan/side/experiments/tracedecay/.worktrees/ncm-biomem-rust-v1/target/debug/tracedecay-ncm-worker",
+    "real_encoder": true,
+    "sha256": "747d01534fc70b8881948363ae502972add7a4dd72d62daeb68110ad82af09cf"
+  }
+}

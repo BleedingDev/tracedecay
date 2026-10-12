@@ -19,6 +19,8 @@ use tracedecay_contracts::code_index_freshness::CODE_INDEX_PUBLICATION_AUTHORITY
 use tracedecay_contracts::request_identity::{
     McpConnectionIdentityAuthority, mcp_connection_request_key as application_surface_request_id,
 };
+#[cfg(feature = "memory-provider-host")]
+use tracedecay_daemon_service::retained_owner::CognitiveRecallMountError;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 use tracedecay_host_admission::TerminalReason;
@@ -507,6 +509,18 @@ pub struct McpServer {
         Option<Arc<tracedecay_application::observability::DeliverySettlementAuthorityV1>>,
     pub(crate) delivery_settlement_recorder:
         Option<Arc<tracedecay_application::observability::BoundedDeliverySettlementRecorderV1>>,
+    /// Retains the product provider composition for exactly this cached
+    /// project-server lifetime. Disabled composition is an inert enum value.
+    #[cfg(feature = "memory-provider-host")]
+    _memory_provider_host_mount: Option<MemoryProviderHostMount>,
+    #[cfg(feature = "memory-provider-host")]
+    _observation_journey_mount: Vec<ObservationJourneyMount>,
+    #[cfg(feature = "memory-provider-host")]
+    provider_control_mount: Option<ProviderControlMount>,
+    /// Retains the cognitive-recall route so session recall ports can be
+    /// minted against this project server's exact scope and admission ledger.
+    #[cfg(feature = "memory-provider-host")]
+    cognitive_recall_mount: Option<CognitiveRecallMount>,
     /// Daemon-owned route liveness. A failed post-open health check revokes
     /// every tool on retained transports before cache retirement can await.
     project_server_live: Option<Arc<AtomicBool>>,
@@ -837,6 +851,14 @@ impl McpServer {
             daemon_invocation_service,
             delivery_settlement_authority,
             delivery_settlement_recorder,
+            #[cfg(feature = "memory-provider-host")]
+            memory_provider_host_mount,
+            #[cfg(feature = "memory-provider-host")]
+            observation_journey_mount,
+            #[cfg(feature = "memory-provider-host")]
+            provider_control_mount,
+            #[cfg(feature = "memory-provider-host")]
+            cognitive_recall_mount,
             project_server_live,
             #[cfg(any(test, feature = "test-transport"))]
             host_admission_test_runtime,
@@ -1084,6 +1106,14 @@ impl McpServer {
             daemon_invocation_service,
             delivery_settlement_authority,
             delivery_settlement_recorder,
+            #[cfg(feature = "memory-provider-host")]
+            _memory_provider_host_mount: memory_provider_host_mount,
+            #[cfg(feature = "memory-provider-host")]
+            _observation_journey_mount: observation_journey_mount,
+            #[cfg(feature = "memory-provider-host")]
+            provider_control_mount,
+            #[cfg(feature = "memory-provider-host")]
+            cognitive_recall_mount,
             project_server_live,
             project_server_lifecycle: ProjectServerResponseLifecycle::default(),
             dispatch_authority: RetainedDispatchAuthority::new(dispatch_server.clone()),
@@ -1146,6 +1176,47 @@ impl McpServer {
     /// Returns the active scope prefix, if the server was launched from a subdirectory.
     pub fn scope_prefix(&self) -> Option<&str> {
         self.scope_prefix.as_deref()
+    }
+
+    /// Mints the cognitive-recall port for one canonical host session over
+    /// this project server's provider composition.
+    ///
+    /// The port binds every request to the exact scope this server was
+    /// opened for and retains each admission report in the project's durable
+    /// admission ledger before delivering a result. A server whose provider
+    /// composition is disabled has no recall route, which is a typed state.
+    #[cfg(feature = "memory-provider-host")]
+    pub(crate) fn cognitive_recall_port_for_session(
+        &self,
+        canonical_session_id: &str,
+    ) -> std::result::Result<
+        tracedecay_memory_provider_registry::ProjectCognitiveRecallPortV1,
+        tracedecay_daemon_service::retained_owner::CognitiveRecallMountError,
+    > {
+        match self.cognitive_recall_mount.as_ref() {
+            Some(mount) => mount.port_for_session(canonical_session_id),
+            None => match self._memory_provider_host_mount.as_ref() {
+                Some(host) if host.cognitive_recall_mount().is_some() => {
+                    Err(CognitiveRecallMountError::FullCompositionPending)
+                }
+                Some(host) if host.registry().is_some() => {
+                    Err(CognitiveRecallMountError::NoActiveProviderConfigured)
+                }
+                _ => Err(CognitiveRecallMountError::CompositionDisabled),
+            },
+        }
+    }
+
+    /// The recall route whose routing identity labels this server's advisory
+    /// lane. The early core route has no session port, but still names the
+    /// provider the host generation selected so a pending lane is truthful.
+    #[cfg(feature = "memory-provider-host")]
+    pub(crate) fn advisory_routing_mount(&self) -> Option<CognitiveRecallMount> {
+        self.cognitive_recall_mount.clone().or_else(|| {
+            self._memory_provider_host_mount
+                .as_ref()
+                .and_then(|host| host.cognitive_recall_mount())
+        })
     }
 
     #[tracing::instrument(name = "mcp.server.reconcile_automation", level = "trace", skip_all)]
@@ -1320,6 +1391,8 @@ impl McpServer {
                     .map(|mounted| Arc::clone(&mounted.service)),
                 project_workflow_index,
                 project_lcm: self.project_lcm_authority.clone(),
+                #[cfg(feature = "memory-provider-host")]
+                provider_control: self.provider_control_mount.clone(),
                 invocation_service: self.daemon_invocation_service.clone(),
             },
         )

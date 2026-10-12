@@ -2095,7 +2095,7 @@ export type EffectReceipt = {
   scope: ResolvedScope;
 };
 
-export type EffectTermination = "cancelled" | "completed" | "effect_unknown" | "failed" | "partial" | "timed_out";
+export type EffectTermination = "cancelled" | "completed" | "effect_unknown" | "failed" | "no_change" | "partial" | "timed_out";
 
 export type EnvironmentSettingsPayloadV1 = {
   global_accounting_enabled: boolean;

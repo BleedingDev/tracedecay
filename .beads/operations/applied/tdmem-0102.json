@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "attempt": 1,
+  "issue_id": "tdmem-0102",
+  "mode": "complete",
+  "actor": "assistant",
+  "claim_comment": "Closing the clean V2 baseline after the pinned branch completed the full build and focused memory, retrieval, host, daemon, and dashboard lanes and published a validated receipt.",
+  "checks": [
+    {
+      "name": "baseline receipt contract tests",
+      "argv": ["python3", "tests/product_v2_baseline_receipt_test.py"],
+      "timeout_seconds": 120
+    },
+    {
+      "name": "published clean V2 baseline receipt validation",
+      "argv": [
+        "python3",
+        "scripts/product/check-v2-baseline.py",
+        "--repo",
+        ".",
+        "--receipt",
+        "product/baseline/tracedecay-v2-pr707-linux.json"
+      ],
+      "timeout_seconds": 120
+    }
+  ],
+  "acceptance_criteria": [
+    "The baseline builds from a clean checkout.",
+    "Focused memory, retrieval, host, daemon, and dashboard tests have recorded results.",
+    "Any failing upstream test is isolated and documented before product changes."
+  ],
+  "close_reason": "Captured and validated the clean TraceDecay V2 baseline at the pinned PR #707 floor with all required build and focused test lanes passing.",
+  "close_comment": "Evidence: GitHub Actions run 33299093667 completed successfully and committed product/baseline/tracedecay-v2-pr707-linux.json in b391cd32ba51e5a8ad584740073554476bca5d8c. The receipt records clean checkout ancestry, toolchain versions, build lanes, focused memory/retrieval/host/daemon/dashboard results, durations, and failure classifications; no upstream failure remained to isolate."
+}

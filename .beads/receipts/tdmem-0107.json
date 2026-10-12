@@ -1,0 +1,266 @@
+{
+  "actor": "assistant",
+  "beads_commands": [
+    {
+      "argv": [
+        "br",
+        "sync",
+        "--import-only",
+        "--rebuild"
+      ],
+      "duration_ms": 679,
+      "exit_code": 0,
+      "name": "rebuild Beads database",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 92,
+      "stdout_sha256": "d3d3117c0f627602d1b76be654a70c2b97973d9e383edc798a39c32b477cd010",
+      "stdout_tail": "Imported from JSONL (via automatic recovery):\n  Created: 131 issues\n  Rebuilt blocked cache\n"
+    },
+    {
+      "argv": [
+        "br",
+        "show",
+        "tdmem-0107",
+        "--json"
+      ],
+      "duration_ms": 36,
+      "exit_code": 0,
+      "name": "show issue",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 5432,
+      "stdout_sha256": "d295c3d8e6458b70577f0ac64180f1e44b59f024ffbe5658e03bf470d765204a",
+      "stdout_tail": "itle\":\"Set the upstream patch-footprint budget and forbidden touch zones\",\"status\":\"closed\",\"priority\":0,\"dependency_type\":\"blocks\"},{\"id\":\"tdmem-0106\",\"title\":\"Write the foundational ADR set\",\"status\":\"closed\",\"priority\":0,\"dependency_type\":\"blocks\"}],\"dependents\":[{\"id\":\"tdmem-0200\",\"title\":\"M1 \u2014 Define the provider contract and capability model\",\"status\":\"open\",\"priority\":0,\"dependency_type\":\"blocks\"},{\"id\":\"tdmem-0201\",\"title\":\"Define the provider capability registry\",\"status\":\"open\",\"priority\":0,\"dependency_type\":\"blocks\"},{\"id\":\"tdmem-1200\",\"title\":\"Continuous \u2014 Preserve convergence with Zack and ingest external lessons safely\",\"status\":\"open\",\"priority\":0,\"dependency_type\":\"blocks\"}],\"parent\":\"tdmem-0100\",\"inherited_context\":[{\"source_id\":\"tdmem-0000\",\"source_role\":\"epic\",\"source_title\":\"Program: Pluggable Cognitive Memory Providers for TraceDecay V2\",\"field_used\":\"agent_context\",\"content\":\"{\\\"constraints\\\":[\\\"Scope is coding agents only. Do not introduce game, NPC, OntOS, or general-purpose product surfaces in this program.\\\",\\\"Use TraceDecay V2 PR #707 head 08fbe33a7c7f403191fd5d6e356c7b6681b96403 as the initial upstream floor.\\\",\\\"Preserve TraceDecay as authority for current code, repository/worktree identity, sessions, tools, approvals, and host integration.\\\",\\\"Memory-provider output is advisory context. It cannot silently mutate canonical code truth or TraceDecay Native facts.\\\",\\\"Keep all work in this monorepo, but isolate product-owned code in dedicated crates and narrow composition-root mounts.\\\",\\\"TraceDecay Native, NCM, and future OCEAN must sit behind one capability-based provider boundary; never branch on provider names outside registry/adapters.\\\",\\\"No silent fallback, fake readiness, placeholder success, swallowed error, unbounded queue, or undocumented authority.\\\",\\\"Every production path must propagate deadlines and cancellation, return typed terminal outcomes, preserve provenance, and enforce exact project/worktree scope.\\\",\\\"All writes must be idempotent and crash-recoverable. Observer providers must never affect prompts, canonical facts, or externally visible actions.\\\",\\\"Do not close a bead without its acceptance checklist, focused tests, and at least one real product journey where applicable.\\\",\\\"Track every intentional edit to Zack-owned files in the upstream convergence map with rationale and semantic invariants.\\\",\\\"Use Beads Rust JSONL as the versioned planning authority; keep the SQLite database local and rebuildable.\\\"],\\\"deliverables\\\":[\\\"Provider API and capability registry\\\",\\\"TraceDecay Native adapter with parity\\\",\\\"NCM adapter and guarded observer/active modes\\\",\\\"Observation dispatch, recall integration, feedback, maintenance, inspection, and conformance\\\",\\\"Coding-agent journeys for Claude Code, Codex, Cursor, multi-worktree, restart, stale correction, and provider failure\\\",\\\"Repeatable upstream convergence workflow for Zack and structured lesson intake from Jeffrey\\\"],\\\"objective\\\":\\\"Deliver a pluggable cognitive-memory layer inside the TraceDecay V2 monorepo for coding agents.\\\",\\\"references\\\":[\\\"https://github.com/ScriptedAlchemy/tracedecay/pull/707\\\",\\\"https://github.com/BleedingDev/tracedecay/tree/feat/pluggable-memory-providers-v2\\\",\\\"https://github.com/bleedingDev/biomem\\\",\\\"https://github.com/Dicklesworthstone/beads_rust\\\"]}\"},{\"source_id\":\"tdmem-0100\",\"source_role\":\"parent\",\"source_title\":\"M0 \u2014 Pin upstream V2 and prove the integration seams\",\"field_used\":\"agent_context\",\"content\":\"{\\\"constraints\\\":[\\\"Follow the root program constraints inherited from tdmem-0000.\\\",\\\"Keep product-owned implementation isolated from Zack-owned crates unless the seam cannot be mounted otherwise.\\\",\\\"Every upstream-owned file touched must be recorded in the convergence map before the bead closes.\\\"],\\\"deliverables\\\":[\\\"Baseline receipts\\\",\\\"Authority matrix\\\",\\\"Seam map\\\",\\\"ADRs\\\",\\\"Go/no-go report\\\"],\\\"objective\\\":\\\"M0 \u2014 Pin upstream V2 and prove the integration seams\\\",\\\"references\\\":[]}\"}]}]\n"
+    },
+    {
+      "argv": [
+        "br",
+        "update",
+        "--actor",
+        "assistant",
+        "tdmem-0107",
+        "--status",
+        "in_progress",
+        "--transition-comment",
+        "Accepting the M0 provider-seam decision after binding five concrete insertion points, a zero-upstream-file tdmem-0201 first slice, explicit risks and kill conditions, and the M1 dependency gate."
+      ],
+      "duration_ms": 278,
+      "exit_code": 0,
+      "name": "claim issue",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 3449,
+      "stdout_sha256": "985f0bb3a0dbf6bb2c41272c909b068cb71ec4962e6a63dfdd104b9a6e135875",
+      "stdout_tail": "Updated tdmem-0107: Publish the provider-seam go/no-go report\n  status: open \u2192 in_progress\n\n--- Inherited context (from epic tdmem-0000: \"Program: Pluggable Cognitive Memory Providers for TraceDecay V2\") ---\n{\n  \"constraints\": [\n    \"Scope is coding agents only. Do not introduce game, NPC, OntOS, or general-purpose product surfaces in this program.\",\n    \"Use TraceDecay V2 PR #707 head 08fbe33a7c7f403191fd5d6e356c7b6681b96403 as the initial upstream floor.\",\n    \"Preserve TraceDecay as authority for current code, repository/worktree identity, sessions, tools, approvals, and host integration.\",\n    \"Memory-provider output is advisory context. It cannot silently mutate canonical code truth or TraceDecay Native facts.\",\n    \"Keep all work in this monorepo, but isolate product-owned code in dedicated crates and narrow composition-root mounts.\",\n    \"TraceDecay Native, NCM, and future OCEAN must sit behind one capability-based provider boundary; never branch on provider names outside registry/adapters.\",\n    \"No silent fallback, fake readiness, placeholder success, swallowed error, unbounded queue, or undocumented authority.\",\n    \"Every production path must propagate deadlines and cancellation, return typed terminal outcomes, preserve provenance, and enforce exact project/worktree scope.\",\n    \"All writes must be idempotent and crash-recoverable. Observer providers must never affect prompts, canonical facts, or externally visible actions.\",\n    \"Do not close a bead without its acceptance checklist, focused tests, and at least one real product journey where applicable.\",\n    \"Track every intentional edit to Zack-owned files in the upstream convergence map with rationale and semantic invariants.\",\n    \"Use Beads Rust JSONL as the versioned planning authority; keep the SQLite database local and rebuildable.\"\n  ],\n  \"deliverables\": [\n    \"Provider API and capability registry\",\n    \"TraceDecay Native adapter with parity\",\n    \"NCM adapter and guarded observer/active modes\",\n    \"Observation dispatch, recall integration, feedback, maintenance, inspection, and conformance\",\n    \"Coding-agent journeys for Claude Code, Codex, Cursor, multi-worktree, restart, stale correction, and provider failure\",\n    \"Repeatable upstream convergence workflow for Zack and structured lesson intake from Jeffrey\"\n  ],\n  \"objective\": \"Deliver a pluggable cognitive-memory layer inside the TraceDecay V2 monorepo for coding agents.\",\n  \"references\": [\n    \"https://github.com/ScriptedAlchemy/tracedecay/pull/707\",\n    \"https://github.com/BleedingDev/tracedecay/tree/feat/pluggable-memory-providers-v2\",\n    \"https://github.com/bleedingDev/biomem\",\n    \"https://github.com/Dicklesworthstone/beads_rust\"\n  ]\n}\n--- End inherited context (tdmem-0000) ---\n--- Inherited context (from parent tdmem-0100: \"M0 \u2014 Pin upstream V2 and prove the integration seams\") ---\n{\n  \"constraints\": [\n    \"Follow the root program constraints inherited from tdmem-0000.\",\n    \"Keep product-owned implementation isolated from Zack-owned crates unless the seam cannot be mounted otherwise.\",\n    \"Every upstream-owned file touched must be recorded in the convergence map before the bead closes.\"\n  ],\n  \"deliverables\": [\n    \"Baseline receipts\",\n    \"Authority matrix\",\n    \"Seam map\",\n    \"ADRs\",\n    \"Go/no-go report\"\n  ],\n  \"objective\": \"M0 \u2014 Pin upstream V2 and prove the integration seams\",\n  \"references\": []\n}\n--- End inherited context (tdmem-0100) ---\n"
+    },
+    {
+      "argv": [
+        "br",
+        "update",
+        "--actor",
+        "assistant",
+        "tdmem-0107",
+        "--acceptance-criteria",
+        "- [x] The report selects concrete insertion points.\n- [x] The first slice has bounded files/crates and acceptance tests.\n- [x] Risks and kill conditions are explicit.\n- [x] M1 remains blocked until the report is accepted."
+      ],
+      "duration_ms": 772,
+      "exit_code": 0,
+      "name": "complete acceptance criteria",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 62,
+      "stdout_sha256": "372302835514a454bd0ea09b861fde1cbed0fa3849d3c40617d1d36447968e2d",
+      "stdout_tail": "Updated tdmem-0107: Publish the provider-seam go/no-go report\n"
+    },
+    {
+      "argv": [
+        "br",
+        "close",
+        "--actor",
+        "assistant",
+        "tdmem-0107",
+        "--reason",
+        "Accepted the machine-checked M0 GO decision with concrete provider-neutral mounts, a bounded first implementation slice, explicit kill conditions, and M1 gated on this decision.",
+        "--transition-comment",
+        "Evidence: product/architecture/m0-go-no-go.json selects provider-contract, daemon-registry, normalized-observation, advisory-recall/context, and post-settlement-feedback insertion points and ties each upstream path to an allowed patch-policy category. The first executable slice is tdmem-0201 and is fixed to three product-owned contract/validator/test files, zero existing upstream files, no Rust crate changes, and two executable acceptance commands; crate work remains deferred to tdmem-0301. Seven residual risk classes, six hard gates, seven NO-GO triggers, Native parity/rollback, observer non-interference, exact-scope admission, deferred NCM topology, deferred OCEAN, and no-unmapped-upstream-edits are explicit. product/upstream/pr707-floor.json is a compact derived receipt that points to the canonical product/upstream/tracedecay-v2-pr707.json authority. scripts/product/check-m0-go-no-go.py and tests/product_m0_go_no_go_test.py validate the decision against real M0 evidence and Beads IDs, while the patch-footprint and foundational ADR validators enforce the inherited architecture constraints."
+      ],
+      "duration_ms": 249,
+      "exit_code": 0,
+      "name": "close issue",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 245,
+      "stdout_sha256": "4054db247af7fd36c7adf40dd8ef3dc2d3505c5d05755d96177e77919915075a",
+      "stdout_tail": "\u2713 Closed tdmem-0107: Publish the provider-seam go/no-go report (Accepted the machine-checked M0 GO decision with concrete provider-neutral mounts, a bounded first implementation slice, explicit kill conditions, and M1 gated on this decision.)\n"
+    },
+    {
+      "argv": [
+        "br",
+        "sync",
+        "--flush-only"
+      ],
+      "duration_ms": 67,
+      "exit_code": 0,
+      "name": "flush Beads JSONL",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 36,
+      "stdout_sha256": "3729c3a3978f7481160ebb0a2d0d702f0484310f76e0219a5c5bcbb40d5126d0",
+      "stdout_tail": "Nothing to export (no dirty issues)\n"
+    },
+    {
+      "argv": [
+        "br",
+        "dep",
+        "cycles",
+        "--json"
+      ],
+      "duration_ms": 22,
+      "exit_code": 0,
+      "name": "check dependency cycles",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 145,
+      "stdout_sha256": "33e568c4decf5b3081ac0ef00cc4ed65a1dc13c5350edd609f2ea2a1a5ae9897",
+      "stdout_tail": "{\"cycles\":[],\"count\":0,\"active_count\":0,\"archived_closed_count\":0,\"total_count\":0,\"blocking_only\":false,\"include_closed\":false,\"scope\":\"active\"}\n"
+    },
+    {
+      "argv": [
+        "br",
+        "doctor"
+      ],
+      "duration_ms": 222,
+      "exit_code": 1,
+      "name": "run Beads doctor",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 2533,
+      "stdout_sha256": "4b30d7ca49ac926f643bb31629975cb1ab98ab03715c66dc2987fc9408696947",
+      "stdout_tail": "br doctor\nHEALTH workspace: healthy\nOK jsonl.merge_artifacts\nOK base_jsonl\nOK doctor.runs_dir\nOK doctor.runs_creatable\nOK permissions.recovery_dir\nOK permissions.write_lock\nOK permissions.root_gitignore\nOK permissions.db_sidecars\nOK permissions.config_yaml_secrets\nOK br_path_dupes\nOK gitignore.beads_inner_present\nOK tmp_files_orphan\nOK br_history.size\nOK gitignore.beads_inner\nOK routes_jsonl: No routes.jsonl present (cross-project routing is optional)\nOK rust_log: RUST_LOG unset; release default is quiet enough for --json\nOK permissions.beads_dir: `.beads/` and critical children are user-writable\nOK config.yaml: config.yaml parses cleanly (220 bytes)\nOK metadata.json: metadata.json parses cleanly (63 bytes); declared targets exist on disk\nOK binary_version: Running br 0.5.7; no beads_rust Cargo.toml reachable from .beads/ \u2014 not flagging\nOK write_lock: .beads/.write.lock is 2s old (within 300s threshold); not stale\nOK routes.targets: No local or town routes.jsonl present (route targets are optional)\nOK startup_cache.health\nOK sync.merge_pending: No pending sync merge requires artifact reconciliation\nOK permissions.jsonl_world_writable\nOK jsonl_crlf\nOK jsonl_bom\nOK jsonl_eof_newline\nOK jsonl_size\nOK jsonl.duplicate_ids\nOK sync_jsonl_path: JSONL path is within sync allowlist\nOK sync_conflict_markers: No merge conflict markers found\nOK jsonl.parse: Parsed 131 records\nOK dep.dead_closed_blocking_edges: 9 open issue(s) have blocking edges whose blockers are closed (satisfied dependencies \u2014 the normal result of completing work)\nOK dep.fully_unblocked_open: 4 open issue(s) have all blockers completed (4 ready to work, 0 deliberately excluded from ready)\nOK db_bloat\nOK wal_size\nWARN db.recovery_artifacts: Preserved recovery artifacts remain for this database family (7 item(s))\nOK db.recovery_artifacts.aged\nOK db.foreign_recovery_debris\nOK db.sidecars: SHM sidecar at /home/runner/work/tracedecay/tracedecay/.beads/beads.db-shm is inert beside the WAL (a WAL-only family is expected for frankensqlite; the WAL index lives in process memory)\nOK schema.tables\nOK schema.columns\nOK db.recoverable_anomalies\nOK db.null_defaults\nOK sqlite.integrity_check\nOK db.export_hash_cache\nOK base_jsonl.missing_post_flush\nOK dirty_bitmap\nOK comments.orphans\nOK labels.orphans\nOK dependencies.orphans\nOK audit.suspect_close_reasons\nOK counts.db_vs_jsonl: Both have 131 records\nOK sync.metadata: Database and JSONL are in sync\nOK db.write_probe: Rollback-only issue write succeeded for tdmem-0000\nOK sqlite3.integrity_check\n"
+    },
+    {
+      "argv": [
+        "br",
+        "show",
+        "tdmem-0107",
+        "--json"
+      ],
+      "duration_ms": 40,
+      "exit_code": 0,
+      "name": "show issue",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 7201,
+      "stdout_sha256": "f06fb19cc6896179eef82fb09a12b4da993c58668993f89a41ffc01cff6dd6e0",
+      "stdout_tail": "nds; crate work remains deferred to tdmem-0301. Seven residual risk classes, six hard gates, seven NO-GO triggers, Native parity/rollback, observer non-interference, exact-scope admission, deferred NCM topology, deferred OCEAN, and no-unmapped-upstream-edits are explicit. product/upstream/pr707-floor.json is a compact derived receipt that points to the canonical product/upstream/tracedecay-v2-pr707.json authority. scripts/product/check-m0-go-no-go.py and tests/product_m0_go_no_go_test.py validate the decision against real M0 evidence and Beads IDs, while the patch-footprint and foundational ADR validators enforce the inherited architecture constraints.\",\"created_at\":\"2026-08-30T10:46:21Z\"}],\"parent\":\"tdmem-0100\",\"inherited_context\":[{\"source_id\":\"tdmem-0000\",\"source_role\":\"epic\",\"source_title\":\"Program: Pluggable Cognitive Memory Providers for TraceDecay V2\",\"field_used\":\"agent_context\",\"content\":\"{\\\"constraints\\\":[\\\"Scope is coding agents only. Do not introduce game, NPC, OntOS, or general-purpose product surfaces in this program.\\\",\\\"Use TraceDecay V2 PR #707 head 08fbe33a7c7f403191fd5d6e356c7b6681b96403 as the initial upstream floor.\\\",\\\"Preserve TraceDecay as authority for current code, repository/worktree identity, sessions, tools, approvals, and host integration.\\\",\\\"Memory-provider output is advisory context. It cannot silently mutate canonical code truth or TraceDecay Native facts.\\\",\\\"Keep all work in this monorepo, but isolate product-owned code in dedicated crates and narrow composition-root mounts.\\\",\\\"TraceDecay Native, NCM, and future OCEAN must sit behind one capability-based provider boundary; never branch on provider names outside registry/adapters.\\\",\\\"No silent fallback, fake readiness, placeholder success, swallowed error, unbounded queue, or undocumented authority.\\\",\\\"Every production path must propagate deadlines and cancellation, return typed terminal outcomes, preserve provenance, and enforce exact project/worktree scope.\\\",\\\"All writes must be idempotent and crash-recoverable. Observer providers must never affect prompts, canonical facts, or externally visible actions.\\\",\\\"Do not close a bead without its acceptance checklist, focused tests, and at least one real product journey where applicable.\\\",\\\"Track every intentional edit to Zack-owned files in the upstream convergence map with rationale and semantic invariants.\\\",\\\"Use Beads Rust JSONL as the versioned planning authority; keep the SQLite database local and rebuildable.\\\"],\\\"deliverables\\\":[\\\"Provider API and capability registry\\\",\\\"TraceDecay Native adapter with parity\\\",\\\"NCM adapter and guarded observer/active modes\\\",\\\"Observation dispatch, recall integration, feedback, maintenance, inspection, and conformance\\\",\\\"Coding-agent journeys for Claude Code, Codex, Cursor, multi-worktree, restart, stale correction, and provider failure\\\",\\\"Repeatable upstream convergence workflow for Zack and structured lesson intake from Jeffrey\\\"],\\\"objective\\\":\\\"Deliver a pluggable cognitive-memory layer inside the TraceDecay V2 monorepo for coding agents.\\\",\\\"references\\\":[\\\"https://github.com/ScriptedAlchemy/tracedecay/pull/707\\\",\\\"https://github.com/BleedingDev/tracedecay/tree/feat/pluggable-memory-providers-v2\\\",\\\"https://github.com/bleedingDev/biomem\\\",\\\"https://github.com/Dicklesworthstone/beads_rust\\\"]}\"},{\"source_id\":\"tdmem-0100\",\"source_role\":\"parent\",\"source_title\":\"M0 \u2014 Pin upstream V2 and prove the integration seams\",\"field_used\":\"agent_context\",\"content\":\"{\\\"constraints\\\":[\\\"Follow the root program constraints inherited from tdmem-0000.\\\",\\\"Keep product-owned implementation isolated from Zack-owned crates unless the seam cannot be mounted otherwise.\\\",\\\"Every upstream-owned file touched must be recorded in the convergence map before the bead closes.\\\"],\\\"deliverables\\\":[\\\"Baseline receipts\\\",\\\"Authority matrix\\\",\\\"Seam map\\\",\\\"ADRs\\\",\\\"Go/no-go report\\\"],\\\"objective\\\":\\\"M0 \u2014 Pin upstream V2 and prove the integration seams\\\",\\\"references\\\":[]}\"}]}]\n"
+    }
+  ],
+  "checks": [
+    {
+      "argv": [
+        "python3",
+        "tests/product_m0_go_no_go_test.py"
+      ],
+      "duration_ms": 669,
+      "exit_code": 0,
+      "name": "M0 GO/NO-GO contract tests",
+      "stderr_bytes": 114,
+      "stderr_sha256": "ae2d109af5648a6ad3232fd57875e70563b505b4ffad041318aee8a39b852aab",
+      "stderr_tail": "...............\n----------------------------------------------------------------------\nRan 15 tests in 0.573s\n\nOK\n",
+      "stdout_bytes": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_tail": ""
+    },
+    {
+      "argv": [
+        "python3",
+        "scripts/product/check-m0-go-no-go.py",
+        "--repo",
+        ".",
+        "--decision",
+        "product/architecture/m0-go-no-go.json",
+        "--report",
+        "product/architecture/m0-go-no-go.md",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "duration_ms": 38,
+      "exit_code": 0,
+      "name": "M0 GO/NO-GO repository validation",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 293,
+      "stdout_sha256": "78bac8cd637273f0b72c18efc42b55a62d6acf91a5b0a325ae767a6707cf6c8b",
+      "stdout_tail": "{\n  \"bead_id\": \"tdmem-0107\",\n  \"evidence_count\": 7,\n  \"hard_gate_count\": 6,\n  \"implementation_stage_count\": 10,\n  \"ncm_topology_state\": \"deferred\",\n  \"next_executable_bead\": \"tdmem-0201\",\n  \"ocean_state\": \"deferred\",\n  \"ok\": true,\n  \"risk_count\": 7,\n  \"schema_version\": 1,\n  \"verdict\": \"go\"\n}\n"
+    },
+    {
+      "argv": [
+        "python3",
+        "scripts/product/check-foundational-adrs.py",
+        "--repo",
+        ".",
+        "--manifest",
+        "product/architecture/adr/manifest.json",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "duration_ms": 36,
+      "exit_code": 0,
+      "name": "foundational ADR repository validation",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 239,
+      "stdout_sha256": "24586f0a06fb8f327c6172861e57c377e4d393ffacf7622f3d34fbe29f976325",
+      "stdout_tail": "{\n  \"bead_id\": \"tdmem-0106\",\n  \"decision_count\": 8,\n  \"manifest\": \"product/architecture/adr/manifest.json\",\n  \"ncm_topology_state\": \"deferred\",\n  \"ok\": true,\n  \"schema_version\": 1,\n  \"status\": \"accepted\",\n  \"verification_bead_count\": 42\n}\n"
+    },
+    {
+      "argv": [
+        "python3",
+        "scripts/product/check-patch-footprint-policy.py",
+        "--repo",
+        ".",
+        "--policy",
+        "product/upstream/patch-footprint-policy.json",
+        "--map",
+        "product/upstream/convergence-map.json"
+      ],
+      "duration_ms": 76,
+      "exit_code": 0,
+      "name": "upstream patch-footprint remains within policy",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 644,
+      "stdout_sha256": "30c62301dcbe5d0b12b2e89350167a831333a0136bd21b937256b597bcdecdcf",
+      "stdout_tail": "{\n  \"allowed_touch_points\": 7,\n  \"bead_id\": \"tdmem-0105\",\n  \"convergence_map\": \"product/upstream/convergence-map.json\",\n  \"dependency_direction_rules\": 6,\n  \"exception_zones\": 5,\n  \"footprint\": {\n    \"composition_root_files\": 0,\n    \"exception_zone_files\": 0,\n    \"total_upstream_changed_lines\": 0,\n    \"upstream_existing_production_files\": 0,\n    \"upstream_existing_test_or_fixture_files\": 0\n  },\n  \"ok\": true,\n  \"policy\": \"product/upstream/patch-footprint-policy.json\",\n  \"policy_revision\": \"patch-footprint.v1\",\n  \"schema_version\": 1,\n  \"upstream_floor_sha\": \"08fbe33a7c7f403191fd5d6e356c7b6681b96403\",\n  \"workspace_manifests_checked\": 38\n}\n"
+    }
+  ],
+  "completed_at": "2026-08-30T10:46:22.072254Z",
+  "final_status": "closed",
+  "implementation_head": "a47abc48e550fa6d9caf0ad3fc9eb0cee8ab6e69",
+  "issue_id": "tdmem-0107",
+  "mode": "complete",
+  "operation_sha256": "f6ce148207815305b187f7afe099be21f8839da7efae721bb7e38204f62412ec",
+  "plan": {
+    "encoded_bytes": 35244,
+    "issues": 131,
+    "jsonl_sha256": "b42b0dbed5b8d0b516bc86bb526c8725c64e29c009d671c004d0230191923e3a",
+    "materializer_contract": "source-and-output-sha256",
+    "part_size": 4000,
+    "parts": 9
+  },
+  "schema_version": 1,
+  "started_at": "2026-08-30T10:46:18.821723Z"
+}

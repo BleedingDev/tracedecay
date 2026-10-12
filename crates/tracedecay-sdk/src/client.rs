@@ -444,10 +444,12 @@ impl Client {
                 .to_owned();
             if !crate::semantic::response_matches(
                 Operation::RESULT_SEMANTICS,
+                Operation::OPERATION_ID,
                 &request_id,
                 expected_request_id.as_ref(),
                 &request,
                 &payload,
+                Some(response.envelope()),
             ) {
                 return Err(protocol(
                     response.status(),

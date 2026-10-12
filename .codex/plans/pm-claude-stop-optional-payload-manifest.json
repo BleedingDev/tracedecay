@@ -1,0 +1,6 @@
+{
+  "crates/tracedecay-hooks/src/native.rs": {
+    "before_sha256": "aec9b71c62461f8aa4461c95e1611d82a7a4cf2a4280732130b9e434ca834897",
+    "after_sha256": "e4daaf25bc58d412888a57cfeac45fdf169bf36e18edc4a5398daae7306d4ba4"
+  }
+}

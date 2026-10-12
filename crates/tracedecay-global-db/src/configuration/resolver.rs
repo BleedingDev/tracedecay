@@ -149,6 +149,7 @@ pub fn resolve_configuration(
     }
 
     let snapshot = ConfigurationSnapshotV1::new(effective_values, provenance)?;
+    registry.validate_provider_configuration(&snapshot.effective_values)?;
     Ok(ConfigurationResolutionV1 { snapshot, settings })
 }
 

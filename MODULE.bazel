@@ -2,6 +2,7 @@ module(name = "tracedecay", version = "0.0.0")
 
 bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "bazel_skylib", version = "1.9.2")
+bazel_dep(name = "rules_shell", version = "0.6.1")
 bazel_dep(name = "rules_python", version = "2.4.2")
 bazel_dep(name = "rules_rust", version = "0.74.0")
 # Rustc adds every dependency search directory to PATH on Windows; large
@@ -40,6 +41,9 @@ use_repo(rust, "rust_toolchains")
 register_toolchains("@rust_toolchains//:all")
 
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+# External optional dependencies resolve from workspace manifests, before the
+# generated Rust targets select their feature variants. The shipped CLI's Cargo
+# defaults include the provider host so both graphs share its production closure.
 crate.from_cargo(
     # One letter: Windows build-script paths repeat the hub's repository
     # name, and MSVC cannot open headers past MAX_PATH (gen_builds.py).

@@ -11,6 +11,8 @@ use tracedecay_contracts::{
     ApplicationProblemKind, CancellationContext, Deadline, ProblemTerminality, RetryDirective,
     WorkGraphReadRequestV1, WorkProductSelectionScopeV1,
 };
+#[cfg(feature = "memory-provider-host")]
+use tracedecay_domain::canonical_json_bytes;
 use tracedecay_domain::{ActorId, ProjectId, RepositoryId, UtcMicros, WorktreeId};
 use tracedecay_tool_catalog::ApplicationSurfaceOperation;
 
@@ -25,14 +27,28 @@ use crate::daemon::{
 use tracedecay_application::primitives::{PrimitiveProjectRuntime, StorageStatusPrimitiveRequest};
 use tracedecay_contracts::retrieval::catalog::primitive_read_operation;
 use tracedecay_contracts::retrieval::{PrimitiveInvocation, PrimitiveRequest};
+#[cfg(feature = "memory-provider-host")]
+use tracedecay_contracts::{
+    ApplicationOutcome, ConfigurationBatchRequestV1, ConfigurationDirectMutationRequestV1,
+    ConfigurationGetRequestV1, ConfigurationMutationReceipt, ConfigurationSetRequestV1,
+    ResolvedSetting,
+};
 use tracedecay_contracts::{
     CapabilityGrantId, CapabilityGrantSnapshot, DisclosureClass, RequestContext, RequestId,
     ResolvedScope,
 };
 use tracedecay_contracts::{ConfigurationListRequestV1, ConfigurationWireRequestV1};
 use tracedecay_daemon_protocol::WorkApplicationInvocationV1;
+#[cfg(feature = "memory-provider-host")]
+use tracedecay_daemon_service::retained_owner::CognitiveRecallMountError;
 use tracedecay_daemon_service::{
     DaemonInvocationProblem, ProjectRuntimePublicationStateV1, RegisteredRetainedRuntime,
+};
+#[cfg(feature = "memory-provider-host")]
+use tracedecay_domain::configuration::{
+    ConfigurationIdempotencyKey, ConfigurationLayerIdV1, ConfigurationValueV1,
+    MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+    MemoryProviderNcmObserverV1, MemoryProviderRecallRoutingV1, SettingKey,
 };
 
 async fn committed_fixture(
@@ -598,11 +614,9 @@ fn memory_status_request(request_id: &str) -> DaemonInvocationRequest {
 }
 
 /// The core route is admitted before the full server's owner phase registers
-/// the retained runtime. Hold that phase open, the configuration registration
-/// pause sits in the same owner phase, just ahead of the retained registration
-///, and prove that a retained request landing in the window reads as the
-/// owner still mounting, retryable, and never as a scope that has no retained
-/// runtime. Once the phase completes the same request is answered.
+/// the retained runtime. Hold its registration open and prove that a retained
+/// request landing in the window sees a retryable mounting owner, rather than
+/// a scope with no retained runtime. The same request is served after mounting.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retained_invocation_while_owners_mount_is_retryable_not_unmounted() {
     let (_temp, _database_scope, engine, handshake) =
@@ -616,7 +630,7 @@ async fn retained_invocation_while_owners_mount_is_retryable_not_unmounted() {
     let registration = engine
         .invocation
         .service
-        .pause_configuration_runtime_registration(canonical_project.clone())
+        .pause_retained_runtime_registration(canonical_project.clone())
         .await;
     let opening_engine = engine.clone();
     let opening_handshake = handshake.clone();
@@ -718,9 +732,9 @@ async fn retained_invocation_while_owners_mount_is_retryable_not_unmounted() {
 }
 
 /// Primitive reads belong to the admitted core route and must not wait for
-/// later configuration, retained, native-integration, or Work owners. Hold
-/// configuration publication after primitive registration and prove a status
-/// read is already served while the overall project publication is warming.
+/// later retained, native-integration, or Work owners. Hold retained
+/// publication after primitive registration and prove a status read is served
+/// while the overall project publication is warming.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn primitive_invocation_serves_while_later_owners_mount() {
     let (_temp, _database_scope, engine, handshake) =
@@ -734,7 +748,7 @@ async fn primitive_invocation_serves_while_later_owners_mount() {
     let registration = engine
         .invocation
         .service
-        .pause_configuration_runtime_registration(canonical_project.clone())
+        .pause_retained_runtime_registration(canonical_project.clone())
         .await;
     let opening_engine = engine.clone();
     let opening_handshake = handshake.clone();
@@ -772,14 +786,14 @@ async fn primitive_invocation_serves_while_later_owners_mount() {
     registration
         .allow_registration
         .send(())
-        .expect("release configuration registration");
+        .expect("release retained registration");
     tokio::time::timeout(
         std::time::Duration::from_mins(1),
         registration.after_registration,
     )
     .await
-    .expect("configuration owner must publish")
-    .expect("configuration registration publication sender");
+    .expect("retained owner must publish")
+    .expect("retained registration publication sender");
     registration
         .allow_return
         .send(())
@@ -789,4 +803,295 @@ async fn primitive_invocation_serves_while_later_owners_mount() {
         .expect("project-open task")
         .expect("project opens once its owners are registered");
     engine.shutdown_all().await;
+}
+
+#[cfg(feature = "memory-provider-host")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn required_ncm_failure_preserves_core_configuration_repair() {
+    let (temp, _database_scope, engine, handshake) =
+        committed_fixture("required-ncm-configuration-repair").await;
+    let server = engine
+        .project_server(&handshake)
+        .await
+        .expect("baseline server");
+    let graph = server.cg().await;
+    let current = graph
+        .configuration_runtime()
+        .client()
+        .current()
+        .await
+        .expect("baseline configuration revision");
+    let target = graph.configuration_runtime().configuration_target().clone();
+    let scope = tracedecay_code_index_runtime::resolved_scope_for_project(
+        graph.project_root(),
+        &target.project_id,
+    )
+    .expect("canonical configuration scope");
+    let project_root = graph.project_root().to_path_buf();
+    let initial_revision = current.revision_id().clone();
+    drop(current);
+    drop(graph);
+
+    let state_root = temp.path().join("ncm-state");
+    std::fs::create_dir_all(&state_root).expect("owned NCM state root");
+    let worker_binary = temp.path().join("absent-ncm-worker");
+    assert!(
+        !worker_binary.exists(),
+        "the fixture has no worker to launch"
+    );
+    let observer = MemoryProviderNcmObserverV1::Enabled {
+        worker_binary: worker_binary.clone(),
+        state_root,
+    };
+    let strict_routing = MemoryProviderRecallRoutingV1 {
+        active_provider: Some("ncm".to_owned()),
+        fallback: None,
+        degradation: None,
+    };
+    let observer_key = SettingKey::new(MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY)
+        .expect("NCM participation setting key");
+    let routing_key = SettingKey::new(MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY)
+        .expect("NCM routing setting key");
+    let strict_value = ConfigurationValueV1::Text(
+        String::from_utf8(canonical_json_bytes(&strict_routing).expect("strict routing document"))
+            .expect("canonical strict routing UTF-8"),
+    );
+    let request = |id: &str, operation, body| {
+        let observed_at = tracedecay_contracts::clock::now_micros();
+        DaemonInvocationRequest::configuration(
+            id,
+            operation,
+            body,
+            observed_at,
+            Deadline::new(UtcMicros(observed_at.0.saturating_add(30_000_000)))
+                .expect("configuration deadline"),
+            CancellationContext::active(format!("cancel.{id}"))
+                .expect("configuration cancellation"),
+        )
+        .with_resolved_scope(Some(scope.clone()))
+        .expect("exact configuration request scope")
+    };
+    let configured = execute_daemon_invocation(
+        &engine,
+        &handshake,
+        request(
+            "request.required-ncm.configure",
+            ApplicationSurfaceOperation::ConfigurationBatch,
+            ConfigurationWireRequestV1::Batch(ConfigurationBatchRequestV1 {
+                mutations: vec![
+                    ConfigurationDirectMutationRequestV1::Set {
+                        layer: ConfigurationLayerIdV1::Project {
+                            project_id: target.project_id.clone(),
+                        },
+                        key: observer_key,
+                        value: Box::new(ConfigurationValueV1::Text(
+                            String::from_utf8(
+                                canonical_json_bytes(&observer)
+                                    .expect("NCM participation document"),
+                            )
+                            .expect("canonical NCM participation UTF-8"),
+                        )),
+                    },
+                    ConfigurationDirectMutationRequestV1::Set {
+                        layer: ConfigurationLayerIdV1::Project {
+                            project_id: target.project_id.clone(),
+                        },
+                        key: routing_key.clone(),
+                        value: Box::new(strict_value.clone()),
+                    },
+                ],
+                expected_revision: initial_revision.clone(),
+                idempotency_key: ConfigurationIdempotencyKey::new(
+                    "idempotency.required-ncm.configure",
+                )
+                .expect("configuration batch identity"),
+            }),
+        ),
+    )
+    .await;
+    let configured_receipt: ConfigurationMutationReceipt = match configured.outcome {
+        DaemonInvocationOutcome::Configuration {
+            outcome: ApplicationOutcome::Effect(effect),
+            ..
+        } => serde_json::from_value(effect.payload.expect("configuration batch receipt"))
+            .expect("typed configuration batch receipt"),
+        other => panic!("strict NCM must be configured through a real CAS: {other:?}"),
+    };
+    assert_eq!(configured_receipt.base_revision_id, initial_revision);
+    drop(server);
+    let shutdown = engine.shutdown_all().await;
+    assert!(
+        shutdown.project_servers.is_clean(),
+        "baseline shutdown: {shutdown:?}"
+    );
+    drop(engine);
+
+    let engine = test_daemon_engine_for_profile(&target.profile_root);
+    let core = engine
+        .project_server(&handshake)
+        .await
+        .expect("failed required NCM activation must preserve the core");
+    assert_eq!(
+        engine
+            .invocation
+            .service
+            .project_runtimes
+            .publication_state(&project_root),
+        Some(ProjectRuntimePublicationStateV1::Failed),
+        "the missing actual worker must refuse full publication"
+    );
+    assert!(
+        !engine
+            .invocation
+            .service
+            .project_runtimes
+            .holds::<RegisteredRetainedRuntime>(&project_root)
+            .await,
+        "failed full publication must not install a retained owner"
+    );
+    assert!(
+        matches!(
+            core.cognitive_recall_port_for_session("session.required-ncm.repair"),
+            Err(CognitiveRecallMountError::FullCompositionPending)
+        ),
+        "strict NCM failure must not return a usable Native recall port"
+    );
+    let observed_at = tracedecay_contracts::clock::now_micros();
+    let storage = DaemonInvocationRequest::primitive(
+        "request.required-ncm.storage",
+        ApplicationSurfaceOperation::StorageStatus,
+        PrimitiveRequest::StorageStatus(StorageStatusPrimitiveRequest {
+            include_details: false,
+        }),
+        observed_at,
+        Deadline::new(UtcMicros(observed_at.0.saturating_add(30_000_000)))
+            .expect("storage status deadline"),
+        CancellationContext::active("cancel.required-ncm.storage")
+            .expect("storage status cancellation"),
+    )
+    .expect("valid storage status primitive request");
+    for request in [
+        storage,
+        memory_status_request("request.required-ncm.memory"),
+    ] {
+        let response = execute_daemon_invocation(&engine, &handshake, request).await;
+        assert!(
+            matches!(
+                response.outcome,
+                DaemonInvocationOutcome::ApplicationProblem { ref problem }
+                    if problem.kind() == ApplicationProblemKind::ExecutionFailed
+                        && problem.retry() == RetryDirective::Never
+                        && problem
+                            .diagnostic()
+                            .map(|diagnostic| diagnostic.code.as_str())
+                            == Some("application.runtime.owner_failed")
+            ),
+            "a failed full owner must retain its permanent typed refusal: {response:?}"
+        );
+    }
+
+    let get = |id: &str| {
+        request(
+            id,
+            ApplicationSurfaceOperation::ConfigurationGet,
+            ConfigurationWireRequestV1::Get(ConfigurationGetRequestV1 {
+                key: routing_key.clone(),
+            }),
+        )
+    };
+    let before = execute_daemon_invocation(
+        &engine,
+        &handshake,
+        get("request.required-ncm.before-repair"),
+    )
+    .await;
+    let before: ResolvedSetting = match before.outcome {
+        DaemonInvocationOutcome::Configuration {
+            outcome: ApplicationOutcome::Evidence(packet),
+            ..
+        } => serde_json::from_value(packet.payload.expect("configuration evidence"))
+            .expect("resolved strict routing"),
+        other => panic!("configuration must remain readable after NCM failure: {other:?}"),
+    };
+    assert_eq!(before.effective_value, strict_value);
+    assert_eq!(before.revision_id, configured_receipt.result_revision_id);
+    let repaired_value = ConfigurationValueV1::Text(
+        String::from_utf8(
+            canonical_json_bytes(&MemoryProviderRecallRoutingV1::default())
+                .expect("observer-only routing document"),
+        )
+        .expect("canonical observer-only routing UTF-8"),
+    );
+    let set = |id: &str, value| {
+        request(
+            id,
+            ApplicationSurfaceOperation::ConfigurationSet,
+            ConfigurationWireRequestV1::Set(ConfigurationSetRequestV1 {
+                layer: ConfigurationLayerIdV1::Project {
+                    project_id: target.project_id.clone(),
+                },
+                key: routing_key.clone(),
+                value,
+                expected_revision: before.revision_id.clone(),
+                idempotency_key: ConfigurationIdempotencyKey::new(id)
+                    .expect("configuration repair identity"),
+            }),
+        )
+    };
+    let repaired = execute_daemon_invocation(
+        &engine,
+        &handshake,
+        set("request.required-ncm.repair", repaired_value.clone()),
+    )
+    .await;
+    let receipt: ConfigurationMutationReceipt = match repaired.outcome {
+        DaemonInvocationOutcome::Configuration {
+            outcome: ApplicationOutcome::Effect(effect),
+            ..
+        } => serde_json::from_value(effect.payload.expect("configuration repair receipt"))
+            .expect("typed configuration repair receipt"),
+        other => panic!("configuration repair CAS must remain callable: {other:?}"),
+    };
+    assert_eq!(receipt.base_revision_id, before.revision_id);
+    assert_ne!(receipt.result_revision_id, before.revision_id);
+    let stale = execute_daemon_invocation(
+        &engine,
+        &handshake,
+        set("request.required-ncm.stale-repair", strict_value),
+    )
+    .await;
+    assert!(
+        matches!(
+            stale.outcome,
+            DaemonInvocationOutcome::ApplicationProblem { ref problem }
+                if problem.kind() == ApplicationProblemKind::Conflict
+        ),
+        "a stale repair revision must still conflict: {stale:?}"
+    );
+    let after = execute_daemon_invocation(
+        &engine,
+        &handshake,
+        get("request.required-ncm.after-repair"),
+    )
+    .await;
+    let after: ResolvedSetting = match after.outcome {
+        DaemonInvocationOutcome::Configuration {
+            outcome: ApplicationOutcome::Evidence(packet),
+            ..
+        } => serde_json::from_value(packet.payload.expect("repaired configuration evidence"))
+            .expect("resolved repaired routing"),
+        other => panic!("configuration repair must be readable: {other:?}"),
+    };
+    assert_eq!(after.effective_value, repaired_value);
+    assert_eq!(after.revision_id, receipt.result_revision_id);
+    assert!(
+        !worker_binary.exists(),
+        "configuration repair must not create a worker"
+    );
+    drop(core);
+    let shutdown = engine.shutdown_all().await;
+    assert!(
+        shutdown.project_servers.is_clean(),
+        "failed-owner shutdown: {shutdown:?}"
+    );
 }

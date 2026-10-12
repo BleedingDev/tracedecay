@@ -10,7 +10,7 @@ load("//scripts:bazel/rust_test.bzl", "perf_rustc_flags", "rust_test")
 
 rust_library(
     name = "tracedecay-contracts",
-    srcs = glob(["src/**/*.rs"]),
+    srcs = glob(["src/**/*.rs"]) + ["//product:contracts_memory-provider-v1_generated_rust_sources"],
     crate_root = "src/lib.rs",
     crate_name = "tracedecay_contracts",
     edition = crate_edition(),
@@ -26,7 +26,7 @@ rust_library(
 
 rust_library(
     name = "tracedecay-contracts__dev",
-    srcs = glob(["src/**/*.rs"]),
+    srcs = glob(["src/**/*.rs"]) + ["//product:contracts_memory-provider-v1_generated_rust_sources"],
     crate_root = "src/lib.rs",
     crate_name = "tracedecay_contracts",
     edition = crate_edition(),
@@ -38,6 +38,21 @@ rust_library(
     aliases = aliases(normal = True),
     rustc_flags = perf_rustc_flags(0),
     crate_features = [],
+)
+
+rust_test(
+    name = "cognitive_recall_port",
+    srcs = glob(["tests/**/*.rs"], exclude = ["tests/fixtures/**"]),
+    crate_root = "tests/cognitive_recall_port.rs",
+    edition = crate_edition(),
+    version = "0.1.0",
+    deps = all_crate_deps(normal = True, normal_dev = True) + ["//crates/tracedecay-contracts:tracedecay-contracts__dev", "//crates/tracedecay-domain:tracedecay-domain__dev", "//crates/tracedecay-policy:tracedecay-policy__dev", "//crates/tracedecay-tool-catalog:tracedecay-tool-catalog__dev"],
+    proc_macro_deps = all_crate_deps(proc_macro = True, proc_macro_dev = True),
+    aliases = aliases(normal = True, normal_dev = True),
+    rustc_flags = perf_rustc_flags(0),
+    crate_features = [],
+    compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
+    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
 )
 
 rust_test(
@@ -71,7 +86,7 @@ rust_test(
 
 filegroup(
     name = "rustfmt_sources_2024",
-    srcs = depset(glob(["src/**/*.rs"]) + glob(["tests/contracts_suite/**/*.rs"])).to_list(),
+    srcs = depset(glob(["src/**/*.rs"]) + ["//product:contracts_memory-provider-v1_generated_rust_sources"] + glob(["tests/**/*.rs"], exclude = ["tests/fixtures/**"]) + glob(["tests/contracts_suite/**/*.rs"])).to_list(),
     tags = ["manual"],
 )
 

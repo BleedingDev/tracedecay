@@ -342,9 +342,19 @@ mkdir -p "$tmpdir/install"
 printf '#!/usr/bin/env bash\nprintf "tracedecay old\\n"\n' >"$tmpdir/install/tracedecay"
 chmod 0755 "$tmpdir/install/tracedecay"
 old_size=$(wc -c <"$tmpdir/install/tracedecay" | tr -d ' ')
+# GNU and BSD stat use different flags for the same permission and size fields.
+stat_args=(-c '%a %s')
+if ! stat "${stat_args[@]}" "$tmpdir/install/tracedecay" >/dev/null 2>&1; then
+  stat_args=(-f '%Mp%03Lp %z')
+fi
 (
   while [[ ! -e $tmpdir/stop-sampling ]]; do
-    stat -c '%a %s' "$tmpdir/install/tracedecay" 2>/dev/null || echo missing
+    if sample=$(stat "${stat_args[@]}" "$tmpdir/install/tracedecay" 2>/dev/null); then
+      # BSD includes a leading zero when no special permission bits are set.
+      printf '%s\n' "${sample#0}"
+    else
+      echo missing
+    fi
   done
 ) >"$tmpdir/replace-samples" &
 sampler=$!

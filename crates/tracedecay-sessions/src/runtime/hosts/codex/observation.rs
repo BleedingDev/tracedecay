@@ -36,6 +36,7 @@ use crate::runtime::shared::TranscriptScopeMatcher;
 use crate::runtime::source::{JsonlIoAccounting, TranscriptIngestError, TranscriptIngestResult};
 use tracedecay_privacy::{ObservationRecordParseErrorV1, normalize_prepared_observation_record_v1};
 use tracedecay_runtime_core::resident_memory::ProcessSharedMemoryReservationV1;
+use tracedecay_runtime_core::storage::enrolled_project_roots;
 
 #[cfg(test)]
 mod meta_cache_tests;
@@ -314,6 +315,7 @@ pub async fn try_admit_codex_jsonl_observations_for_project_with_admission_and_c
         admission,
         max_new_bytes,
         None,
+        None,
         cancellation,
     )
     .await
@@ -339,6 +341,38 @@ pub(crate) async fn try_admit_codex_jsonl_observations_for_project_window(
                 .min(crate::runtime::jsonl_observation_admission::MAX_CAPTURE_WINDOW_BYTES),
         ),
         Some(crate::runtime::jsonl_observation_admission::MAX_CAPTURE_WINDOW),
+        None,
+        cancellation,
+    )
+    .await
+}
+
+/// One canonical capture window for an exact hook session in its owning project.
+///
+/// A rollout filename is discovery evidence, not session authority. Verify its
+/// native metadata before reading or advancing the source cursor.
+pub async fn try_admit_codex_jsonl_observations_for_project_session_window(
+    path: &Path,
+    project_root: &Path,
+    project_id: ProjectId,
+    session_id: &str,
+    admission: &dyn HostAdmission,
+    max_new_bytes: u64,
+    cancellation: &ObservationCancellation,
+) -> TranscriptIngestResult<CodexJsonlAdmissionProgress> {
+    try_admit_codex_jsonl_observations(
+        path,
+        CodexObservationAdmission::Project {
+            root: project_root,
+            project_id,
+        },
+        admission,
+        Some(
+            max_new_bytes
+                .min(crate::runtime::jsonl_observation_admission::MAX_CAPTURE_WINDOW_BYTES),
+        ),
+        Some(crate::runtime::jsonl_observation_admission::MAX_CAPTURE_WINDOW),
+        Some(session_id),
         cancellation,
     )
     .await
@@ -402,6 +436,7 @@ pub async fn try_admit_codex_jsonl_observations_for_profile_with_admission_and_c
         },
         admission,
         max_new_bytes,
+        None,
         None,
         cancellation,
     )
@@ -602,6 +637,7 @@ async fn try_admit_codex_jsonl_observations(
     admission: &dyn HostAdmission,
     max_new_bytes: Option<u64>,
     max_frames: Option<usize>,
+    expected_session: Option<&str>,
     cancellation: &ObservationCancellation,
 ) -> TranscriptIngestResult<CodexJsonlAdmissionProgress> {
     if cancellation.is_cancelled() {
@@ -614,9 +650,48 @@ async fn try_admit_codex_jsonl_observations(
     let parsed_meta = shared_session_meta_with_provenance(path, cancellation).await?;
     let native_thread_id = parsed_meta.native_thread_id.clone();
     let meta = parsed_meta.meta.clone();
+    if expected_session.is_some_and(|expected| native_thread_id.as_deref() != Some(expected)) {
+        return Err(TranscriptIngestError::HostAdmission {
+            provider: PROVIDER,
+            reason: "source_session_mismatch",
+            retryable: false,
+            detail: None,
+        });
+    }
     if !admission_scope.accepts_session(&meta.session_id) {
         return Ok(CodexJsonlAdmissionProgress::default());
     }
+    // Project identity belongs to the enrolled repository family, while each
+    // record retains the exact cwd as its location. A scheduler or hook can
+    // enter through a linked checkout without changing the session's root.
+    let enrolled_root;
+    let admission_scope = match admission_scope {
+        CodexObservationAdmission::Project { root, project_id } => {
+            let roots =
+                enrolled_project_roots([root.to_path_buf()], &project_id).map_err(|error| {
+                    TranscriptIngestError::HostAdmission {
+                        provider: PROVIDER,
+                        reason: "project_identity_unavailable",
+                        retryable: false,
+                        detail: Some(error.to_string()),
+                    }
+                })?;
+            let [root] = roots.as_slice() else {
+                return Err(TranscriptIngestError::HostAdmission {
+                    provider: PROVIDER,
+                    reason: "project_identity_unavailable",
+                    retryable: false,
+                    detail: Some("capture root does not name the enrolled project".to_owned()),
+                });
+            };
+            enrolled_root = root.clone();
+            CodexObservationAdmission::Project {
+                root: &enrolled_root,
+                project_id,
+            }
+        }
+        profile @ CodexObservationAdmission::Profile { .. } => profile,
+    };
     let canonical_source = codex_observation_source_v2(&meta.session_id)?;
     let context = CodexAdmissionContext {
         path,
@@ -670,6 +745,7 @@ async fn admit_codex_jsonl_page(
         request = request.with_max_frames(max_frames);
     }
     let mut prior_context_bytes = 0;
+    let mut normalization_refusal = None;
     let progress = admit_jsonl_observations(
         request,
         |scan| {
@@ -751,13 +827,32 @@ async fn admit_codex_jsonl_page(
                         .ok_or(TranscriptIngestError::InvalidFrameState { provider: PROVIDER })?;
                     Ok(JsonlFrameAdmission::durable(parsed, record_id))
                 }
-                Err(_) => Ok(JsonlFrameAdmission::non_durable(
-                    non_durable_reason.unwrap_or(ObservationCoverageReason::MalformedFrame),
-                )),
+                Err(error) => {
+                    let reason =
+                        non_durable_reason.unwrap_or(ObservationCoverageReason::MalformedFrame);
+                    let _ = normalization_refusal.get_or_insert((error, reason));
+                    Ok(JsonlFrameAdmission::non_durable(reason))
+                }
             }
         },
     )
     .await?;
+    tracing::debug!(
+        path = %path.display(),
+        ?scope,
+        bytes_consumed = progress.bytes_consumed,
+        source_deferred = progress.source_deferred,
+        frames_decoded = progress.frames_decoded,
+        frames_accepted = progress.frames_accepted,
+        frames_skipped = progress.frames_skipped,
+        frames_rejected_before_decode = progress.frames_rejected_before_decode,
+        frames_refused = progress.frames_refused,
+        frames_persisted = progress.frames_persisted,
+        resumed = progress.resumed,
+        covered_through = progress.covered_through,
+        ?normalization_refusal,
+        "Codex transcript admission window completed"
+    );
     Ok(CodexJsonlAdmissionProgress {
         bytes_consumed: progress.bytes_consumed,
         source_deferred: progress.source_deferred,

@@ -19,6 +19,9 @@ include = [
     "!/src/resources/logo.png",
 ]
 
+[package.metadata.bazel.binary_features]
+tracedecay = ["memory-provider-host"]
+
 [[bin]]
 name = "tracedecay"
 path = "src/main.rs"
@@ -38,6 +41,21 @@ path = "build-support/host_cli_fixture.rs"
 name = "host_journeys_suite"
 path = "tests/host_journeys_suite/main.rs"
 required-features = ["test-transport"]
+
+[[test]]
+name = "product_memory_provider_claude_host_journey"
+path = "tests/product_memory_provider_claude_host_journey.rs"
+# The subprocess journey drives the shipped `tracedecay` binary against a live
+# daemon that must contain the provider mount. Keep the host feature required
+# when the journey runs with default features disabled.
+required-features = ["memory-provider-host", "test-transport"]
+
+[[test]]
+name = "product_memory_provider_hermes_host_journey"
+path = "tests/product_memory_provider_hermes_host_journey.rs"
+# This journey loads the generated Hermes plugin and drives its real provider
+# callback against the live daemon/provider mount.
+required-features = ["memory-provider-host", "test-transport"]
 
 [[test]]
 name = "c_library_allocator"
@@ -65,8 +83,14 @@ path = "tests/work_loop_journey.rs"
 required-features = ["test-transport"]
 
 [features]
-default = ["production"]
+default = ["production", "memory-provider-host"]
 production = ["tracedecay/production", "alloc-mimalloc"]
+# The V2 CLI includes the provider host and real model encoder. Each
+# project's configuration decides which memory provider the host activates.
+memory-provider-host = [
+    "tracedecay/memory-provider-host",
+    "tracedecay-memory-ncm-runtime/real-encoder",
+]
 # Opt-in tiered graph storage; not part of `production`.
 graph-disk-tier = ["tracedecay/graph-disk-tier"]
 token-counting = ["tracedecay/token-counting"]
@@ -174,6 +198,7 @@ tracedecay-host-integration = { path = "../tracedecay-host-integration" }
 tracedecay-lsp = { path = "../tracedecay-lsp" }
 tracedecay-maintenance = { path = "../tracedecay-maintenance" }
 tracedecay-mcp = { path = "../tracedecay-mcp" }
+tracedecay-memory-ncm-runtime = { path = "../tracedecay-memory-ncm-runtime", default-features = false }
 tracedecay-private-fs = { path = "../tracedecay-private-fs" }
 tracedecay-project = { path = "../tracedecay-project" }
 tracedecay-runtime-core = { path = "../tracedecay-runtime-core" }
@@ -233,6 +258,11 @@ tracedecay-global-db = { path = "../tracedecay-global-db", features = ["test-hel
 # contracts directly since the lcm extraction; CLI test targets compile that
 # fixture via `#[path]` and need the extern.
 tracedecay-lcm = { path = "../tracedecay-lcm" }
+# Dev-only: the Claude host memory journey reads the durable observation
+# journal through the journal crate's own inspection surface rather than
+# re-deriving its schema in SQL.
+tracedecay-memory-observation = { path = "../tracedecay-memory-observation" }
+tracedecay-privacy = { path = "../tracedecay-privacy" }
 tracedecay-project = { path = "../tracedecay-project", features = ["test-helpers"] }
 tracedecay-runtime-core = { path = "../tracedecay-runtime-core", features = ["test-helpers"] }
 tracedecay-session-temporal-store = { path = "../tracedecay-session-temporal-store" }

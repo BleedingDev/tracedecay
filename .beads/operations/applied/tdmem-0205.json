@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "attempt": 1,
+  "issue_id": "tdmem-0205",
+  "mode": "complete",
+  "actor": "assistant",
+  "claim_comment": "Closing lifecycle semantics only after proving capability-gated typed unsupported behavior, feedback targeting across explicit and latent memory, bounded cancellable maintenance, verifiable forget-by-source postconditions, and compatible provider-local snapshot/replay rules.",
+  "checks": [
+    {
+      "name": "provider lifecycle contract tests",
+      "argv": ["python3", "tests/product_provider_lifecycle_contract_test.py"],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "provider lifecycle repository validation",
+      "argv": [
+        "python3",
+        "scripts/product/check-provider-lifecycle-contract.py",
+        "--repo",
+        ".",
+        "--contract",
+        "product/contracts/memory-provider-v1/provider-lifecycle-contract.json",
+        "--schema",
+        "product/contracts/memory-provider-v1/provider-lifecycle-contract.schema.json",
+        "--doc",
+        "product/contracts/memory-provider-v1/provider-lifecycle-contract.md",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "provider recall contract remains valid",
+      "argv": [
+        "python3",
+        "scripts/product/check-provider-recall-contract.py",
+        "--repo",
+        ".",
+        "--contract",
+        "product/contracts/memory-provider-v1/provider-recall-contract.json",
+        "--schema",
+        "product/contracts/memory-provider-v1/provider-recall-contract.schema.json",
+        "--doc",
+        "product/contracts/memory-provider-v1/provider-recall-contract.md",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "provider observation contract remains valid",
+      "argv": [
+        "python3",
+        "scripts/product/check-provider-observation-contract.py",
+        "--repo",
+        ".",
+        "--contract",
+        "product/contracts/memory-provider-v1/provider-observation-contract.json",
+        "--schema",
+        "product/contracts/memory-provider-v1/provider-observation-contract.schema.json",
+        "--doc",
+        "product/contracts/memory-provider-v1/provider-observation-contract.md",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "provider registry and handshake remain valid",
+      "argv": [
+        "bash",
+        "-lc",
+        "python3 scripts/product/check-provider-registry-contract.py --repo . --contract product/contracts/memory-provider-v1/provider-registry-contract.json --schema product/contracts/memory-provider-v1/provider-registry-contract.schema.json --readme product/contracts/memory-provider-v1/README.md --issues .beads/issues.jsonl && python3 scripts/product/check-provider-handshake-contract.py --repo . --contract product/contracts/memory-provider-v1/provider-handshake-contract.json --schema product/contracts/memory-provider-v1/provider-handshake-contract.schema.json --doc product/contracts/memory-provider-v1/provider-handshake-contract.md --issues .beads/issues.jsonl"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "upstream patch-footprint remains within policy",
+      "argv": [
+        "python3",
+        "scripts/product/check-patch-footprint-policy.py",
+        "--repo",
+        ".",
+        "--policy",
+        "product/upstream/patch-footprint-policy.json",
+        "--map",
+        "product/upstream/convergence-map.json"
+      ],
+      "timeout_seconds": 180
+    }
+  ],
+  "acceptance_criteria": [
+    "Unsupported lifecycle operations return typed unsupported results.",
+    "Forget-by-source has a verifiable postcondition.",
+    "Feedback can target a stable item, a recall trace, or a context-pack item.",
+    "Maintenance is bounded and cancellable."
+  ],
+  "close_reason": "Accepted the V1 provider lifecycle contract with explicit capability gating, latent-or-explicit feedback targets, bounded cancellable maintenance, redacted inspection, revisioned correction, verifiable source forgetting, and compatible provider-local snapshot/replay semantics.",
+  "close_comment": "Evidence: provider-lifecycle-contract.json and its strict schema define a common exact-scope idempotent request context plus registry-checked health, feedback, maintenance, inspection, correction, deletion-by-source, snapshot export/restore, replay, explicit projection, and explain-trace capabilities. Unsupported optional operations return capability_unsupported with no fallback. Feedback targets exactly one stable memory ref, recall trace, or context-pack item and requires settled outcome evidence. Maintenance has finite item/byte/time limits, one writer per scope, live deadline/cancellation, partial receipts, and no unbounded scan. Inspection is bounded/redacted. Correction is revision-checked and cannot change code or Native facts. Forget-by-source reports matched/removed/anonymized/locked/remaining influence plus snapshot coverage and verification state; success cannot hide residual influence. Snapshots bind provider/build/schema/scope/generation/sequence/digest and restore cannot reset or overwrite implicitly. Replay is receipt-backed, monotonic, idempotent, and explicit about gaps/partial effects. The validator cross-checks all registry capabilities and accepted M1 contracts; mutation tests enforce unsupported, targeting, bounding, cancellation, privacy, authority, deletion postcondition, snapshot, replay, terminal, Beads, and schema rules."
+}

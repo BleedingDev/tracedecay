@@ -74,11 +74,13 @@ pub fn sync_parent_directory(path: &Path, policy: DirectorySyncPolicy) -> io::Re
 /// already-submitted writes. The cost stays proportional to the batch's own
 /// bytes. `syncfs(2)` also paid one commit, but waited for every dirty inode on
 /// the filesystem, so a one-file seal stalled for seconds behind unrelated
-/// writers. Other platforms fsync each file as it is written.
+/// writers. On macOS full file syncs are also deferred to [`Self::sync`],
+/// so the whole staged batch can be written before issuing those barriers.
+/// Other platforms fsync each file as it is written.
 #[derive(Default)]
 pub struct DurableFileBatch {
     /// Paths rather than open handles, so a large seal holds no descriptors.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     members: Vec<PathBuf>,
 }
 
@@ -89,41 +91,57 @@ impl DurableFileBatch {
 
     /// Record one fully written member file, created at `path`.
     pub fn written(&mut self, path: &Path, file: &File) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            // SAFETY: `file` is an open descriptor for the whole call.
-            let started = unsafe {
-                libc::sync_file_range(file.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE)
-            };
-            if started != 0 {
-                return Err(io::Error::last_os_error());
+            #[cfg(target_os = "linux")]
+            {
+                // SAFETY: `file` is an open descriptor for the whole call.
+                let started = unsafe {
+                    libc::sync_file_range(file.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE)
+                };
+                if started != 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
+            #[cfg(target_os = "macos")]
+            let _ = file;
             self.members.push(path.to_path_buf());
             Ok(())
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             sync_owned_file(path, file)
         }
     }
 
     /// Make every member file's contents durable.
+    pub fn sync(&self) -> io::Result<()> {
+        self.sync_with_checkpoint(|| Ok(()), |error| error)
+    }
+
+    /// Make every member durable, checking the caller's publication authority
+    /// before each full file sync and after the final barrier. IO failures and
+    /// checkpoint refusals retain the caller's distinct error states.
     #[tracing::instrument(
         name = "private_fs.framed_log.sync_file_batch",
         level = "trace",
         skip_all
     )]
-    pub fn sync(&self) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
+    pub fn sync_with_checkpoint<E>(
+        &self,
+        mut checkpoint: impl FnMut() -> Result<(), E>,
+        io_error: impl Fn(io::Error) -> E,
+    ) -> Result<(), E> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            self.members
-                .iter()
-                .try_for_each(|member| sync_file_at(member))
+            for member in &self.members {
+                checkpoint()?;
+                sync_file_at(member).map_err(&io_error)?;
+            }
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            Ok(())
-        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let _ = io_error;
+        checkpoint()
     }
 }
 
@@ -231,6 +249,21 @@ fn normalize_no_follow_error(error: io::Error) -> io::Error {
         return io::Error::new(io::ErrorKind::InvalidInput, "path is a symbolic link");
     }
     error
+}
+
+/// Open a regular file for bounded caller-owned reads. Empty regular files
+/// are valid; final symlinks, reparse points, directories and FIFOs are not.
+/// The handle check follows the nonblocking, no-follow open, so replacing a
+/// pathname with a FIFO cannot park a reader in `open`.
+pub fn open_regular_read_no_follow(path: &Path) -> io::Result<File> {
+    let file = open_no_follow(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 /// Read a whole regular file of at most `maximum` bytes, or `None` when
@@ -1033,8 +1066,51 @@ mod tests {
 
     use super::{
         DIRECTORY_SYNC_CALLS, DirectorySyncPolicy, append_durable, atomic_write_accelerator,
-        atomic_write_prepared,
+        atomic_write_prepared, open_regular_read_no_follow,
     };
+
+    #[test]
+    fn regular_read_opener_accepts_empty_files_and_rejects_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let empty = root.path().join("empty");
+        fs::write(&empty, []).unwrap();
+        assert_eq!(
+            open_regular_read_no_follow(&empty)
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            open_regular_read_no_follow(root.path()).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regular_read_opener_rejects_symlinks_and_fifos_without_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("file");
+        fs::write(&file, b"source").unwrap();
+        let link = root.path().join("link");
+        symlink(&file, &link).unwrap();
+        assert_eq!(
+            open_regular_read_no_follow(&link).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        let fifo = root.path().join("fifo");
+        let native = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `native` is a live NUL-terminated path for this fixture.
+        assert_eq!(unsafe { libc::mkfifo(native.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            open_regular_read_no_follow(&fifo).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
 
     #[test]
     fn rebuildable_accelerators_publish_without_directory_sync() {

@@ -86,6 +86,30 @@ production = [
     "full",
 ]
 
+# Product-owned provider composition is mounted at the daemon project-server
+# lifetime boundary. Opt-in only: never in `default` and never in
+# `production`, so a shipped default build compiles no provider-registry,
+# observation-journal, or hygiene code at all and behaves exactly as upstream.
+# `product/upstream/convergence-map.json` and
+# `product/upstream/patch-footprint-policy.md` both record this mount as the
+# "default-off host feature"; enabling it is a deliberate build choice
+# (`--features memory-provider-host`), and even then the runtime configuration
+# gates `memory.provider_native_enabled.v1` decide whether anything runs.
+#
+# The durable observation journal and the hygiene pipeline join the same
+# feature rather than getting one of their own: a mounted provider host that
+# cannot journal or sanitize would be a dispatch path with no outbox and no
+# secret gate, which is worse than no mount at all.
+memory-provider-host = [
+    "dep:chrono",
+    "dep:thiserror",
+    "dep:tracedecay-memory-provider-registry",
+    "dep:tracedecay-memory-provider-ncm",
+    "dep:tracedecay-memory-observation",
+    "dep:tracedecay-memory-hygiene",
+    "tracedecay-daemon-service/memory-provider-host",
+]
+
 # Exact token counting for the Savings & Cost dashboard (tiktoken BPE).
 # Embeds gzip-compressed o200k_base (~1.6 MiB .rodata; inflate is lazy on
 # first count). Disable for a leaner binary; cost estimation falls back to
@@ -159,6 +183,7 @@ test-helpers = [
     "tracedecay-daemon-service/test-helpers",
     "tracedecay-host-admission/test-helpers",
     "tracedecay-maintenance/test-helpers",
+    "tracedecay-memory-provider-ncm?/test-helpers",
     "tracedecay-runtime-core/test-helpers",
     "tracedecay-session-runtime/test-helpers",
     "tracedecay-sessions/test-helpers",
@@ -168,6 +193,7 @@ test-helpers = [
 
 test-transport = [
     "test-helpers",
+    "tracedecay-memory-provider-ncm?/test-transport",
     "tracedecay-project/test-transport",
     "tracedecay-rusqlite-runtime/test-transport",
     "tracedecay-runtime-core/test-transport",
@@ -231,6 +257,7 @@ path = "../../tests/storage_runtime_rusqlite_suite/main.rs"
 
 [dependencies]
 axum = "0.8"
+chrono = { version = "0.4.45", default-features = false, features = ["std"], optional = true }
 tower = "0.5"
 constant_time_eq = "0.5.0"
 # Wakes the hook replay drain when a callback appends to a spool.
@@ -257,6 +284,10 @@ tracedecay-host-admission = { path = "../tracedecay-host-admission" }
 tracedecay-mcp = { path = "../tracedecay-mcp" }
 tracedecay-lsp = { path = "../tracedecay-lsp" }
 tracedecay-maintenance = { path = "../tracedecay-maintenance" }
+tracedecay-memory-provider-registry = { path = "../tracedecay-memory-provider-registry", optional = true }
+tracedecay-memory-provider-ncm = { path = "../tracedecay-memory-provider-ncm", optional = true, features = ["rust-backend"] }
+tracedecay-memory-observation = { path = "../tracedecay-memory-observation", optional = true }
+tracedecay-memory-hygiene = { path = "../tracedecay-memory-hygiene", optional = true }
 tracedecay-global-db = { path = "../tracedecay-global-db" }
 tracedecay-graph-db = { path = "../tracedecay-graph-db" }
 tracedecay-graph-query = { path = "../tracedecay-graph-query" }
@@ -285,12 +316,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "3", features = ["json"] }
 url = "2"
+thiserror = { version = "2", optional = true }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = "0.1"
 sha2 = "0.11"
 walkdir = "2"
 gix.workspace = true
+# Recall diagnostic-key entropy for the NCM provider observer (src/daemon/project_composition/ncm_observer.rs).
+getrandom = "0.2"
 zeroize = "1.9.0"
 keyring = { version = "4.1.5", features = ["v1"] }
 tempfile = "3"
@@ -325,6 +359,8 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 jsonschema = { version = "0.46.8", default-features = false }
 tracedecay-sdk = { path = "../tracedecay-sdk" }
+# Root-only Native baseline over the coding-memory scenario corpus (tdmem-0902).
+tracedecay-memory-conformance = { path = "../tracedecay-memory-conformance" }
 tracedecay-tokenizer = { path = "../tracedecay-tokenizer" }
 tracedecay-capture = { path = "../tracedecay-capture" }
 # Test builds opt into the query kernel's `*_for_test` constructors; the

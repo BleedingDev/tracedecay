@@ -76,5 +76,56 @@ class DefaultAliasNormalizationTests(unittest.TestCase):
         )
 
 
+class BinaryFeatureSelectionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.gen = load_gen_builds()
+
+    def package(self, selections):
+        return {
+            "name": "product-cli",
+            "features": {"memory-provider-host": [], "transport": []},
+            "metadata": {"bazel": {"binary_features": selections}},
+            "targets": [
+                {"name": "product", "kind": ["bin"]},
+                {"name": "fixture", "kind": ["bin"]},
+                {"name": "product", "kind": ["lib"]},
+            ],
+        }
+
+    def test_selects_only_the_named_production_binary(self) -> None:
+        package = self.package({"product": ["memory-provider-host"]})
+        self.gen.validate_binary_features(package)
+        self.assertEqual(
+            self.gen.target_features(package, package["targets"][0]),
+            {"memory-provider-host"},
+        )
+        for target in package["targets"][1:]:
+            self.assertEqual(self.gen.target_features(package, target), set())
+
+    def test_preserves_cargo_required_features(self) -> None:
+        package = self.package({"product": ["memory-provider-host"]})
+        target = dict(package["targets"][0], **{"required-features": ["transport"]})
+        self.assertEqual(
+            self.gen.target_features(package, target),
+            {"memory-provider-host", "transport"},
+        )
+
+    def test_rejects_unknown_binary(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "unknown binary"):
+            self.gen.validate_binary_features(
+                self.package({"missing": ["memory-provider-host"]})
+            )
+
+    def test_rejects_unknown_feature(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "declared package features"):
+            self.gen.validate_binary_features(self.package({"product": ["missing"]}))
+
+    def test_rejects_malformed_selection(self) -> None:
+        for selections in (["memory-provider-host"], {"product": "memory-provider-host"}):
+            with self.subTest(selections=selections), self.assertRaises(SystemExit):
+                self.gen.validate_binary_features(self.package(selections))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -83,29 +83,11 @@ impl ObservationExecutor {
             if collision == ObservationCollisionOutcomeV1::ExactDuplicate
                 && stored_observation.identity() != observation.identity()
             {
-                let identity = observation.identity();
-                let mut advance = ObservationCursorAdvance::for_ordering_with_sanitization_receipt(
-                    identity.source().clone(),
-                    identity.scope().clone(),
-                    identity.generation(),
-                    identity.ordering_domain(),
-                    write.expected_cursor().cloned(),
-                    identity.position(),
-                    ObservationCoverageReason::DuplicateObservation,
+                return self.execute_duplicate_cursor_advance(
+                    savepoint,
+                    write,
                     observation.receipt().clone(),
-                )
-                .map_err(invalid)?;
-                match (
-                    write.next_cursor().file_identity(),
-                    write.next_cursor().resume_fingerprint(),
-                ) {
-                    (Some(file_identity), Some(resume_fingerprint)) => {
-                        advance = advance.with_resume_checkpoint(file_identity, resume_fingerprint);
-                    }
-                    (None, None) => {}
-                    _ => return Err(invalid("cursor resume checkpoint is incomplete").into()),
-                }
-                return self.execute_cursor_advance(savepoint, &advance);
+                );
             }
             if collision != ObservationCollisionOutcomeV1::ExactDuplicate
                 || stored_digest != payload_digest
@@ -123,7 +105,11 @@ impl ObservationExecutor {
                 return Err(invalid("sanitization receipt identity collision").into());
             }
             verify_observation_authority(savepoint, write)?;
-            return Ok(());
+            return self.execute_duplicate_cursor_advance(
+                savepoint,
+                write,
+                stored_observation.receipt().clone(),
+            );
         }
 
         let actual_cursor = read_cursor(savepoint, &source_json, &scope_json)?;
@@ -179,6 +165,37 @@ impl ObservationExecutor {
             params![observation.observation_id().as_str(), sequence],
         )?;
         Ok(())
+    }
+
+    fn execute_duplicate_cursor_advance(
+        &mut self,
+        savepoint: &Savepoint<'_>,
+        write: &AnchoredObservationWrite,
+        receipt: SanitizationReceiptV1,
+    ) -> Result<(), StorageOperationError> {
+        let identity = write.observation().identity();
+        let mut advance = ObservationCursorAdvance::for_ordering_with_sanitization_receipt(
+            identity.source().clone(),
+            identity.scope().clone(),
+            identity.generation(),
+            identity.ordering_domain(),
+            write.expected_cursor().cloned(),
+            identity.position(),
+            ObservationCoverageReason::DuplicateObservation,
+            receipt,
+        )
+        .map_err(invalid)?;
+        match (
+            write.next_cursor().file_identity(),
+            write.next_cursor().resume_fingerprint(),
+        ) {
+            (Some(file_identity), Some(resume_fingerprint)) => {
+                advance = advance.with_resume_checkpoint(file_identity, resume_fingerprint);
+            }
+            (None, None) => {}
+            _ => return Err(invalid("cursor resume checkpoint is incomplete").into()),
+        }
+        self.execute_cursor_advance(savepoint, &advance)
     }
 
     pub fn execute_cursor_advance(

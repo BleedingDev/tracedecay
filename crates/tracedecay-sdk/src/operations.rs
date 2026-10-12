@@ -1207,6 +1207,78 @@ typed_operation!(
     ProjectSearch, project_search, "operation.application.project_search", OperationTransport::McpTool { tool_name: "tracedecay_project_search" }, "binding.mcp.project_search.v1", EffectClass::Read, IdempotencyContract::NotRequired, SdkRequestIdControlV1::ServerMinted, SdkResultSemanticsV1::SchemaOnly, true, &[CancellationPoint::BeforeAdmission, CancellationPoint::BeforeRead, CancellationPoint::DuringRead], 120000, DeadlineBehavior::ReturnOperationReceipt, ReconciliationContract::NotRequired, ReceiptContract::Operation, &[TerminalState::Completed, TerminalState::Cancelled, TerminalState::TimedOut, TerminalState::Failed, TerminalState::Unavailable, TerminalState::Partial], "schema.application.primitive.project-search.result", 1
 );
 
+pub mod application_provider_correction {
+    pub type Request = tracedecay_contracts::retained_surfaces::ProviderCorrectionRequestV1;
+    pub type Result = tracedecay_contracts::retained_surfaces::ProviderControlResultV1;
+}
+typed_operation!(
+    ApplicationProviderCorrection, application_provider_correction, "operation.application.provider_correction", OperationTransport::Http { route: "/application/retained/provider_correction" }, "binding.http.provider_correction.v1", EffectClass::Administrative, IdempotencyContract::Required, SdkRequestIdControlV1::Required, SdkResultSemanticsV1::ProviderControlTerminal, true, &[CancellationPoint::BeforeAdmission, CancellationPoint::BeforeEffect, CancellationPoint::EffectInFlight, CancellationPoint::Reconciling, CancellationPoint::AfterCommit], 30000, DeadlineBehavior::ReturnEffectReceipt, ReconciliationContract::Required, ReceiptContract::DurableEffect, &[TerminalState::Completed, TerminalState::Cancelled, TerminalState::TimedOut, TerminalState::Failed, TerminalState::Unavailable, TerminalState::EffectUnknown, TerminalState::Partial], "schema.application.retained.provider-correction.result", 1
+);
+
+pub mod application_provider_delete_by_source {
+    pub type Request = tracedecay_contracts::retained_surfaces::ProviderDeleteBySourceRequestV1;
+    pub type Result = tracedecay_contracts::retained_surfaces::ProviderControlResultV1;
+}
+typed_operation!(
+    ApplicationProviderDeleteBySource, application_provider_delete_by_source, "operation.application.provider_delete_by_source", OperationTransport::Http { route: "/application/retained/provider_delete_by_source" }, "binding.http.provider_delete_by_source.v1", EffectClass::Administrative, IdempotencyContract::Required, SdkRequestIdControlV1::Required, SdkResultSemanticsV1::ProviderControlTerminal, true, &[CancellationPoint::BeforeAdmission, CancellationPoint::BeforeEffect, CancellationPoint::EffectInFlight, CancellationPoint::Reconciling, CancellationPoint::AfterCommit], 30000, DeadlineBehavior::ReturnEffectReceipt, ReconciliationContract::Required, ReceiptContract::DurableEffect, &[TerminalState::Completed, TerminalState::Cancelled, TerminalState::TimedOut, TerminalState::Failed, TerminalState::Unavailable, TerminalState::EffectUnknown, TerminalState::Partial], "schema.application.retained.provider-delete-by-source.result", 1
+);
+
+pub mod application_provider_feedback {
+    pub type Request = tracedecay_contracts::retained_surfaces::ProviderFeedbackRequestV1;
+    pub type Result = tracedecay_contracts::retained_surfaces::ProviderControlResultV1;
+}
+typed_operation!(
+    ApplicationProviderFeedback, application_provider_feedback, "operation.application.provider_feedback", OperationTransport::Http { route: "/application/retained/provider_feedback" }, "binding.http.provider_feedback.v1", EffectClass::Administrative, IdempotencyContract::Required, SdkRequestIdControlV1::Required, SdkResultSemanticsV1::ProviderControlTerminal, true, &[CancellationPoint::BeforeAdmission, CancellationPoint::BeforeEffect, CancellationPoint::EffectInFlight, CancellationPoint::Reconciling, CancellationPoint::AfterCommit], 30000, DeadlineBehavior::ReturnEffectReceipt, ReconciliationContract::Required, ReceiptContract::DurableEffect, &[TerminalState::Completed, TerminalState::Cancelled, TerminalState::TimedOut, TerminalState::Failed, TerminalState::Unavailable, TerminalState::EffectUnknown, TerminalState::Partial], "schema.application.retained.provider-feedback.result", 1
+);
+
+pub mod application_provider_health {
+    pub type Request = tracedecay_contracts::retained_surfaces::ProviderHealthRequestV1;
+    pub type Result = tracedecay_contracts::retained_surfaces::ProviderControlResultV1;
+}
+typed_operation!(
+    ApplicationProviderHealth, application_provider_health, "operation.application.provider_health", OperationTransport::Http { route: "/application/retained/provider_health" }, "binding.http.provider_health.v1", EffectClass::Read, IdempotencyContract::NotRequired, SdkRequestIdControlV1::ServerMinted, SdkResultSemanticsV1::ProviderControlTerminal, true, &[CancellationPoint::BeforeAdmission, CancellationPoint::BeforeRead, CancellationPoint::DuringRead], 30000, DeadlineBehavior::ReturnOperationReceipt, ReconciliationContract::NotRequired, ReceiptContract::Operation, &[TerminalState::Completed, TerminalState::Cancelled, TerminalState::TimedOut, TerminalState::Failed, TerminalState::Unavailable, TerminalState::Partial], "schema.application.retained.provider-health.result", 1
+);
+
+pub mod application_provider_inspection {
+    pub type Request = tracedecay_contracts::retained_surfaces::ProviderInspectionRequestV1;
+    pub type Result = tracedecay_contracts::retained_surfaces::ProviderControlResultV1;
+}
+typed_operation!(
+    ApplicationProviderInspection, application_provider_inspection, "operation.application.provider_inspection", OperationTransport::Http { route: "/application/retained/provider_inspection" }, "binding.http.provider_inspection.v1", EffectClass::Read, IdempotencyContract::NotRequired, SdkRequestIdControlV1::ServerMinted, SdkResultSemanticsV1::ProviderControlTerminal, true, &[CancellationPoint::BeforeAdmission, CancellationPoint::BeforeRead, CancellationPoint::DuringRead], 30000, DeadlineBehavior::ReturnOperationReceipt, ReconciliationContract::NotRequired, ReceiptContract::Operation, &[TerminalState::Completed, TerminalState::Cancelled, TerminalState::TimedOut, TerminalState::Failed, TerminalState::Unavailable, TerminalState::Partial], "schema.application.retained.provider-inspection.result", 1
+);
+
+pub mod application_provider_maintenance {
+    pub type Request = tracedecay_contracts::retained_surfaces::ProviderMaintenanceRequestV1;
+    pub type Result = tracedecay_contracts::retained_surfaces::ProviderControlResultV1;
+}
+typed_operation!(
+    ApplicationProviderMaintenance, application_provider_maintenance, "operation.application.provider_maintenance", OperationTransport::Http { route: "/application/retained/provider_maintenance" }, "binding.http.provider_maintenance.v1", EffectClass::Administrative, IdempotencyContract::Required, SdkRequestIdControlV1::Required, SdkResultSemanticsV1::ProviderControlTerminal, true, &[CancellationPoint::BeforeAdmission, CancellationPoint::BeforeEffect, CancellationPoint::EffectInFlight, CancellationPoint::Reconciling, CancellationPoint::AfterCommit], 30000, DeadlineBehavior::ReturnEffectReceipt, ReconciliationContract::Required, ReceiptContract::DurableEffect, &[TerminalState::Completed, TerminalState::Cancelled, TerminalState::TimedOut, TerminalState::Failed, TerminalState::Unavailable, TerminalState::EffectUnknown, TerminalState::Partial], "schema.application.retained.provider-maintenance.result", 1
+);
+
+pub mod application_provider_replay {
+    pub type Request = tracedecay_contracts::retained_surfaces::ProviderReplayRequestV1;
+    pub type Result = tracedecay_contracts::retained_surfaces::ProviderControlResultV1;
+}
+typed_operation!(
+    ApplicationProviderReplay, application_provider_replay, "operation.application.provider_replay", OperationTransport::Http { route: "/application/retained/provider_replay" }, "binding.http.provider_replay.v1", EffectClass::Administrative, IdempotencyContract::Required, SdkRequestIdControlV1::Required, SdkResultSemanticsV1::ProviderControlTerminal, true, &[CancellationPoint::BeforeAdmission, CancellationPoint::BeforeEffect, CancellationPoint::EffectInFlight, CancellationPoint::Reconciling, CancellationPoint::AfterCommit], 30000, DeadlineBehavior::ReturnEffectReceipt, ReconciliationContract::Required, ReceiptContract::DurableEffect, &[TerminalState::Completed, TerminalState::Cancelled, TerminalState::TimedOut, TerminalState::Failed, TerminalState::Unavailable, TerminalState::EffectUnknown, TerminalState::Partial], "schema.application.retained.provider-replay.result", 1
+);
+
+pub mod application_provider_snapshot_export {
+    pub type Request = tracedecay_contracts::retained_surfaces::ProviderSnapshotExportRequestV1;
+    pub type Result = tracedecay_contracts::retained_surfaces::ProviderControlResultV1;
+}
+typed_operation!(
+    ApplicationProviderSnapshotExport, application_provider_snapshot_export, "operation.application.provider_snapshot_export", OperationTransport::Http { route: "/application/retained/provider_snapshot_export" }, "binding.http.provider_snapshot_export.v1", EffectClass::Read, IdempotencyContract::NotRequired, SdkRequestIdControlV1::ServerMinted, SdkResultSemanticsV1::ProviderControlTerminal, true, &[CancellationPoint::BeforeAdmission, CancellationPoint::BeforeRead, CancellationPoint::DuringRead], 30000, DeadlineBehavior::ReturnOperationReceipt, ReconciliationContract::NotRequired, ReceiptContract::Operation, &[TerminalState::Completed, TerminalState::Cancelled, TerminalState::TimedOut, TerminalState::Failed, TerminalState::Unavailable, TerminalState::Partial], "schema.application.retained.provider-snapshot-export.result", 1
+);
+
+pub mod application_provider_snapshot_restore {
+    pub type Request = tracedecay_contracts::retained_surfaces::ProviderSnapshotRestoreRequestV1;
+    pub type Result = tracedecay_contracts::retained_surfaces::ProviderControlResultV1;
+}
+typed_operation!(
+    ApplicationProviderSnapshotRestore, application_provider_snapshot_restore, "operation.application.provider_snapshot_restore", OperationTransport::Http { route: "/application/retained/provider_snapshot_restore" }, "binding.http.provider_snapshot_restore.v1", EffectClass::Administrative, IdempotencyContract::Required, SdkRequestIdControlV1::Required, SdkResultSemanticsV1::ProviderControlTerminal, true, &[CancellationPoint::BeforeAdmission, CancellationPoint::BeforeEffect, CancellationPoint::EffectInFlight, CancellationPoint::Reconciling, CancellationPoint::AfterCommit], 30000, DeadlineBehavior::ReturnEffectReceipt, ReconciliationContract::Required, ReceiptContract::DurableEffect, &[TerminalState::Completed, TerminalState::Cancelled, TerminalState::TimedOut, TerminalState::Failed, TerminalState::Unavailable, TerminalState::EffectUnknown, TerminalState::Partial], "schema.application.retained.provider-snapshot-restore.result", 1
+);
+
 pub mod application_qualified_name {
     pub type Request = tracedecay_contracts::retrieval::QualifiedNamePrimitiveRequest;
     pub type Result = tracedecay_contracts::retrieval::QualifiedNamePrimitiveResult;

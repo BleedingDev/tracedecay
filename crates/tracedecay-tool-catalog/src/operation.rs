@@ -274,6 +274,15 @@ application_surface_operations! {
     FactStoreList => "fact_store_list";
     FactFeedback => "fact_feedback";
     MemoryStatus => "memory_status";
+    ProviderFeedback => "provider_feedback";
+    ProviderCorrection => "provider_correction";
+    ProviderDeleteBySource => "provider_delete_by_source";
+    ProviderHealth => "provider_health";
+    ProviderInspection => "provider_inspection";
+    ProviderMaintenance => "provider_maintenance";
+    ProviderSnapshotExport => "provider_snapshot_export";
+    ProviderSnapshotRestore => "provider_snapshot_restore";
+    ProviderReplay => "provider_replay";
     SessionRefreshStatus => "session_refresh_status";
     SessionRefreshCancel => "session_refresh_cancel";
     SessionRefreshBegin => "session_refresh_begin";

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -13,16 +14,37 @@ SCRIPT = Path(__file__).with_name("plan-release-recovery.py")
 TARGETS = {
     "include": [
         {
-            "name": "linux",
-            "runner": "ubuntu",
-            "target": "x86_64-linux",
+            "name": "aarch64-macos",
+            "runner": "macos-14",
+            "target": "aarch64-apple-darwin",
             "archive": "tar.gz",
+            "ncm": "supported",
+            "sidecar": {
+                "worker": "tracedecay-ncm-worker",
+                "manifest": "worker-manifest.json",
+                "model_manifest": "model-acquisition-manifest.json",
+            },
         },
         {
-            "name": "windows",
-            "runner": "windows",
-            "target": "x86_64-windows",
+            "name": "x86_64-linux",
+            "runner": "ubuntu-22.04",
+            "target": "x86_64-unknown-linux-gnu",
+            "archive": "tar.gz",
+            "ncm": "native-only",
+        },
+        {
+            "name": "aarch64-linux",
+            "runner": "ubuntu-22.04-arm",
+            "target": "aarch64-unknown-linux-gnu",
+            "archive": "tar.gz",
+            "ncm": "native-only",
+        },
+        {
+            "name": "x86_64-windows",
+            "runner": "windows-latest",
+            "target": "x86_64-pc-windows-msvc",
             "archive": "zip",
+            "ncm": "native-only",
         },
     ]
 }
@@ -36,7 +58,7 @@ def invoke(
         (root / output).unlink(missing_ok=True)
     return subprocess.run(
         [
-            "python3",
+            sys.executable,
             str(SCRIPT),
             "--manifest",
             str(root / "targets.json"),
@@ -70,9 +92,7 @@ def run(
     return outputs["build_required"], json.loads(outputs["matrix"]), retained
 
 
-def refuses(
-    root: Path, assets: tuple[str, ...], reason: str, profile: str = "stable"
-) -> None:
+def refuses(root: Path, assets: tuple[str, ...], reason: str, profile: str) -> None:
     completed = invoke(root, assets, profile)
     if completed.returncode != 1 or completed.stderr != f"{reason}\n":
         raise AssertionError(completed.stdout + completed.stderr)
@@ -87,82 +107,90 @@ def premature_metadata(asset: str) -> str:
     )
 
 
+def check_profile(root: Path, profile: str) -> None:
+    cli_prefix = "tracedecay-beta" if profile == "beta" else "tracedecay"
+    worker_prefix = (
+        "tracedecay-ncm-worker-beta" if profile == "beta" else "tracedecay-ncm-worker"
+    )
+    macos_binary = f"{cli_prefix}-v1.2.3-aarch64-macos.tar.gz"
+    macos_mcpb = f"{cli_prefix}-v1.2.3-aarch64-macos.mcpb"
+    macos_worker = f"{worker_prefix}-v1.2.3-aarch64-macos.tar.gz"
+    macos_checksum = f"{macos_worker}.sha256"
+    native_assets = (
+        f"{cli_prefix}-v1.2.3-x86_64-linux.tar.gz",
+        f"{cli_prefix}-v1.2.3-x86_64-linux.mcpb",
+        f"{cli_prefix}-v1.2.3-aarch64-linux.tar.gz",
+        f"{cli_prefix}-v1.2.3-aarch64-linux.mcpb",
+        f"{cli_prefix}-v1.2.3-x86_64-windows.zip",
+        f"{cli_prefix}-v1.2.3-x86_64-windows.mcpb",
+    )
+    complete_macos = (macos_binary, macos_mcpb, macos_worker, macos_checksum)
+    all_assets = complete_macos + native_assets
+
+    build_required, matrix, retained = run(root, (), profile)
+    assert build_required == "true"
+    assert matrix == TARGETS
+    assert retained == []
+
+    # A CLI pair cannot satisfy a target whose worker sidecar is required.
+    build_required, matrix, retained = run(root, (macos_binary, macos_mcpb), profile)
+    assert build_required == "true"
+    assert matrix == TARGETS
+    assert retained == sorted((macos_binary, macos_mcpb))
+
+    # Recovery keeps both already-published worker bytes and their checksum.
+    build_required, matrix, retained = run(root, complete_macos, profile)
+    assert build_required == "true"
+    assert matrix == {"include": TARGETS["include"][1:]}
+    assert retained == sorted(complete_macos)
+
+    for absent in (macos_binary, macos_mcpb, macos_worker, macos_checksum):
+        partial = tuple(asset for asset in all_assets if asset != absent)
+        build_required, matrix, retained = run(root, partial, profile)
+        assert build_required == "true"
+        assert matrix == {"include": [TARGETS["include"][0]]}
+        assert retained == sorted(partial)
+        for metadata in ("SHA256SUMS", "install.sh"):
+            refuses(root, partial + (metadata,), premature_metadata(metadata), profile)
+
+    build_required, matrix, retained = run(
+        root, all_assets + ("SHA256SUMS", "install.sh"), profile
+    )
+    assert build_required == "false"
+    assert matrix == {"include": []}
+    assert retained == sorted(all_assets)
+
+    foreign_worker = f"{worker_prefix}-v1.2.3-x86_64-linux.tar.gz"
+    refuses(
+        root,
+        (foreign_worker,),
+        "unexpected existing release assets: " + foreign_worker,
+        profile,
+    )
+    refuses(
+        root,
+        ("unexpected.tar.gz",),
+        "unexpected existing release assets: unexpected.tar.gz",
+        profile,
+    )
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         (root / "targets.json").write_text(json.dumps(TARGETS), encoding="utf-8")
+        check_profile(root, "stable")
+        check_profile(root, "beta")
 
-        build_required, matrix, retained = run(root, ())
-        assert build_required == "true"
-        assert matrix == TARGETS
-        assert retained == []
-
-        linux_binary = "tracedecay-v1.2.3-linux.tar.gz"
-        linux_mcpb = "tracedecay-v1.2.3-linux.mcpb"
-        build_required, matrix, retained = run(root, (linux_binary,))
-        assert build_required == "true"
-        assert matrix == TARGETS
-        assert retained == [linux_binary]
-
-        build_required, matrix, retained = run(root, (linux_binary, linux_mcpb))
-        assert build_required == "true"
-        assert matrix == {"include": [TARGETS["include"][1]]}
-        assert retained == sorted((linux_binary, linux_mcpb))
-
-        stable_assets = (
-            linux_binary,
-            linux_mcpb,
-            "tracedecay-v1.2.3-windows.zip",
-            "tracedecay-v1.2.3-windows.mcpb",
-            "SHA256SUMS",
-            "install.sh",
-        )
-        build_required, matrix, retained = run(root, stable_assets)
-        assert build_required == "false"
-        assert matrix == {"include": []}
-        assert retained == [
-            linux_mcpb,
-            linux_binary,
-            "tracedecay-v1.2.3-windows.mcpb",
-            "tracedecay-v1.2.3-windows.zip",
-        ]
-
-        refuses(root, (linux_binary, "SHA256SUMS"), premature_metadata("SHA256SUMS"))
-        refuses(root, (linux_binary, "install.sh"), premature_metadata("install.sh"))
-        refuses(
-            root, ("unexpected.tar.gz",), "unexpected existing release assets: unexpected.tar.gz"
-        )
-
-        beta_linux = "tracedecay-beta-v1.2.3-linux.tar.gz"
-        beta_linux_mcpb = "tracedecay-beta-v1.2.3-linux.mcpb"
-        build_required, matrix, retained = run(
-            root,
-            (beta_linux, beta_linux_mcpb),
-            profile="beta",
-        )
-        assert build_required == "true"
-        assert matrix == {"include": [TARGETS["include"][1]]}
-        assert retained == sorted((beta_linux, beta_linux_mcpb))
-
-        beta_assets = (
-            beta_linux,
-            beta_linux_mcpb,
-            "tracedecay-beta-v1.2.3-windows.zip",
-            "tracedecay-beta-v1.2.3-windows.mcpb",
-            "SHA256SUMS",
-            "install.sh",
-        )
-        build_required, matrix, retained = run(root, beta_assets, profile="beta")
-        assert build_required == "false"
-        assert matrix == {"include": []}
-        assert retained == [
-            beta_linux_mcpb,
-            beta_linux,
-            "tracedecay-beta-v1.2.3-windows.mcpb",
-            "tracedecay-beta-v1.2.3-windows.zip",
-        ]
-
-        refuses(root, (beta_linux, "install.sh"), premature_metadata("install.sh"), profile="beta")
+        # Source fixtures carry the same mandatory participation policy as releases.
+        missing_policy = json.loads(json.dumps(TARGETS))
+        del missing_policy["include"][0]["ncm"]
+        (root / "targets.json").write_text(json.dumps(missing_policy), encoding="utf-8")
+        completed = invoke(root, (), "stable")
+        assert completed.returncode == 1
+        assert completed.stderr == "release target is missing required string fields\n"
+        assert not (root / "github-output").exists()
+        assert not (root / "retained").exists()
 
     print("release recovery planner tests passed")
 

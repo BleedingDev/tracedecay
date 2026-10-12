@@ -1,0 +1,142 @@
+{
+  "description": "Transient run output. None of these may ever be withheld: a transient detection is at most a redaction inside the provider-bound copy, never a reason to hold an observation back and never a reason to touch canonical evidence.",
+  "cases": [
+    {
+      "id": "process_id",
+      "expected_class": "transient_process_id",
+      "expected_disposition": "redacted",
+      "payload": {
+        "note": "server started with pid 48213 and stayed up"
+      }
+    },
+    {
+      "id": "instance_temp_path",
+      "expected_class": "transient_temp_path",
+      "expected_disposition": "redacted",
+      "payload": {
+        "note": "wrote /tmp/tracedecay-a91f3c/spool.json then exited"
+      }
+    },
+    {
+      "id": "ephemeral_port",
+      "expected_class": "transient_ephemeral_port",
+      "expected_disposition": "accepted",
+      "payload": {
+        "note": "dashboard listening on 127.0.0.1:43817 for this run"
+      }
+    },
+    {
+      "id": "run_log_line",
+      "expected_class": "transient_run_log",
+      "expected_disposition": "accepted",
+      "payload": {
+        "note": "build finished in 12.4s"
+      }
+    },
+    {
+      "id": "nested_process_id",
+      "expected_class": "transient_process_id",
+      "expected_disposition": "redacted",
+      "payload": {
+        "run": {
+          "steps": [
+            "compile",
+            "supervisor pid 90210 reaped the child"
+          ]
+        }
+      }
+    },
+    {
+      "id": "process_id_assignment",
+      "expected_class": "transient_process_id",
+      "expected_disposition": "redacted",
+      "payload": {
+        "note": "the daemon lock is held by pid=48213 until shutdown"
+      }
+    },
+    {
+      "id": "process_id_upper_case_colon",
+      "expected_class": "transient_process_id",
+      "expected_disposition": "redacted",
+      "payload": {
+        "note": "PID: 90210 reaped the child worker"
+      }
+    },
+    {
+      "id": "macos_tmpdir_instance_path",
+      "expected_class": "transient_temp_path",
+      "expected_disposition": "redacted",
+      "payload": {
+        "note": "spooled to /private/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/T/tracedecay-run-77f2/out.log"
+      }
+    },
+    {
+      "id": "var_folders_instance_path",
+      "expected_class": "transient_temp_path",
+      "expected_disposition": "redacted",
+      "payload": {
+        "note": "scratch db at /var/folders/xy/abcd1234/T/spool-0001.sqlite3"
+      }
+    },
+    {
+      "id": "tmp_instance_directory",
+      "expected_class": "transient_temp_path",
+      "expected_disposition": "redacted",
+      "payload": {
+        "note": "worktree seeded under /tmp/tracedecay-agent-4f8e21/checkout"
+      }
+    },
+    {
+      "id": "raw_log_exit_code",
+      "expected_class": "transient_run_log",
+      "expected_disposition": "accepted",
+      "payload": {
+        "note": "the flaky suite ended with exit code 101 on the second run"
+      }
+    },
+    {
+      "id": "raw_log_started_in",
+      "expected_class": "transient_run_log",
+      "expected_disposition": "accepted",
+      "payload": {
+        "note": "daemon started in 42 ms"
+      }
+    },
+    {
+      "id": "raw_log_listening_on",
+      "expected_class": "transient_run_log",
+      "expected_disposition": "accepted",
+      "payload": {
+        "note": "listening on http://localhost:3000"
+      }
+    },
+    {
+      "id": "ephemeral_port_zero_address",
+      "expected_class": "transient_ephemeral_port",
+      "expected_disposition": "accepted",
+      "payload": {
+        "note": "bound 0.0.0.0:43817 for the duration of the test"
+      }
+    },
+    {
+      "id": "process_id_beside_annotated_port",
+      "expected_class": "transient_process_id",
+      "expected_disposition": "redacted",
+      "payload": {
+        "note": "worker pid 555 bound 127.0.0.1:8080 and served the dashboard"
+      }
+    },
+    {
+      "id": "raw_log_multi_line_output",
+      "expected_class": "transient_run_log",
+      "expected_disposition": "accepted",
+      "payload": {
+        "stdout": [
+          "compiling tracedecay v0.0.49",
+          "build finished in 12.4s",
+          "exit code 0"
+        ]
+      }
+    }
+  ]
+}

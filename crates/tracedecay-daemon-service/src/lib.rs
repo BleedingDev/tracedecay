@@ -81,9 +81,9 @@ pub use callable_code_authorization::{
 };
 #[cfg(any(test, feature = "test-helpers"))]
 pub use invocation::{
-    AuthorizedDaemonLspWorkspace, DaemonConfigurationRuntimeRegistrationPauseV1,
-    DaemonFeedbackPublicationTestGate, InvocationProjectRuntimeIdentityV1, LspLeaseTaskRegistry,
-    RuntimeLspSession, WorkAttemptProcessRegistryV1, canonicalize_lsp_roots,
+    AuthorizedDaemonLspWorkspace, DaemonFeedbackPublicationTestGate,
+    DaemonRetainedRuntimeRegistrationPauseV1, InvocationProjectRuntimeIdentityV1,
+    LspLeaseTaskRegistry, RuntimeLspSession, WorkAttemptProcessRegistryV1, canonicalize_lsp_roots,
     execute_work_application, lsp_delivery_attempt, mounted_configuration_layers, now_millis,
     retain_lsp_delivery_attempt,
 };

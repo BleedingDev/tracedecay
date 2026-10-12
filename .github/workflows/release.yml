@@ -131,6 +131,7 @@ jobs:
           config: dist
           dest: target/${{ matrix.target }}/release
           cache-key: release-${{ matrix.target }}
+          ncm-worker: ${{ matrix.ncm == 'supported' }}
 
       # verify-release requires every target to embed the same bundle.
       - name: Record the embedded dashboard digest
@@ -249,11 +250,71 @@ jobs:
           & "./verify-binary/tracedecay.exe" --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "Packaged binary failed --help" }
 
+      - name: Package NCM worker sidecar
+        if: matrix.ncm == 'supported'
+        shell: bash
+        run: |
+          set -euo pipefail
+          worker="target/${{ matrix.target }}/release/ncm-worker/tracedecay-ncm-worker"
+          manifest="target/${{ matrix.target }}/release/ncm-worker/worker-manifest.json"
+          model_manifest="target/${{ matrix.target }}/release/ncm-worker/model-acquisition-manifest.json"
+          test -x "$worker"
+          test -s "$manifest"
+          test -s "$model_manifest"
+          archive="tracedecay-ncm-worker-${{ needs.validate-release.outputs.tag }}-${{ matrix.name }}.tar.gz"
+          python3 scripts/package-release-archive.py \
+            --binary "$worker" \
+            --output "$archive" \
+            --format tar.gz \
+            --entry-name tracedecay-ncm-worker \
+            --companion "$manifest=worker-manifest.json" \
+            --companion "$model_manifest=model-acquisition-manifest.json" \
+            --epoch "${{ needs.validate-release.outputs.source_epoch }}"
+          shasum -a 256 "$archive" > "$archive.sha256"
+
+      - name: Verify installed NCM release
+        if: matrix.ncm == 'supported'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/tracedecay"
+          manifest="target/${{ matrix.target }}/release/ncm-worker/worker-manifest.json"
+          model_manifest="target/${{ matrix.target }}/release/ncm-worker/model-acquisition-manifest.json"
+          archive="tracedecay-ncm-worker-${{ needs.validate-release.outputs.tag }}-${{ matrix.name }}.tar.gz"
+          binary_archive="tracedecay-${{ needs.validate-release.outputs.tag }}-${{ matrix.name }}.tar.gz"
+          mkdir verify-ncm-worker
+          tar xzf "$archive" -C verify-ncm-worker
+          test -x verify-ncm-worker/tracedecay-ncm-worker
+          cmp "$manifest" verify-ncm-worker/worker-manifest.json
+          cmp "$model_manifest" verify-ncm-worker/model-acquisition-manifest.json
+          model_root="$RUNNER_TEMP/ncm-release-model-${{ matrix.name }}"
+          trap 'rm -rf "$model_root"' EXIT
+          python3 scripts/product/ncm/verify-installed.py \
+            --repo . \
+            --target "${{ matrix.target }}" \
+            --profile stable \
+            --worker-manifest "$manifest" \
+            --manifest "$model_manifest" \
+            --revision-receipt product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json \
+            --binary-archive "$binary_archive" \
+            --worker-archive "$archive" \
+            --binary "$binary" \
+            --expected-version "${{ needs.validate-release.outputs.version }}" \
+            --expected-source-sha "${{ needs.validate-release.outputs.source_sha }}" \
+            --expected-archive-sha256 "$(shasum -a 256 "$binary_archive" | awk '{print $1}')" \
+            --expected-binary-sha256 "$(shasum -a 256 "$binary" | awk '{print $1}')" \
+            --model-root "$model_root" \
+            --operation install \
+            --installed-e2e
+
       - name: Upload binary archive artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binary-${{ matrix.name }}
-          path: tracedecay-${{ needs.validate-release.outputs.tag }}-${{ matrix.name }}.${{ matrix.archive }}
+          path: |
+            tracedecay-${{ needs.validate-release.outputs.tag }}-${{ matrix.name }}.${{ matrix.archive }}
+            tracedecay-ncm-worker-${{ needs.validate-release.outputs.tag }}-${{ matrix.name }}.tar.gz
+            tracedecay-ncm-worker-${{ needs.validate-release.outputs.tag }}-${{ matrix.name }}.tar.gz.sha256
           if-no-files-found: error
 
   verify-release:
@@ -360,7 +421,7 @@ jobs:
           TAG="${{ needs.validate-release.outputs.tag }}"
           SOURCE_SHA="${{ needs.validate-release.outputs.source_sha }}"
           VERSION="${TAG#v}"
-          mkdir binaries mcpbs retained-assets
+          mkdir binaries mcpbs ncm-workers retained-assets
           gh api "repos/${{ github.repository }}/releases/tags/${TAG}" \
             --jq '.assets[].name' > remote-asset-names
           python3 scripts/plan-release-recovery.py \
@@ -383,6 +444,8 @@ jobs:
             [[ -z "$asset" ]] && continue
             if [[ "$asset" == *.mcpb ]]; then
               cp "retained-assets/$asset" "mcpbs/$asset"
+            elif [[ "$asset" == tracedecay-ncm-worker-* ]]; then
+              cp "retained-assets/$asset" "ncm-workers/$asset"
             else
               cp "retained-assets/$asset" "binaries/$asset"
             fi
@@ -390,7 +453,12 @@ jobs:
           if [[ "${{ needs.validate-release.outputs.build_required }}" == "true" ]]; then
             shopt -s nullglob
             for artifact in new-binaries/tracedecay-*; do
-              destination="binaries/$(basename "$artifact")"
+              name="$(basename "$artifact")"
+              if [[ "$name" == tracedecay-ncm-worker-* ]]; then
+                destination="ncm-workers/$name"
+              else
+                destination="binaries/$name"
+              fi
               [[ -e "$destination" ]] || cp "$artifact" "$destination"
             done
             for artifact in new-mcpbs/*.mcpb; do
@@ -404,6 +472,7 @@ jobs:
             --tag "$TAG" \
             --binaries binaries \
             --mcpbs mcpbs \
+            --ncm-workers ncm-workers \
             --allow-missing-targets
           for bundle in mcpbs/*.mcpb; do
             platform="${bundle#mcpbs/tracedecay-"${TAG}"-}"
@@ -443,7 +512,8 @@ jobs:
           shopt -s nullglob
           binaries=(binaries/tracedecay-*)
           bundles=(mcpbs/*.mcpb)
-          assets=("${binaries[@]}" "${bundles[@]}")
+          workers=(ncm-workers/tracedecay-ncm-worker-*)
+          assets=("${binaries[@]}" "${bundles[@]}" "${workers[@]}")
           (
             cd binaries
             sha256sum tracedecay-*
@@ -452,6 +522,12 @@ jobs:
             cd mcpbs
             sha256sum -- *.mcpb
           ) >> SHA256SUMS
+          if [[ "${#workers[@]}" -gt 0 ]]; then
+            (
+              cd ncm-workers
+              sha256sum -- tracedecay-ncm-worker-*
+            ) >> SHA256SUMS
+          fi
           assets+=(SHA256SUMS install.sh)
           TAG="${{ needs.validate-release.outputs.tag }}"
           SOURCE_SHA="${{ needs.validate-release.outputs.source_sha }}"
@@ -511,11 +587,14 @@ jobs:
           # Verify by name, not by glob: a partial publish may have no .zip
           # or no .tar.gz yet, and `gh release download --pattern` fails on
           # an empty match.
-          mkdir -p remote-assets/{binaries,mcpbs}
+          mkdir -p remote-assets/{binaries,mcpbs,ncm-workers}
           gh api "repos/${{ github.repository }}/releases/tags/${TAG}" \
             --jq '.assets[].name' > remote-asset-names
           while IFS= read -r name; do
             case "$name" in
+              tracedecay-ncm-worker-"${TAG}"-*.tar.gz | tracedecay-ncm-worker-"${TAG}"-*.tar.gz.sha256)
+                gh release download "$TAG" --repo "${{ github.repository }}" \
+                  --pattern "$name" --dir remote-assets/ncm-workers ;;
               tracedecay-"${TAG}"-*.mcpb)
                 gh release download "$TAG" --repo "${{ github.repository }}" \
                   --pattern "$name" --dir remote-assets/mcpbs ;;
@@ -529,6 +608,7 @@ jobs:
             --tag "$TAG" \
             --binaries remote-assets/binaries \
             --mcpbs remote-assets/mcpbs \
+            --ncm-workers remote-assets/ncm-workers \
             --allow-missing-targets
           scripts/verify-retained-release-assets.sh \
             --tag "$TAG" \
@@ -537,7 +617,7 @@ jobs:
             --source-digest "$SOURCE_SHA" \
             --signer-ref "refs/tags/${TAG}" \
             --signer-ref "refs/heads/master" \
-            --files remote-assets/binaries/* remote-assets/mcpbs/*
+            --files remote-assets/binaries/* remote-assets/mcpbs/* remote-assets/ncm-workers/*
 
       - name: Mark stable release as latest
         if: needs.validate-release.outputs.prerelease == 'false'

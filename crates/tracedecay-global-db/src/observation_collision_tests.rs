@@ -2661,6 +2661,95 @@ async fn run_vibe_trigger(
     .await
 }
 
+#[tokio::test]
+async fn retained_duplicate_rescan_restores_native_jsonl_frontier() {
+    use std::io::Write;
+
+    let tmp = TempDir::new().unwrap();
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let vibe_home = tmp.path().join("vibe-home");
+    let transcript = write_vibe_fixture(&vibe_home, &workspace, "retained native record");
+    let source = tracedecay_sessions::runtime::hosts::vibe::VibeSource::with_vibe_home(&vibe_home)
+        .for_user_scope(Vec::new());
+    let runtime = HostAdmissionTestRuntimeV1::profile_with_session_capture_resources(
+        tmp.path().join("profile"),
+    )
+    .await
+    .unwrap();
+    let store = runtime
+        .observation_store(HostAdmissionScope::Profile)
+        .unwrap();
+    let admission = ProductionJsonlAdmission::new(store.clone());
+    run_vibe_trigger(&source, &workspace, &admission)
+        .await
+        .unwrap();
+    let retained = store
+        .replay_observations(tracedecay_store::ObservationReplayRequest::new(0, 10).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(retained.len(), 1);
+    let original_receipt = retained[0].commit_receipt().clone();
+
+    let database = runtime
+        .registered_database(HostAdmissionScope::Profile)
+        .unwrap();
+    let transaction = database.begin_write_transaction().await.unwrap();
+    transaction
+        .execute("DELETE FROM source_cursors", ())
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({"role": "assistant", "content": "new native record", "timestamp": 2})
+    )
+    .unwrap();
+    drop(file);
+
+    let before = admission.capture_count();
+    let recovered = run_vibe_trigger(&source, &workspace, &admission)
+        .await
+        .expect("retained native records must durably rearm the rescan frontier");
+    assert_eq!(admission.capture_count() - before, 2);
+    assert_eq!(
+        recovered.bytes_consumed,
+        std::fs::metadata(&transcript).unwrap().len()
+    );
+    let observations = store
+        .replay_observations(tracedecay_store::ObservationReplayRequest::new(0, 10).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        observations.len(),
+        2,
+        "the retained record must not be duplicated"
+    );
+    assert_eq!(observations[0].commit_receipt(), &original_receipt);
+    let cursor = only_source_cursor(&runtime).await;
+    assert_eq!(
+        cursor.position(),
+        std::fs::metadata(&transcript).unwrap().len()
+    );
+    assert_eq!(
+        cursor.generation(),
+        original_receipt.committed_cursor().generation()
+    );
+
+    let before = admission.capture_count();
+    let settled = run_vibe_trigger(&source, &workspace, &admission)
+        .await
+        .unwrap();
+    assert_eq!(settled.bytes_consumed, 0);
+    assert_eq!(admission.capture_count(), before);
+    assert_eq!(only_source_cursor(&runtime).await, cursor);
+}
+
 /// Real provider-path gate: a one-record Vibe `messages.jsonl` is admitted by
 /// the shipping shared JSONL scanner with `FileBytes` resume checkpoints.
 /// A rewritten EOF record collides once; the global-db transaction records the

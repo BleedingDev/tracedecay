@@ -2,7 +2,7 @@ use std::path::Path;
 use std::process::Command;
 
 use tracedecay_domain::ProjectId;
-use tracedecay_session_memory::context::RegisteredScopeResolver;
+use tracedecay_session_memory::context::{ApplicationScopeError, RegisteredScopeResolver};
 
 fn git(root: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -78,4 +78,102 @@ fn registered_scope_route_rejects_foreign_repository() {
     assert!(
         RegisteredScopeResolver::resolve(registered.path(), foreign.path(), &project_id).is_err()
     );
+}
+
+#[test]
+fn registered_scope_route_preserves_nested_linked_worktree_and_descendants() {
+    let repository = repository();
+    let registered_root = repository.path().canonicalize().expect("registered root");
+    let project_id = ProjectId::new("project.registered-route").expect("project id");
+    assert!(
+        tracedecay_runtime_core::storage::write_repository_identity_marker(
+            &registered_root,
+            project_id.as_str(),
+        )
+        .expect("identity marker")
+    );
+    let ordinary = registered_root.join("src");
+    std::fs::create_dir(&ordinary).expect("ordinary subdirectory");
+    let linked = registered_root.join(".worktrees/feature");
+    std::fs::create_dir(linked.parent().expect("linked parent")).expect("linked parent directory");
+    git(
+        &registered_root,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "feature",
+            linked.to_str().expect("linked path"),
+        ],
+    );
+    let linked_child = linked.join("src");
+    std::fs::create_dir(&linked_child).expect("linked subdirectory");
+
+    let registered_scope =
+        RegisteredScopeResolver::resolve(&registered_root, &registered_root, &project_id)
+            .expect("registered scope");
+    let linked_scope = RegisteredScopeResolver::resolve(&registered_root, &linked, &project_id)
+        .expect("nested linked scope");
+    assert_eq!(linked_scope.project_id, project_id);
+    assert_eq!(linked_scope.repository_id, registered_scope.repository_id);
+    assert_ne!(linked_scope.worktree_id, registered_scope.worktree_id);
+    assert_eq!(
+        linked_scope
+            .reference
+            .as_ref()
+            .map(|reference| reference.as_str()),
+        Some("refs/heads/feature")
+    );
+    assert_eq!(
+        RegisteredScopeResolver::canonical_scope_root(&registered_root, &linked, &project_id)
+            .expect("nested linked root"),
+        linked
+    );
+    assert_eq!(
+        RegisteredScopeResolver::canonical_scope_root(&registered_root, &linked_child, &project_id)
+            .expect("nested linked child root"),
+        linked
+    );
+    assert_eq!(
+        RegisteredScopeResolver::resolve(&registered_root, &linked_child, &project_id)
+            .expect("nested linked child scope"),
+        linked_scope
+    );
+    assert_eq!(
+        RegisteredScopeResolver::canonical_scope_root(&registered_root, &ordinary, &project_id)
+            .expect("ordinary child root"),
+        registered_root
+    );
+    assert_eq!(
+        RegisteredScopeResolver::resolve(&registered_root, &ordinary, &project_id)
+            .expect("ordinary child scope"),
+        registered_scope
+    );
+}
+
+#[test]
+fn registered_scope_route_rejects_foreign_nested_repository() {
+    let repository = repository();
+    let registered_root = repository.path().canonicalize().expect("registered root");
+    let project_id = ProjectId::new("project.registered-route").expect("project id");
+    assert!(
+        tracedecay_runtime_core::storage::write_repository_identity_marker(
+            &registered_root,
+            project_id.as_str(),
+        )
+        .expect("identity marker")
+    );
+    let foreign = registered_root.join("foreign");
+    std::fs::create_dir(&foreign).expect("foreign repository directory");
+    git(&foreign, &["init", "--quiet"]);
+
+    assert!(matches!(
+        RegisteredScopeResolver::canonical_scope_root(&registered_root, &foreign, &project_id),
+        Err(ApplicationScopeError::UnauthorizedSiblingRoot { .. })
+    ));
+    assert!(matches!(
+        RegisteredScopeResolver::resolve(&registered_root, &foreign, &project_id),
+        Err(ApplicationScopeError::UnauthorizedSiblingRoot { .. })
+    ));
 }

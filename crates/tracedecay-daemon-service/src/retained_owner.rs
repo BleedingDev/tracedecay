@@ -26,6 +26,43 @@ use tracedecay_project::project::TraceDecay;
 mod retained_curator;
 pub use retained_curator::execute_retained_memory_curator;
 
+#[cfg(feature = "memory-provider-host")]
+pub(crate) mod cognitive_recall;
+#[cfg(feature = "memory-provider-host")]
+pub use cognitive_recall::{
+    AdvisoryMemoryContextV1, AdvisoryRecallUnavailableV1, CognitiveRecallMountError,
+};
+#[cfg(feature = "memory-provider-host")]
+pub(crate) mod native_authority;
+#[cfg(feature = "memory-provider-host")]
+pub(crate) mod native_provider;
+#[cfg(feature = "memory-provider-host")]
+mod ncm_lifecycle;
+#[cfg(feature = "memory-provider-host")]
+pub use ncm_lifecycle::NcmLifecycleOwner;
+#[cfg(feature = "memory-provider-host")]
+pub(crate) mod observation_journey;
+#[cfg(feature = "memory-provider-host")]
+pub(crate) mod provider_control;
+#[cfg(feature = "memory-provider-host")]
+pub(crate) mod provider_history;
+#[cfg(feature = "memory-provider-host")]
+mod provider_host;
+#[cfg(all(feature = "memory-provider-host", test))]
+pub(crate) use provider_host::native_observation_mount;
+#[cfg(feature = "memory-provider-host")]
+pub use provider_host::{
+    NativeApplicationPortInterpositionV1, NcmRegistrationFactoryV1, ProjectAdvisoryRecallCallV1,
+    ProjectCognitiveRecallMountV1, ProjectMemoryProviderFullMountInputsV1,
+    ProjectMemoryProviderFullMountV1, ProjectMemoryProviderHostInputsV1,
+    ProjectMemoryProviderHostMountV1, ProjectObservationJourneyMountV1,
+    mount_project_memory_provider_full, mount_project_memory_provider_host,
+    project_advisory_context_call, project_advisory_memory_context_for_call,
+};
+
+#[cfg(feature = "memory-provider-host")]
+pub(crate) use tracedecay_session_memory::memory_mapping;
+
 #[cfg(test)]
 mod memory_target_journeys;
 #[cfg(test)]
@@ -51,6 +88,10 @@ pub struct ProductionRetainedAuthoritiesV1 {
     pub project_workflow_index: Option<Arc<dyn tracedecay_sessions::WorkflowIndexReadPort>>,
     pub project_lcm:
         Option<Arc<dyn tracedecay_session_runtime::lcm_authority::MountedLcmAuthorityPort>>,
+    #[cfg(feature = "memory-provider-host")]
+    pub provider_control: Option<
+        Arc<dyn tracedecay_contracts::retained_surfaces::RetainedProviderControlExecutionPortV1>,
+    >,
     pub configuration_digest: ManifestDigest,
     pub invocation_service: Option<DaemonInvocationService>,
 }
@@ -128,6 +169,10 @@ pub fn retained_surface_ports(
         mounted_project_root: authorities.project_root.clone(),
         configuration_digest: authorities.configuration_digest.clone(),
     }));
+    #[cfg(feature = "memory-provider-host")]
+    if let Some(provider_control) = authorities.provider_control {
+        ports = ports.with_provider_control(provider_control);
+    }
     if let Some(invocation_service) = authorities.invocation_service.clone() {
         ports = ports.with_automation(Arc::new(AssembledRetainedAutomation {
             cg: Arc::clone(&authorities.cg),

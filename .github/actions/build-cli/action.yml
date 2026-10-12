@@ -1,14 +1,14 @@
 name: Build the tracedecay CLI
 description: >-
-  Build //crates/tracedecay-cli:tracedecay with Bazel and stage it at a fixed
-  path for the steps that package, upload, or spawn it.
+  Build //crates/tracedecay-cli:tracedecay with Bazel and stage it and any
+  requested NCM worker bundle for packaging, upload, or runtime verification.
 
 inputs:
   config:
     description: >-
       Bazel config. `dist` is the shipping-tuned compile (thin LTO, strip,
-      codegen-units=1). `release` is opt-level 3 without LTO, the CI / cargo
-      `--release` equivalent; tracedecay-cli's default features are
+      codegen-units=1). `release` is opt-level 3 without LTO;
+      tracedecay-cli's default features are
       `production`, the release source profile. `ci` is a dev-profile build.
     required: true
   dest:
@@ -17,6 +17,10 @@ inputs:
   cache-key:
     description: Disk-cache name (see the setup-bazel action).
     required: true
+  ncm-worker:
+    description: Stage the generated NCM worker bundle for a supported release target.
+    required: false
+    default: 'false'
 
 outputs:
   path:
@@ -37,16 +41,33 @@ runs:
       env:
         CONFIG: ${{ inputs.config }}
         DEST: ${{ inputs.dest }}
+        NCM_WORKER: ${{ inputs.ncm-worker }}
       run: |
         set -euo pipefail
         exe=""
         if [[ "$RUNNER_OS" == "Windows" ]]; then
           exe=".exe"
         fi
-        bazel build --config="$CONFIG" --config=ci //crates/tracedecay-cli:tracedecay
+        targets=(//crates/tracedecay-cli:tracedecay)
+        case "$NCM_WORKER" in
+          true) targets+=(//product/ncm:worker_bundle) ;;
+          false) ;;
+          *) echo "::error::ncm-worker must be true or false"; exit 1 ;;
+        esac
+        bazel build --config="$CONFIG" --config=ci "${targets[@]}"
+        bazel_bin="$(bazel info --config="$CONFIG" --config=ci bazel-bin)"
         mkdir -p "$DEST"
-        cp "$(bazel info --config="$CONFIG" --config=ci bazel-bin)/crates/tracedecay-cli/tracedecay${exe}" "$DEST/tracedecay${exe}"
+        cp "$bazel_bin/crates/tracedecay-cli/tracedecay${exe}" "$DEST/tracedecay${exe}"
         chmod u+w "$DEST/tracedecay${exe}"
+        if [[ "$NCM_WORKER" == true ]]; then
+          mkdir -p "$DEST/ncm-worker"
+          cp "$bazel_bin/product/ncm/worker-bundle/tracedecay-ncm-worker${exe}" \
+            "$DEST/ncm-worker/tracedecay-ncm-worker${exe}"
+          cp "$bazel_bin/product/ncm/worker-bundle/worker-manifest.json" \
+            "$DEST/ncm-worker/worker-manifest.json"
+          cp "$bazel_bin/product/ncm/worker-bundle/model-acquisition-manifest.json" \
+            "$DEST/ncm-worker/model-acquisition-manifest.json"
+        fi
         echo "path=${GITHUB_WORKSPACE}/${DEST}/tracedecay${exe}" >> "$GITHUB_OUTPUT"
 
     # Cargo's macOS link wrapper gave the product a stable ad-hoc identity;

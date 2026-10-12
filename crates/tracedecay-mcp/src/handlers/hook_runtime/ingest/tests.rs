@@ -21,6 +21,51 @@ fn status_for(account: &IngestCommitAccount) -> HostAdmissionStatus {
     .status
 }
 
+#[test]
+fn compaction_cursor_conflict_defers_without_masking_other_admission_failures() {
+    let result = codex_compaction_intake_result(Err(hook_admission_error(
+        HostAdmissionStatus::Backpressured,
+        "cursor_conflict",
+        true,
+        "a peer advanced the canonical cursor",
+    )))
+    .unwrap();
+    let HookCompactionResultV1::NotRun {
+        status,
+        reason,
+        summary_nodes_created,
+        summary_node_ids,
+        relation_projection_status,
+    } = result
+    else {
+        panic!("a cursor conflict must defer, not settle compaction");
+    };
+    assert_eq!(status, "pending");
+    assert_eq!(reason, "canonical_transcript_pending");
+    assert_eq!(summary_nodes_created, 0);
+    assert!(summary_node_ids.is_empty());
+    assert!(relation_projection_status.is_none());
+
+    for (reason, retryable) in [
+        ("cursor_conflict", false),
+        ("source_session_mismatch", false),
+        ("authority_write_failed", true),
+        ("authority_unavailable", true),
+        ("cancelled", true),
+        ("deadline_exceeded", true),
+    ] {
+        let refusal = hook_admission_error(
+            HostAdmissionStatus::Unavailable,
+            reason,
+            retryable,
+            "canonical admission refused",
+        );
+        let expected = structured_hook_error_data(&refusal).unwrap();
+        let error = codex_compaction_intake_result(Err(refusal)).unwrap_err();
+        assert_eq!(structured_hook_error_data(&error).unwrap(), expected);
+    }
+}
+
 /// A shared-queue residual is not this pass's commit. Nine projected rows
 /// left by a peer, or by another provider on the same scope queue, must stay
 /// `accepted_for_replay` when admission persisted nothing and cannot prove a

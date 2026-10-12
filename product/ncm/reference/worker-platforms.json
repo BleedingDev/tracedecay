@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "provider_id": "ncm",
+  "worker": "tracedecay-ncm-worker",
+  "policy": "pinned-artifact-only",
+  "worker_manifest": "product/ncm/reference/worker-manifest.json",
+  "model_acquisition_manifest": "product/ncm/release/model-acquisition-manifest.json",
+  "release_target_manifest": ".github/release-targets.json",
+  "fallback": "native-only",
+  "runtime_policy": {
+    "provider_package": "tracedecay-memory-provider-ncm",
+    "provider_feature": "rust-backend",
+    "runtime_package": "tracedecay-memory-ncm-runtime",
+    "runtime_feature": "real-encoder",
+    "worker_distribution": "separate-sidecar",
+    "worker_manifest": "product/ncm/reference/worker-manifest.json",
+    "model_manifest": "product/ncm/reference/embedding-manifest.json",
+    "model_acquisition_manifest": "product/ncm/release/model-acquisition-manifest.json"
+  },
+  "packaging": {
+    "worker_distribution": "separate-sidecar",
+    "standard_cli_archive_includes_worker": false,
+    "manifest_sidecar_required": true,
+    "model_acquisition_manifest_sidecar_required": true
+  },
+  "supported_targets": [
+    {
+      "target": "aarch64-apple-darwin",
+      "status": "supported"
+    },
+    {
+      "target": "x86_64-apple-darwin",
+      "status": "supported"
+    },
+    {
+      "target": "aarch64-unknown-linux-gnu",
+      "status": "supported"
+    },
+    {
+      "target": "x86_64-unknown-linux-gnu",
+      "status": "supported"
+    },
+    {
+      "target": "aarch64-pc-windows-msvc",
+      "status": "supported"
+    },
+    {
+      "target": "x86_64-pc-windows-msvc",
+      "status": "supported"
+    }
+  ],
+  "unsupported_targets": [
+    {
+      "target": "aarch64-unknown-linux-musl",
+      "reason": "no-prebuilt-onnxruntime"
+    },
+    {
+      "target": "x86_64-unknown-linux-musl",
+      "reason": "no-prebuilt-onnxruntime"
+    }
+  ],
+  "release_targets": [
+    {
+      "name": "aarch64-macos",
+      "target": "aarch64-apple-darwin",
+      "ncm": "supported"
+    },
+    {
+      "name": "x86_64-linux",
+      "target": "x86_64-unknown-linux-gnu",
+      "ncm": "native-only"
+    },
+    {
+      "name": "aarch64-linux",
+      "target": "aarch64-unknown-linux-gnu",
+      "ncm": "native-only"
+    },
+    {
+      "name": "x86_64-windows",
+      "target": "x86_64-pc-windows-msvc",
+      "ncm": "native-only"
+    }
+  ]
+}

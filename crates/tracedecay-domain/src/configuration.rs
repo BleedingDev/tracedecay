@@ -95,6 +95,9 @@ pub const INDEX_MAX_FILE_SIZE_SETTING_KEY: &str = "index.max_file_size.v1";
 pub const INDEX_EXTRACT_DOCSTRINGS_SETTING_KEY: &str = "index.extract_docstrings.v1";
 pub const INDEX_TRACK_CALL_SITES_SETTING_KEY: &str = "index.track_call_sites.v1";
 pub const INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY: &str = "index.native_graph_activation.v1";
+pub const MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY: &str = "memory.provider_native_enabled.v1";
+pub const MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY: &str = "memory.provider_ncm_observer.v1";
+pub const MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY: &str = "memory.provider_recall_routing.v1";
 pub const SYNC_AUTO_WATCH_SETTING_KEY: &str = "sync.auto_watch.v1";
 pub const SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY: &str = "sync.watch_linked_worktrees.v1";
 pub const SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY: &str = "sync.watch_debounce_ms.v1";
@@ -139,6 +142,9 @@ pub const CONFIGURATION_SETTING_KEYS_V1: &[&str] = &[
     INDEX_EXTRACT_DOCSTRINGS_SETTING_KEY,
     INDEX_TRACK_CALL_SITES_SETTING_KEY,
     INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
+    MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+    MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+    MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
     SYNC_AUTO_WATCH_SETTING_KEY,
     SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY,
     SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY,
@@ -911,6 +917,375 @@ impl ContextScoutConfigurationLimitsV1 {
             return Err(DomainError::NonCanonical {
                 field: "context scout configuration limits",
             });
+        }
+        Ok(())
+    }
+}
+
+/// Host-pinned fallback rule for cognitive recall: the one alternate
+/// provider a failing active provider may hand a recall to, and only when the
+/// provider's own terminal carries this identical policy identity, revision,
+/// and target.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryProviderRecallFallbackV1 {
+    pub policy_id: String,
+    pub policy_revision: u64,
+    pub target_provider: String,
+}
+
+/// Typed causes that an explicit cognitive-recall degradation rule may allow.
+///
+/// A cause is not a string flag: unknown JSON values are rejected by serde and
+/// duplicate entries are rejected by [`MemoryProviderRecallDegradationV1::validate`].
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryProviderRecallDegradationCauseV1 {
+    /// The provider does not support the requested recall capability.
+    Unsupported,
+    /// The provider or its host execution lane is unavailable.
+    Unavailable,
+    /// The caller withdrew the recall before it completed.
+    Cancelled,
+    /// The recall exceeded its caller-owned deadline.
+    TimedOut,
+    /// The provider returned useful content but not a complete result.
+    Partial,
+    /// Admission found that the provider's evidence is stale or unresolved.
+    Stale,
+    /// The provider exhausted an explicit recall budget.
+    BudgetExhausted,
+}
+
+/// Explicit host policy for which typed cognitive-recall degradations may be
+/// returned. Omission is fail-closed: no degraded result is allowed unless an
+/// operator pins this policy under the routing document.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryProviderRecallDegradationV1 {
+    /// Stable host policy identity.
+    pub policy_id: String,
+    /// Positive revision of the host policy.
+    pub policy_revision: u64,
+    /// Set-like allowlist of typed degradation causes.
+    pub allowed_causes: Vec<MemoryProviderRecallDegradationCauseV1>,
+}
+
+impl MemoryProviderRecallDegradationV1 {
+    /// Rejects blank policy identities, zero revisions, and duplicate causes.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        validate_canonical_label(
+            &self.policy_id,
+            "memory provider recall degradation policy id",
+        )?;
+        if self.policy_revision == 0 {
+            return Err(DomainError::NonCanonical {
+                field: "memory provider recall degradation policy revision",
+            });
+        }
+        if self.allowed_causes.is_empty() {
+            return Err(DomainError::NonCanonical {
+                field: "memory provider recall degradation allowed causes",
+            });
+        }
+        let mut causes = BTreeSet::new();
+        for cause in &self.allowed_causes {
+            if !causes.insert(*cause) {
+                return Err(DomainError::NonCanonical {
+                    field: "memory provider recall degradation duplicate cause",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Independently enabled real NCM participation. Changing this setting requires
+/// a daemon restart. The legacy observer type/key/JSON remain stable: enabled
+/// means observer unless recall routing explicitly selects NCM as active.
+/// The existing offline installer must install into `state_root/models` before
+/// readiness can be proved; mounting never downloads or copies models.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MemoryProviderNcmObserverV1 {
+    /// Construct no NCM adapter, process, or observation journey.
+    Disabled {},
+    /// Accept canonical commits; only explicit recall routing permits active output.
+    Enabled {
+        /// Absolute path of the production NCM worker executable.
+        worker_binary: std::path::PathBuf,
+        /// Absolute admitted root containing models and provider namespaces.
+        state_root: std::path::PathBuf,
+    },
+}
+
+impl Default for MemoryProviderNcmObserverV1 {
+    fn default() -> Self {
+        Self::Disabled {}
+    }
+}
+
+/// Descriptive alias for the existing serialized NCM participation setting.
+/// Its legacy name and `mode: enabled` wire value remain supported unchanged.
+pub type MemoryProviderNcmParticipationV1 = MemoryProviderNcmObserverV1;
+
+impl MemoryProviderNcmObserverV1 {
+    /// Whether composition may construct this adapter. Enabling does not itself
+    /// authorize recall, and does not depend on Native advisory participation.
+    pub const fn is_enabled(&self) -> bool {
+        matches!(self, Self::Enabled { .. })
+    }
+
+    /// Reject relative paths and traversal instead of resolving against a host CWD.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if let Self::Enabled {
+            worker_binary,
+            state_root,
+        } = self
+        {
+            for (path, field) in [
+                (worker_binary, "NCM observer worker binary"),
+                (state_root, "NCM observer state root"),
+            ] {
+                if !path.is_absolute()
+                    || path.components().any(|part| {
+                        matches!(
+                            part,
+                            std::path::Component::CurDir | std::path::Component::ParentDir
+                        )
+                    })
+                    || path.to_str().is_none_or(|text| text.contains('\0'))
+                {
+                    return Err(DomainError::NonCanonical { field });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Concrete adapters this product composition can explicitly construct.
+/// Recognition chooses a constructor; descriptor/profile validation still
+/// determines whether the constructed adapter is compatible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemoryProviderKindV1 {
+    /// Host-authored Native advisory adapter; canonical facts are independent.
+    Native,
+    /// Real worker-backed NCM advisory adapter.
+    Ncm,
+}
+
+impl MemoryProviderKindV1 {
+    /// Configured identity for this constructor.
+    pub const fn provider_id(self) -> &'static str {
+        match self {
+            Self::Native => "tracedecay.native",
+            Self::Ncm => "ncm",
+        }
+    }
+
+    /// Resolves an explicitly configured provider without substitution.
+    pub fn from_provider_id(provider_id: &str) -> Result<Self, MemoryProviderSelectionErrorV1> {
+        match provider_id {
+            "tracedecay.native" => Ok(Self::Native),
+            "ncm" => Ok(Self::Ncm),
+            other => Err(MemoryProviderSelectionErrorV1::UnknownProvider(
+                other.to_owned(),
+            )),
+        }
+    }
+}
+
+/// Independent participation for an installed adapter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemoryProviderParticipationV1 {
+    /// No adapter, worker, journal or observation journey may be constructed.
+    Disabled,
+    /// Receive observations without active recall authorization.
+    Observer,
+    /// The explicitly selected provider for active advisory recall.
+    Active,
+}
+
+/// Validated composition choices derived from the existing pinned settings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryProviderSelectionV1 {
+    /// Native advisory participation, independent of canonical host facts.
+    pub native: MemoryProviderParticipationV1,
+    /// NCM participation, independent of Native advisory enablement.
+    pub ncm: MemoryProviderParticipationV1,
+}
+
+impl MemoryProviderSelectionV1 {
+    /// Resolves legacy enablement plus explicit routing without creating workers
+    /// or migrating a persisted configuration revision. Unknown or disabled active
+    /// selection fails; enabled unselected adapters remain observers. The current
+    /// project composition has no fallback registration slot, so any fallback is
+    /// rejected after its target is checked.
+    pub fn resolve(
+        native_enabled: bool,
+        ncm: &MemoryProviderNcmObserverV1,
+        routing: &MemoryProviderRecallRoutingV1,
+    ) -> Result<Self, MemoryProviderSelectionErrorV1> {
+        ncm.validate()
+            .map_err(MemoryProviderSelectionErrorV1::InvalidConfiguration)?;
+        routing
+            .validate()
+            .map_err(MemoryProviderSelectionErrorV1::InvalidConfiguration)?;
+        let mut selection = Self {
+            native: if native_enabled {
+                MemoryProviderParticipationV1::Observer
+            } else {
+                MemoryProviderParticipationV1::Disabled
+            },
+            ncm: if ncm.is_enabled() {
+                MemoryProviderParticipationV1::Observer
+            } else {
+                MemoryProviderParticipationV1::Disabled
+            },
+        };
+        if let Some(provider) = &routing.active_provider {
+            let provider = MemoryProviderKindV1::from_provider_id(provider)?;
+            let participation = match provider {
+                MemoryProviderKindV1::Native => &mut selection.native,
+                MemoryProviderKindV1::Ncm => &mut selection.ncm,
+            };
+            if *participation == MemoryProviderParticipationV1::Disabled {
+                return Err(MemoryProviderSelectionErrorV1::SelectedProviderDisabled(
+                    provider,
+                ));
+            }
+            *participation = MemoryProviderParticipationV1::Active;
+        }
+        if let Some(fallback) = &routing.fallback {
+            let provider = MemoryProviderKindV1::from_provider_id(&fallback.target_provider)
+                .map_err(|error| match error {
+                    MemoryProviderSelectionErrorV1::UnknownProvider(provider) => {
+                        MemoryProviderSelectionErrorV1::UnsupportedFallbackProvider(provider)
+                    }
+                    other => other,
+                })?;
+            let participation = match provider {
+                MemoryProviderKindV1::Native => selection.native,
+                MemoryProviderKindV1::Ncm => selection.ncm,
+            };
+            if participation == MemoryProviderParticipationV1::Disabled {
+                return Err(MemoryProviderSelectionErrorV1::FallbackProviderDisabled(
+                    provider,
+                ));
+            }
+            // The current project composition registers exactly one provider:
+            // the active selection. A fallback can therefore never be
+            // dispatched, even when its target is independently enabled.
+            return Err(MemoryProviderSelectionErrorV1::UnsupportedFallbackProvider(
+                fallback.target_provider.clone(),
+            ));
+        }
+        Ok(selection)
+    }
+
+    /// Selected active constructor, absent when every enabled provider observes.
+    pub const fn active_provider(self) -> Option<MemoryProviderKindV1> {
+        match (self.native, self.ncm) {
+            (MemoryProviderParticipationV1::Active, _) => Some(MemoryProviderKindV1::Native),
+            (_, MemoryProviderParticipationV1::Active) => Some(MemoryProviderKindV1::Ncm),
+            _ => None,
+        }
+    }
+
+    /// Whether composition must create no provider infrastructure.
+    pub const fn is_disabled(self) -> bool {
+        matches!(self.native, MemoryProviderParticipationV1::Disabled)
+            && matches!(self.ncm, MemoryProviderParticipationV1::Disabled)
+    }
+}
+
+/// Selection failed before constructing any concrete adapter.
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum MemoryProviderSelectionErrorV1 {
+    /// A persisted value was not canonical or had invalid paths/policy.
+    #[error("memory provider configuration is invalid: {0}")]
+    InvalidConfiguration(#[source] DomainError),
+    /// This product has no configured constructor for the selected identity.
+    #[error("memory provider '{0}' is unknown to this composition")]
+    UnknownProvider(String),
+    /// Selecting an identity cannot implicitly enable its adapter.
+    #[error("selected memory provider {0:?} is disabled")]
+    SelectedProviderDisabled(MemoryProviderKindV1),
+    /// The configured fallback cannot be dispatched by this composition.
+    #[error(
+        "fallback memory provider '{0}' is unsupported by this composition; it can never dispatch a fallback"
+    )]
+    UnsupportedFallbackProvider(String),
+    /// A known fallback provider is not enabled, so no registration can be
+    /// composed for it. Selection never enables a provider as a side effect.
+    #[error("fallback memory provider {0:?} is disabled")]
+    FallbackProviderDisabled(MemoryProviderKindV1),
+}
+
+/// Explicit routing gate for cognitive recall.
+///
+/// `active_provider` names the one provider allowed to answer product recall;
+/// `None` (the default) leaves every enabled provider an observer, so turning
+/// the provider host on never promotes a provider to active output on its
+/// own. `fallback` is `None` (no fallback, whatever a provider suggests)
+/// unless an operator pins a complete rule whose target differs from the
+/// active provider. `degradation` is also fail-closed: omitted means that no
+/// typed degraded result may be returned. The value is stored as canonical
+/// JSON text under [`MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryProviderRecallRoutingV1 {
+    #[serde(default)]
+    pub active_provider: Option<String>,
+    #[serde(default)]
+    pub fallback: Option<MemoryProviderRecallFallbackV1>,
+    #[serde(default)]
+    pub degradation: Option<MemoryProviderRecallDegradationV1>,
+}
+
+impl MemoryProviderRecallRoutingV1 {
+    /// Rejects blank identities, zero policy revisions, duplicate degradation
+    /// causes, a fallback or degradation rule without an active provider, and
+    /// a fallback that targets the active provider itself.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if let Some(active) = &self.active_provider {
+            validate_canonical_label(active, "memory provider recall active provider")?;
+        }
+        if let Some(fallback) = &self.fallback {
+            let Some(active) = &self.active_provider else {
+                return Err(DomainError::NonCanonical {
+                    field: "memory provider recall fallback without active provider",
+                });
+            };
+            validate_canonical_label(
+                &fallback.policy_id,
+                "memory provider recall fallback policy id",
+            )?;
+            validate_canonical_label(
+                &fallback.target_provider,
+                "memory provider recall fallback target provider",
+            )?;
+            if fallback.policy_revision == 0 {
+                return Err(DomainError::NonCanonical {
+                    field: "memory provider recall fallback policy revision",
+                });
+            }
+            if &fallback.target_provider == active {
+                return Err(DomainError::NonCanonical {
+                    field: "memory provider recall fallback target equals active provider",
+                });
+            }
+        }
+        if let Some(degradation) = &self.degradation {
+            if self.active_provider.is_none() {
+                return Err(DomainError::NonCanonical {
+                    field: "memory provider recall degradation without active provider",
+                });
+            }
+            degradation.validate()?;
         }
         Ok(())
     }
@@ -2133,4 +2508,158 @@ fn derive_configuration_snapshot_id(
     let encoded =
         crate::canonical_text::sha256_hex_body(digest.as_str(), "configuration snapshot digest")?;
     ConfigurationSnapshotId::new(format!("{CONFIGURATION_SNAPSHOT_ID_DOMAIN}.{encoded}"))
+}
+
+#[cfg(test)]
+mod memory_provider_selection_tests {
+    use super::*;
+
+    fn enabled_ncm() -> MemoryProviderNcmObserverV1 {
+        let root = if cfg!(windows) {
+            std::path::PathBuf::from("C:\\ncm")
+        } else {
+            std::path::PathBuf::from("/ncm")
+        };
+        MemoryProviderNcmObserverV1::Enabled {
+            worker_binary: root.join("worker"),
+            state_root: root.join("state"),
+        }
+    }
+
+    fn routing(provider: Option<&str>) -> MemoryProviderRecallRoutingV1 {
+        MemoryProviderRecallRoutingV1 {
+            active_provider: provider.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn old_default_settings_remain_disabled_without_a_new_wire_value() {
+        let ncm: MemoryProviderNcmObserverV1 =
+            serde_json::from_str(r#"{"mode":"disabled"}"#).unwrap();
+        assert_eq!(
+            serde_json::to_string(&ncm).unwrap(),
+            r#"{"mode":"disabled"}"#
+        );
+        let route: MemoryProviderRecallRoutingV1 = serde_json::from_str("{}").unwrap();
+        let selected = MemoryProviderSelectionV1::resolve(false, &ncm, &route).unwrap();
+        assert!(selected.is_disabled());
+        assert_eq!(selected.active_provider(), None);
+    }
+
+    #[test]
+    fn ncm_active_is_independent_of_native_advisory_enablement() {
+        let ncm = enabled_ncm();
+        for native_enabled in [false, true] {
+            let selected =
+                MemoryProviderSelectionV1::resolve(native_enabled, &ncm, &routing(Some("ncm")))
+                    .unwrap();
+            assert_eq!(selected.active_provider(), Some(MemoryProviderKindV1::Ncm));
+            assert_eq!(selected.ncm, MemoryProviderParticipationV1::Active);
+            assert_eq!(
+                selected.native,
+                if native_enabled {
+                    MemoryProviderParticipationV1::Observer
+                } else {
+                    MemoryProviderParticipationV1::Disabled
+                }
+            );
+        }
+        let decoded: MemoryProviderNcmObserverV1 =
+            serde_json::from_str(&serde_json::to_string(&ncm).unwrap()).unwrap();
+        assert_eq!(decoded, ncm);
+    }
+
+    #[test]
+    fn unselected_participation_remains_observer_for_either_provider() {
+        let ncm = enabled_ncm();
+        let selected = MemoryProviderSelectionV1::resolve(false, &ncm, &routing(None)).unwrap();
+        assert_eq!(selected.native, MemoryProviderParticipationV1::Disabled);
+        assert_eq!(selected.ncm, MemoryProviderParticipationV1::Observer);
+        assert_eq!(selected.active_provider(), None);
+        let selected =
+            MemoryProviderSelectionV1::resolve(true, &ncm, &routing(Some("tracedecay.native")))
+                .unwrap();
+        assert_eq!(selected.native, MemoryProviderParticipationV1::Active);
+        assert_eq!(selected.ncm, MemoryProviderParticipationV1::Observer);
+    }
+
+    #[test]
+    fn unknown_or_disabled_active_selection_never_falls_back() {
+        assert!(
+            matches!(MemoryProviderSelectionV1::resolve(true, &enabled_ncm(), &routing(Some("missing"))), Err(MemoryProviderSelectionErrorV1::UnknownProvider(provider)) if provider == "missing")
+        );
+        for (native, ncm, provider, kind) in [
+            (
+                false,
+                enabled_ncm(),
+                "tracedecay.native",
+                MemoryProviderKindV1::Native,
+            ),
+            (
+                true,
+                MemoryProviderNcmObserverV1::default(),
+                "ncm",
+                MemoryProviderKindV1::Ncm,
+            ),
+        ] {
+            assert!(
+                matches!(MemoryProviderSelectionV1::resolve(native, &ncm, &routing(Some(provider))), Err(MemoryProviderSelectionErrorV1::SelectedProviderDisabled(actual)) if actual == kind)
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_selection_rejects_disabled_unregistered_and_undispatchable_targets_without_mutating_inputs()
+     {
+        let disabled_ncm = MemoryProviderNcmObserverV1::default();
+        let routing = MemoryProviderRecallRoutingV1 {
+            active_provider: Some("tracedecay.native".to_owned()),
+            fallback: Some(MemoryProviderRecallFallbackV1 {
+                policy_id: "policy.recall.fallback".to_owned(),
+                policy_revision: 1,
+                target_provider: "ncm".to_owned(),
+            }),
+            degradation: None,
+        };
+        let before_ncm = disabled_ncm.clone();
+        let before_routing = routing.clone();
+
+        assert!(matches!(
+            MemoryProviderSelectionV1::resolve(true, &disabled_ncm, &routing),
+            Err(MemoryProviderSelectionErrorV1::FallbackProviderDisabled(
+                MemoryProviderKindV1::Ncm
+            ))
+        ));
+        assert_eq!(disabled_ncm, before_ncm);
+        assert_eq!(routing, before_routing);
+
+        let ncm = enabled_ncm();
+        let mut enabled_routing = routing;
+        enabled_routing.fallback = Some(MemoryProviderRecallFallbackV1 {
+            policy_id: "policy.recall.fallback".to_owned(),
+            policy_revision: 1,
+            target_provider: "provider.unregistered".to_owned(),
+        });
+        assert!(matches!(
+            MemoryProviderSelectionV1::resolve(true, &ncm, &enabled_routing),
+            Err(MemoryProviderSelectionErrorV1::UnsupportedFallbackProvider(provider))
+                if provider == "provider.unregistered"
+        ));
+
+        let enabled_fallback = MemoryProviderRecallRoutingV1 {
+            active_provider: Some("tracedecay.native".to_owned()),
+            fallback: Some(MemoryProviderRecallFallbackV1 {
+                policy_id: "policy.recall.fallback".to_owned(),
+                policy_revision: 1,
+                target_provider: "ncm".to_owned(),
+            }),
+            degradation: None,
+        };
+        assert!(matches!(
+            MemoryProviderSelectionV1::resolve(true, &ncm, &enabled_fallback),
+            Err(MemoryProviderSelectionErrorV1::UnsupportedFallbackProvider(provider))
+                if provider == "ncm"
+        ));
+    }
 }

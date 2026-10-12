@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Behavior of the stable macOS ad-hoc identity: the install helper, the manual
-# signer, the link wrapper, and the post-rustc wrapper. Runs on Linux with a
-# mocked codesign. Release strip is a stub that re-signs with the filename.
+# signer, the link wrapper, and the post-rustc wrapper. Runs on Linux and macOS
+# with mocked codesign. Release strip is a stub that re-signs with the filename.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -111,9 +111,21 @@ log=$(sign_with_report $'Identifier=com.example.legacy\nTeamIdentifier=TEAMID123
 assert_not_signed "$log"
 
 # Off Darwin, do not invoke codesign even when it would fail.
+non_darwin_bin=$tmpdir/non-darwin-bin
+mkdir -p "$non_darwin_bin"
+cat >"$non_darwin_bin/uname" <<'SH'
+#!/usr/bin/env bash
+printf 'Linux\n'
+SH
+cat >"$non_darwin_bin/codesign" <<'SH'
+#!/usr/bin/env bash
+printf 'codesign must not run off Darwin\n' >&2
+exit 1
+SH
+chmod +x "$non_darwin_bin/uname" "$non_darwin_bin/codesign"
 write_macho "$tmpdir/linux.macho"
 if TRACEDECAY_ASSUME_DARWIN= \
-  PATH="$tmpdir/missing-bin:$PATH" \
+  PATH="$non_darwin_bin:$PATH" \
   "$SIGNER" "$tmpdir/linux.macho"
 then
   :
@@ -436,7 +448,8 @@ assert_not_signed "$tmpdir/codesign.log"
 # Off Darwin the wrapper execs rustc and does not sign, even when strip did.
 : >"$tmpdir/codesign.log"
 off=$tmpdir/off/deps/tracedecay-$HASH
-PATH="$tmpdir/mock-bin:$PATH" \
+PATH="$tmpdir/mock-bin:$non_darwin_bin:$PATH" \
+  OSTYPE=linux-gnu \
   TRACEDECAY_ASSUME_DARWIN= \
   CODESIGN_LOG="$tmpdir/codesign.log" \
   FAKE_RUSTC_STRIP="$fake_strip" \

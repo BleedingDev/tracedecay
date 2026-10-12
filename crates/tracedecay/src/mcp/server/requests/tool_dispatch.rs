@@ -4,6 +4,15 @@ use super::*;
 use crate::mcp::tools::handlers::ServedCodeGraphSlot;
 use crate::mcp::tools::{ToolCallRegistryOptions, handle_tool_call_with_registry_options};
 
+#[cfg(feature = "memory-provider-host")]
+use tracedecay_contracts::{
+    CancellationSignal, Deadline, RequestContext, RequestId, ResolvedScope,
+    RetainedSurfaceOperation, retained_surface_application_operation, try_now_micros,
+};
+#[cfg(feature = "memory-provider-host")]
+use tracedecay_daemon_service::RegisteredRetainedRequestContextError;
+#[cfg(feature = "memory-provider-host")]
+use tracedecay_daemon_service::retained_owner::AdvisoryRecallUnavailableV1;
 use tracedecay_mcp::server::{ReadFlightClaim, tool_allows_identical_read_coalescing};
 
 impl McpServer {
@@ -222,6 +231,7 @@ impl McpServer {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(feature = "memory-provider-host"), allow(clippy::let_and_return))]
     #[expect(
         clippy::too_many_lines,
         reason = "Tool dispatch is one registry match onto the owning handler future."
@@ -257,6 +267,25 @@ impl McpServer {
             .session_sync_service
             .as_ref()
             .and_then(std::sync::Weak::upgrade);
+        // Advisory admission reads the arguments before they move; the recall
+        // itself runs only after the authoritative handler answered.
+        #[cfg(feature = "memory-provider-host")]
+        let advisory_call =
+            tracedecay_daemon_service::retained_owner::project_advisory_context_call(
+                tool_name,
+                &handler_arguments,
+                application_request_id.as_ref(),
+                application_deadline.as_ref(),
+                application_cancellation.as_ref(),
+            )
+            .map(|call| {
+                (
+                    call,
+                    application_request_id.clone(),
+                    application_deadline.clone(),
+                    application_cancellation.clone(),
+                )
+            });
         let dispatch: std::pin::Pin<
             Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + '_>,
         > = handle_tool_call_with_registry_options(
@@ -341,7 +370,7 @@ impl McpServer {
             ),
             None => dispatch,
         };
-        if let Some(read_flight) = read_flight {
+        let dispatched = if let Some(read_flight) = read_flight {
             match read_flight {
                 ReadFlightClaim::Leader(leader) => match dispatch.await {
                     Ok(result) => Ok(leader.complete(result)),
@@ -358,7 +387,117 @@ impl McpServer {
             }
         } else {
             dispatch.await
+        };
+        // The handler keeps its whole deadline and a failed lane leaves the
+        // canonical result exactly as produced; running after the read flight
+        // keeps a coalesced read free of this caller's provider candidates.
+        #[cfg(feature = "memory-provider-host")]
+        let dispatched = match (dispatched, advisory_call) {
+            (Ok(mut result), Some((call, request_id, deadline, cancellation))) => {
+                let session_retrieval_context = self
+                    .advisory_session_retrieval_context(
+                        cg,
+                        resolved_project_route.map(|route| &route.scope),
+                        request_id,
+                        deadline.clone(),
+                        cancellation.clone(),
+                    )
+                    .await;
+                let publication_deadline = match &session_retrieval_context {
+                    Ok(context) => Some(context.deadline().clone()),
+                    Err(_) => deadline,
+                };
+                let call = call.with_session_retrieval_context(session_retrieval_context);
+                let advisory_routing_mount = self.advisory_routing_mount();
+                let advisory =
+                    tracedecay_daemon_service::retained_owner::project_advisory_memory_context_for_call(
+                        self.cognitive_recall_port_for_session(call.canonical_session_id()),
+                        advisory_routing_mount.as_deref(),
+                        call,
+                        result.context_memory_contribution(),
+                    )
+                    .await;
+                if let Some(advisory) = advisory
+                    && let Some(slot) = result.value.pointer_mut("/content/0/text")
+                    && let Some(text) = slot.as_str()
+                {
+                    let packed_text = advisory.appended_text(text);
+                    let publication = match (
+                        advisory_routing_mount.as_deref(),
+                        publication_deadline.as_ref(),
+                        cancellation.as_ref(),
+                    ) {
+                        (Some(mount), Some(deadline), Some(cancellation)) => {
+                            mount.validate_publication(deadline, cancellation)
+                        }
+                        _ => Err(AdvisoryRecallUnavailableV1::LaneInputsMissing),
+                    };
+                    match publication {
+                        Ok(()) => *slot = Value::String(packed_text),
+                        Err(outcome) => tracing::warn!(
+                            event = "memory_recall_publication_withheld",
+                            outcome = outcome.code(),
+                            "advisory publication withheld; canonical tool result preserved"
+                        ),
+                    }
+                }
+                Ok(result)
+            }
+            (dispatched, _) => dispatched,
+        };
+        dispatched
+    }
+
+    #[cfg(feature = "memory-provider-host")]
+    async fn advisory_session_retrieval_context(
+        &self,
+        cg: &TraceDecay,
+        routed_scope: Option<&ResolvedScope>,
+        request_id: Option<RequestId>,
+        deadline: Option<Deadline>,
+        cancellation: Option<CancellationSignal>,
+    ) -> std::result::Result<RequestContext, String> {
+        let mounted_scope = self
+            .admitted_project_scope()
+            .ok_or_else(|| "advisory project scope is unavailable".to_owned())?;
+        let selected_scope = routed_scope.unwrap_or(&mounted_scope);
+        if !mounted_scope.identifies_same_checkout(selected_scope) {
+            return Err("advisory route does not identify the dispatched checkout".to_owned());
         }
+        let service = self
+            .daemon_invocation_service()
+            .ok_or_else(|| "advisory retained request authority is unavailable".to_owned())?;
+        let request_id =
+            request_id.ok_or_else(|| "advisory request identity is unavailable".to_owned())?;
+        let deadline =
+            deadline.ok_or_else(|| "advisory request deadline is unavailable".to_owned())?;
+        let cancellation = cancellation
+            .ok_or_else(|| "advisory request cancellation is unavailable".to_owned())?;
+        let operation =
+            retained_surface_application_operation(RetainedSurfaceOperation::MessageSearch)
+                .map_err(|error| format!("advisory session operation is unavailable: {error}"))?;
+        let observed_at = try_now_micros()
+            .map_err(|error| format!("advisory admission clock failed: {error}"))?;
+        let context = service
+            .registered_retained_request_context(
+                cg.project_root(),
+                request_id,
+                deadline,
+                cancellation.context(),
+                observed_at,
+                &operation,
+            )
+            .await
+            .map_err(|error| match error {
+                RegisteredRetainedRequestContextError::Application(problem) => {
+                    TraceDecayError::from(problem).to_string()
+                }
+                RegisteredRetainedRequestContextError::Runtime(error) => error.to_string(),
+            })?;
+        if !context.scope().identifies_same_checkout(selected_scope) {
+            return Err("advisory retained authority belongs to another checkout".to_owned());
+        }
+        Ok(context)
     }
 }
 

@@ -1,0 +1,8 @@
+{
+  "scripts/product/memory-comparison/runner.py": "9e9133442229ea0bbd6e5342dd98ccc5f742d6696818b1cbf630b434f08bddf8",
+  "scripts/product/memory-comparison/adjudicate.py": "b5d8a1ee508a7c43d2df6b0fb430346bcdc22a579b2a6c3222b81ffb89589562",
+  "crates/tracedecay-memory-evaluation/src/host_retrieval.rs": "d281794e10a1316c04b0eff330c111458106ae8624b94c352cb00c79c76c90c7",
+  "crates/tracedecay-memory-evaluation/tests/host_retrieval.rs": "926251216392b1cf49080f07d5aded02231e5ad3987f588c021f74a28a761cd7",
+  "product/evaluation/host-comparison/comparison-capture.schema.json": "1b14f3eae3377cef9b76fe9572440ac9dd1af137b5976f482ce525e63e08a572",
+  "product/evaluation/host-comparison/comparison-report.schema.json": "57a93e28375cf38ee5c04283f97c9c9cfda5f68c6a080b42dab837c1d55d59bd"
+}

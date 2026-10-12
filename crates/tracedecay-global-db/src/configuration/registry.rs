@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tracedecay_domain::configuration::{
     ACCESS_RULES_SETTING_KEY, ANALYZER_SETTINGS_SETTING_KEY, AUTOMATION_SETTINGS_SETTING_KEY,
@@ -11,7 +12,10 @@ use tracedecay_domain::configuration::{
     INDEX_EXTRACT_DOCSTRINGS_SETTING_KEY, INDEX_INCLUDE_SETTING_KEY,
     INDEX_MAX_FILE_SIZE_SETTING_KEY, INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
     INDEX_TRACK_CALL_SITES_SETTING_KEY, LCM_SUMMARIZER_EXECUTABLES_SETTING_KEY,
-    LcmSummarizerExecutablesV1, PROFILE_SETTING_KEYS_V1,
+    LcmSummarizerExecutablesV1, MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+    MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+    MemoryProviderKindV1, MemoryProviderNcmObserverV1, MemoryProviderRecallRoutingV1,
+    MemoryProviderSelectionErrorV1, MemoryProviderSelectionV1, PROFILE_SETTING_KEYS_V1,
     PROJECT_WORK_EXPERTISE_CONSENT_SETTING_KEY, RestartRequirementV1, SOURCE_BINDINGS_SETTING_KEY,
     SYNC_AUTO_INIT_SETTING_KEY, SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY,
     SYNC_AUTO_TRACK_PR_POLL_SECS_SETTING_KEY, SYNC_AUTO_WATCH_SETTING_KEY,
@@ -29,7 +33,7 @@ use tracedecay_domain::configuration::{
     safe_work_topology_policy_v1,
 };
 use tracedecay_domain::feedback::PROXIMITY_RISK_THRESHOLD_SETTING_KEY_V1;
-use tracedecay_domain::{DomainError, validate_index_path_patterns};
+use tracedecay_domain::{DomainError, canonical_json_bytes, validate_index_path_patterns};
 
 /// Canonical default for configured-tier proximity warnings.
 pub const DEFAULT_PROXIMITY_RISK_THRESHOLD_BASIS_POINTS_V1: u64 = 7_000;
@@ -71,6 +75,16 @@ pub enum ConfigurationRegistryError {
         key: SettingKey,
         layer: tracedecay_domain::configuration::ConfigurationLayerIdV1,
     },
+    #[error("setting {key} contains invalid {document} JSON: {message}")]
+    InvalidStructuredValue {
+        key: SettingKey,
+        document: &'static str,
+        message: String,
+    },
+    #[error("provider configuration is not composable: {0}")]
+    ProviderSelection(#[source] MemoryProviderSelectionErrorV1),
+    #[error("configuration snapshot is missing registered setting value: {0}")]
+    MissingSettingValue(SettingKey),
 }
 
 /// Immutable mapping of every supported setting to its typed definition.
@@ -274,6 +288,17 @@ impl ConfigurationRegistry {
         self.definitions.values()
     }
 
+    /// Whether this registry owns the project-level provider settings.
+    ///
+    /// The daemon also uses this type for the smaller profile-session
+    /// registry, whose snapshots contain only profile settings. Provider
+    /// composition is only meaningful for the core registry.
+    pub fn has_provider_configuration(&self) -> bool {
+        self.definitions
+            .keys()
+            .any(|key| key.as_str() == MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY)
+    }
+
     pub fn validate_value(
         &self,
         key: &SettingKey,
@@ -326,7 +351,80 @@ impl ConfigurationRegistry {
                 });
             }
         }
+        match key.as_str() {
+            MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY => {
+                let document: MemoryProviderNcmObserverV1 =
+                    decode_structured_value(key, value, "NCM observer configuration")?;
+                document.validate().map_err(|error| {
+                    invalid_structured_value(key, "NCM observer configuration", error)
+                })?;
+            }
+            MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY => {
+                let document: MemoryProviderRecallRoutingV1 =
+                    decode_structured_value(key, value, "recall routing configuration")?;
+                document.validate().map_err(|error| {
+                    invalid_structured_value(key, "recall routing configuration", error)
+                })?;
+            }
+            _ => {}
+        }
         Ok(())
+    }
+
+    /// Resolve the provider participation represented by one complete project
+    /// snapshot. The three provider settings are stored independently for
+    /// compatibility, but they form one admission unit: an active or fallback
+    /// provider may only be selected when this composition can construct it.
+    pub fn resolve_provider_selection(
+        &self,
+        values: &BTreeMap<SettingKey, ConfigurationValueV1>,
+    ) -> Result<MemoryProviderSelectionV1, ConfigurationRegistryError> {
+        let native_key = setting_key(MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY)?;
+        let ncm_key = setting_key(MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY)?;
+        let routing_key = setting_key(MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY)?;
+
+        let native_value = values
+            .get(&native_key)
+            .ok_or_else(|| ConfigurationRegistryError::MissingSettingValue(native_key.clone()))?;
+        self.validate_value(&native_key, native_value)?;
+        let native_enabled = match native_value {
+            ConfigurationValueV1::Boolean(value) => *value,
+            value => {
+                return Err(ConfigurationRegistryError::ValueKindMismatch {
+                    key: native_key,
+                    expected: ConfigurationValueKindV1::Boolean,
+                    actual: value.kind(),
+                });
+            }
+        };
+
+        let ncm_value = values
+            .get(&ncm_key)
+            .ok_or_else(|| ConfigurationRegistryError::MissingSettingValue(ncm_key.clone()))?;
+        self.validate_value(&ncm_key, ncm_value)?;
+        let ncm: MemoryProviderNcmObserverV1 =
+            decode_structured_value(&ncm_key, ncm_value, "NCM observer configuration")?;
+
+        let routing_value = values
+            .get(&routing_key)
+            .ok_or_else(|| ConfigurationRegistryError::MissingSettingValue(routing_key.clone()))?;
+        self.validate_value(&routing_key, routing_value)?;
+        let routing: MemoryProviderRecallRoutingV1 =
+            decode_structured_value(&routing_key, routing_value, "recall routing configuration")?;
+
+        MemoryProviderSelectionV1::resolve(native_enabled, &ncm, &routing)
+            .map_err(ConfigurationRegistryError::ProviderSelection)
+    }
+
+    /// Validate the provider settings without returning a composition plan.
+    pub fn validate_provider_configuration(
+        &self,
+        values: &BTreeMap<SettingKey, ConfigurationValueV1>,
+    ) -> Result<(), ConfigurationRegistryError> {
+        if !self.has_provider_configuration() {
+            return Ok(());
+        }
+        self.resolve_provider_selection(values).map(|_| ())
     }
 
     /// [`Self::validate_value`] plus the checks that gate only a new write.
@@ -386,6 +484,55 @@ impl ConfigurationRegistry {
                 layer: layer.clone(),
             })
         }
+    }
+}
+
+fn decode_structured_value<T: DeserializeOwned + Serialize>(
+    key: &SettingKey,
+    value: &ConfigurationValueV1,
+    document: &'static str,
+) -> Result<T, ConfigurationRegistryError> {
+    let ConfigurationValueV1::Text(value) = value else {
+        return Err(ConfigurationRegistryError::ValueKindMismatch {
+            key: key.clone(),
+            expected: ConfigurationValueKindV1::Text,
+            actual: value.kind(),
+        });
+    };
+    let decoded = serde_json::from_str::<T>(value)
+        .map_err(|error| invalid_structured_value(key, document, error))?;
+    // The text itself participates in the snapshot behavior digest. Requiring
+    // the exact repository serializer output closes equivalent spellings that
+    // would otherwise produce different persisted digests.
+    let canonical = canonical_json_bytes(&decoded)
+        .map_err(|error| invalid_structured_value(key, document, error))?;
+    if value.as_bytes() != canonical.as_slice() {
+        return Err(invalid_structured_value(
+            key,
+            document,
+            "JSON text is not the repository canonical serialization",
+        ));
+    }
+    Ok(decoded)
+}
+
+fn canonical_json_text<T: Serialize>(
+    value: &T,
+    error: impl Fn() -> ConfigurationRegistryError,
+) -> Result<String, ConfigurationRegistryError> {
+    let bytes = canonical_json_bytes(value).map_err(|_| error())?;
+    String::from_utf8(bytes).map_err(|_| error())
+}
+
+fn invalid_structured_value(
+    key: &SettingKey,
+    document: &'static str,
+    error: impl std::fmt::Display,
+) -> ConfigurationRegistryError {
+    ConfigurationRegistryError::InvalidStructuredValue {
+        key: key.clone(),
+        document,
+        message: error.to_string(),
     }
 }
 
@@ -473,6 +620,7 @@ struct ProjectDefaults {
     extract_docstrings: bool,
     track_call_sites: bool,
     native_graph_activation: bool,
+    memory_provider_native_enabled: bool,
     telemetry_timings: bool,
     sync: SyncDefaults,
 }
@@ -538,6 +686,7 @@ impl Default for ProjectDefaults {
             extract_docstrings: true,
             track_call_sites: true,
             native_graph_activation: true,
+            memory_provider_native_enabled: true,
             telemetry_timings: true,
             sync: SyncDefaults::default(),
         }
@@ -550,6 +699,24 @@ fn register_project_settings(
 ) -> Result<(), ConfigurationRegistryError> {
     let defaults = ProjectDefaults::default();
     let sync = defaults.sync;
+    let recall_routing_default = MemoryProviderRecallRoutingV1 {
+        active_provider: Some(MemoryProviderKindV1::Native.provider_id().to_owned()),
+        ..Default::default()
+    };
+    recall_routing_default
+        .validate()
+        .map_err(ConfigurationRegistryError::InvalidDefinition)?;
+    let recall_routing_default = canonical_json_text(&recall_routing_default, || {
+        ConfigurationRegistryError::InvalidDefinition(DomainError::NonCanonical {
+            field: "memory provider recall routing default encoding",
+        })
+    })?;
+    let ncm_observer_default =
+        canonical_json_text(&MemoryProviderNcmObserverV1::default(), || {
+            ConfigurationRegistryError::InvalidDefinition(DomainError::NonCanonical {
+                field: "NCM observer default encoding",
+            })
+        })?;
     let settings = vec![
         (
             INDEX_EXCLUDE_SETTING_KEY,
@@ -584,6 +751,24 @@ fn register_project_settings(
         (
             INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
             ConfigurationValueV1::Boolean(defaults.native_graph_activation),
+            SettingSensitivityV1::Public,
+            RestartRequirementV1::DaemonRestart,
+        ),
+        (
+            MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+            ConfigurationValueV1::Boolean(defaults.memory_provider_native_enabled),
+            SettingSensitivityV1::Public,
+            RestartRequirementV1::DaemonRestart,
+        ),
+        (
+            MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+            ConfigurationValueV1::Text(ncm_observer_default),
+            SettingSensitivityV1::Public,
+            RestartRequirementV1::DaemonRestart,
+        ),
+        (
+            MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+            ConfigurationValueV1::Text(recall_routing_default),
             SettingSensitivityV1::Public,
             RestartRequirementV1::DaemonRestart,
         ),
@@ -958,5 +1143,235 @@ mod user_profile_settings_tests {
                 }
             ))
         ));
+    }
+}
+
+#[cfg(test)]
+mod memory_provider_registration_tests {
+    use super::*;
+    use tracedecay_domain::configuration::MemoryProviderParticipationV1;
+
+    fn canonical_text<T: serde::Serialize>(value: &T) -> String {
+        String::from_utf8(tracedecay_domain::canonical_json_bytes(value).unwrap()).unwrap()
+    }
+
+    fn provider_test_root() -> std::path::PathBuf {
+        if cfg!(windows) {
+            std::path::PathBuf::from(r"C:\provider")
+        } else {
+            std::path::PathBuf::from("/provider")
+        }
+    }
+
+    #[test]
+    fn provider_participation_and_selection_keep_project_scope_defaults_and_restart_policy() {
+        let registry = ConfigurationRegistry::core().unwrap();
+        for key in [
+            MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+            MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+            MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+        ] {
+            let definition = registry.definition(&SettingKey::new(key).unwrap()).unwrap();
+            assert_eq!(definition.scope, SettingScopeV1::Project);
+            assert_eq!(
+                definition.restart_requirement,
+                RestartRequirementV1::DaemonRestart
+            );
+            match key {
+                MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY => assert_eq!(
+                    definition.default_value,
+                    ConfigurationValueV1::Boolean(true)
+                ),
+                MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY => assert_eq!(
+                    definition.default_value,
+                    ConfigurationValueV1::Text(r#"{"mode":"disabled"}"#.to_owned())
+                ),
+                _ => {
+                    let ConfigurationValueV1::Text(value) = &definition.default_value else {
+                        panic!("routing must remain canonical JSON text")
+                    };
+                    let routing: tracedecay_domain::configuration::MemoryProviderRecallRoutingV1 =
+                        serde_json::from_str(value).unwrap();
+                    assert_eq!(value, &canonical_text(&routing));
+                    assert_eq!(
+                        routing.active_provider.as_deref(),
+                        Some(MemoryProviderKindV1::Native.provider_id())
+                    );
+                    assert_eq!(routing.fallback, None);
+                    assert_eq!(routing.degradation, None);
+                }
+            }
+        }
+        let resolution = crate::configuration::resolver::resolve_configuration(&registry, &[])
+            .expect("default provider settings resolve");
+        let selection = registry
+            .resolve_provider_selection(&resolution.snapshot.effective_values)
+            .expect("default provider selection is composable");
+        assert_eq!(
+            selection.active_provider(),
+            Some(MemoryProviderKindV1::Native)
+        );
+        assert_eq!(selection.native, MemoryProviderParticipationV1::Active);
+        assert_eq!(selection.ncm, MemoryProviderParticipationV1::Disabled);
+    }
+
+    #[test]
+    fn provider_documents_are_parsed_and_semantically_validated_at_registry_admission() {
+        let registry = ConfigurationRegistry::core().unwrap();
+        let ncm_key = SettingKey::new(MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY).unwrap();
+        let routing_key = SettingKey::new(MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY).unwrap();
+
+        for (key, document) in [
+            (&ncm_key, "{"),
+            (
+                &ncm_key,
+                r#"{"mode":"enabled","worker_binary":"worker","state_root":"/state"}"#,
+            ),
+            (&ncm_key, r#"{ "mode":"disabled" }"#),
+            (&routing_key, r#"{"active_provider":"ncm","unknown":true}"#),
+            (
+                &routing_key,
+                r#"{ "active_provider": null, "degradation": null, "fallback": null }"#,
+            ),
+            (
+                &routing_key,
+                r#"{"fallback":{"policy_id":"policy.recall.fallback","policy_revision":1,"target_provider":"ncm"},"active_provider":"tracedecay.native","degradation":null}"#,
+            ),
+            (
+                &routing_key,
+                r#"{"active_provider":"tracedecay.native","degradation":null,"fallback":{"policy_id":"policy.recall.fallback","policy_revision":1.0,"target_provider":"ncm"}}"#,
+            ),
+        ] {
+            assert!(matches!(
+                registry.validate_value(key, &ConfigurationValueV1::Text(document.to_owned())),
+                Err(ConfigurationRegistryError::InvalidStructuredValue {
+                    key: actual_key,
+                    ..
+                }) if actual_key.as_str() == key.as_str()
+            ));
+        }
+    }
+
+    #[test]
+    fn noncanonical_provider_document_is_rejected_without_mutating_values() {
+        let registry = ConfigurationRegistry::core().unwrap();
+        let resolution = crate::configuration::resolver::resolve_configuration(&registry, &[])
+            .expect("default provider settings resolve");
+        let routing_key = SettingKey::new(MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY).unwrap();
+        let mut values = resolution.snapshot.effective_values;
+        values.insert(
+            routing_key.clone(),
+            ConfigurationValueV1::Text(
+                r#"{ "active_provider": null, "degradation": null, "fallback": null }"#.to_owned(),
+            ),
+        );
+        let before = values.clone();
+
+        assert!(matches!(
+            registry.resolve_provider_selection(&values),
+            Err(ConfigurationRegistryError::InvalidStructuredValue {
+                key,
+                message,
+                ..
+            }) if key == routing_key && message.contains("canonical serialization")
+        ));
+        assert_eq!(values, before);
+    }
+
+    #[test]
+    fn provider_selection_rejects_uncomposable_active_and_fallback_targets_without_mutating_values()
+    {
+        let registry = ConfigurationRegistry::core().unwrap();
+        let resolution = crate::configuration::resolver::resolve_configuration(&registry, &[])
+            .expect("default provider settings resolve");
+        let mut values = resolution.snapshot.effective_values.clone();
+        let native_key = SettingKey::new(MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY).unwrap();
+        let ncm_key = SettingKey::new(MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY).unwrap();
+        let routing_key = SettingKey::new(MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY).unwrap();
+        values.insert(native_key.clone(), ConfigurationValueV1::Boolean(false));
+        let before = values.clone();
+        assert!(matches!(
+            registry.resolve_provider_selection(&values),
+            Err(ConfigurationRegistryError::ProviderSelection(
+                MemoryProviderSelectionErrorV1::SelectedProviderDisabled(
+                    MemoryProviderKindV1::Native
+                )
+            ))
+        ));
+        assert_eq!(values, before);
+        values.insert(native_key.clone(), ConfigurationValueV1::Boolean(true));
+
+        values.insert(
+            routing_key.clone(),
+            ConfigurationValueV1::Text(canonical_text(&MemoryProviderRecallRoutingV1 {
+                active_provider: Some("ncm".to_owned()),
+                ..Default::default()
+            })),
+        );
+        let before = values.clone();
+        assert!(matches!(
+            registry.resolve_provider_selection(&values),
+            Err(ConfigurationRegistryError::ProviderSelection(
+                MemoryProviderSelectionErrorV1::SelectedProviderDisabled(
+                    tracedecay_domain::configuration::MemoryProviderKindV1::Ncm
+                )
+            ))
+        ));
+        assert_eq!(values, before);
+
+        values.insert(
+            ncm_key,
+            ConfigurationValueV1::Text(canonical_text(&MemoryProviderNcmObserverV1::Enabled {
+                worker_binary: provider_test_root().join("worker"),
+                state_root: provider_test_root().join("state"),
+            })),
+        );
+        let enabled_fallback = MemoryProviderRecallRoutingV1 {
+            active_provider: Some("tracedecay.native".to_owned()),
+            fallback: Some(
+                tracedecay_domain::configuration::MemoryProviderRecallFallbackV1 {
+                    policy_id: "policy.recall.fallback".to_owned(),
+                    policy_revision: 1,
+                    target_provider: "ncm".to_owned(),
+                },
+            ),
+            ..Default::default()
+        };
+        values.insert(
+            routing_key.clone(),
+            ConfigurationValueV1::Text(canonical_text(&enabled_fallback)),
+        );
+        let before = values.clone();
+        assert!(matches!(
+            registry.resolve_provider_selection(&values),
+            Err(ConfigurationRegistryError::ProviderSelection(
+                MemoryProviderSelectionErrorV1::UnsupportedFallbackProvider(provider)
+            )) if provider == "ncm"
+        ));
+        assert_eq!(values, before);
+
+        let unregistered_fallback = MemoryProviderRecallRoutingV1 {
+            active_provider: Some("tracedecay.native".to_owned()),
+            fallback: Some(
+                tracedecay_domain::configuration::MemoryProviderRecallFallbackV1 {
+                    policy_id: "policy.recall.fallback".to_owned(),
+                    policy_revision: 1,
+                    target_provider: "provider.unregistered".to_owned(),
+                },
+            ),
+            ..Default::default()
+        };
+        values.insert(
+            routing_key,
+            ConfigurationValueV1::Text(canonical_text(&unregistered_fallback)),
+        );
+        let before = values.clone();
+        assert!(matches!(
+            registry.resolve_provider_selection(&values),
+            Err(ConfigurationRegistryError::ProviderSelection(
+                MemoryProviderSelectionErrorV1::UnsupportedFallbackProvider(provider)
+            )) if provider == "provider.unregistered"
+        ));
+        assert_eq!(values, before);
     }
 }

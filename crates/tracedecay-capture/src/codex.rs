@@ -58,6 +58,54 @@ pub fn codex_current_user_message(payload: &Value) -> Option<CodexCurrentUserMes
     Some(CodexCurrentUserMessage { item_id, content })
 }
 
+/// Completed assistant messages own the visible turn; their response-item
+/// counterparts remain unsupported so replay cannot duplicate conversation.
+fn codex_current_agent_message(payload: &Value) -> Option<(&str, &Value)> {
+    if payload.get("type").and_then(Value::as_str) != Some("item_completed") {
+        return None;
+    }
+    let item = payload.get("item")?;
+    if item.get("type").and_then(Value::as_str) != Some("AgentMessage")
+        || !matches!(
+            item.get("phase").and_then(Value::as_str),
+            Some("commentary" | "final_answer")
+        )
+        || [payload, item].iter().any(|value| {
+            value
+                .get("role")
+                .is_some_and(|role| role.as_str() != Some("assistant"))
+                || value.get("channel").is_some_and(|channel| {
+                    !matches!(channel.as_str(), Some("commentary" | "final"))
+                })
+        })
+    {
+        return None;
+    }
+    let item_id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|item_id| !item_id.is_empty())?;
+    ObservationId::new(item_id).ok()?;
+    let content = item.get("content")?;
+    let parts = content.as_array()?;
+    if parts.is_empty()
+        || parts.iter().any(|part| {
+            part.get("type").and_then(Value::as_str) != Some("Text")
+                || part.get("text").and_then(Value::as_str).is_none()
+                || part.as_object().is_none_or(|part| {
+                    part.keys()
+                        .any(|key| !matches!(key.as_str(), "type" | "text"))
+                })
+        })
+        || tracedecay_store::codex_message_visible_text(content)
+            .trim()
+            .is_empty()
+    {
+        return None;
+    }
+    Some((item_id, content))
+}
+
 /// Validate the legacy response-only goal-context shape. A response item may
 /// omit `id` in older rollouts; when present, it must still be a valid native
 /// observation identity. Pair replacement belongs to transactional projection,
@@ -209,7 +257,9 @@ fn normalize_codex_record(
     ) {
         let message_id = match native_kind {
             "event_msg" => codex_current_user_message(payload)
-                .and_then(|message| observation_id_from_native(message.item_id)),
+                .map(|message| message.item_id)
+                .or_else(|| codex_current_agent_message(payload).map(|(item_id, _)| item_id))
+                .and_then(observation_id_from_native),
             "response_item" => codex_response_goal_context(payload)
                 .and_then(|message| message.item_id)
                 .and_then(observation_id_from_native),
@@ -416,14 +466,20 @@ fn append_codex_event_facts(
                 append_codex_subagent_spawn_fact(item, facts);
                 return;
             }
-            if item.get("type").and_then(Value::as_str) != Some("UserMessage") {
-                facts.push(CanonicalObservationFactV1::Unknown {
-                    native_kind: "item_completed".to_string(),
-                    state: CanonicalUnknownStateV1::Unsupported,
-                });
-                return;
-            }
-            let Some(message) = codex_current_user_message(payload) else {
+            let message = match item.get("type").and_then(Value::as_str) {
+                Some("UserMessage") => codex_current_user_message(payload)
+                    .map(|message| (CanonicalMessageRoleV1::User, message.content)),
+                Some("AgentMessage") => codex_current_agent_message(payload)
+                    .map(|(_, content)| (CanonicalMessageRoleV1::Assistant, content)),
+                _ => {
+                    facts.push(CanonicalObservationFactV1::Unknown {
+                        native_kind: "item_completed".to_string(),
+                        state: CanonicalUnknownStateV1::Unsupported,
+                    });
+                    return;
+                }
+            };
+            let Some((role, content)) = message else {
                 facts.push(CanonicalObservationFactV1::Unknown {
                     native_kind: "item_completed".to_string(),
                     state: CanonicalUnknownStateV1::Malformed,
@@ -431,8 +487,8 @@ fn append_codex_event_facts(
                 return;
             };
             facts.push(CanonicalObservationFactV1::Message {
-                role: CanonicalMessageRoleV1::User,
-                content: message.content.clone(),
+                role,
+                content: content.clone(),
                 model: item
                     .get("model")
                     .or_else(|| payload.get("model"))

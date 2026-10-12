@@ -1,0 +1,42 @@
+{
+  "crates/tracedecay-memory-evaluation/src/host_retrieval.rs": {
+    "base_sha256": "d281794e10a1316c04b0eff330c111458106ae8624b94c352cb00c79c76c90c7",
+    "proposed_sha256": "69a0a23ae3511fb01175d63c0ef15b2ffaf25b2b0a4252cd2092c251e368c1e7"
+  },
+  "crates/tracedecay-memory-evaluation/src/host_retrieval/tool_result.rs": {
+    "base_sha256": null,
+    "proposed_sha256": "f2609b27546d12ac9f752c57aee770ec2fae48eeee4df0a8abe388dde3eaa56b"
+  },
+  "crates/tracedecay-memory-evaluation/tests/fixtures/tool_result_v1.json": {
+    "base_sha256": null,
+    "proposed_sha256": "c7bb60aab84525a6361c44f4652361ea1ff4a1e0ab2fc4eebb73f9fc80cb8d43"
+  },
+  "crates/tracedecay-memory-evaluation/tests/host_retrieval.rs": {
+    "base_sha256": "926251216392b1cf49080f07d5aded02231e5ad3987f588c021f74a28a761cd7",
+    "proposed_sha256": "7ee0967b6bab2979617dc526922babe50fcf2d4ca519864f5fcdf1768828047f"
+  },
+  "product/evaluation/host-comparison/comparison-capture.schema.json": {
+    "base_sha256": "1b14f3eae3377cef9b76fe9572440ac9dd1af137b5976f482ce525e63e08a572",
+    "proposed_sha256": "c995f6b06669da5d133617231100d669a587ffeb711152a709ba4136ca9e3024"
+  },
+  "product/evaluation/host-comparison/comparison-report.schema.json": {
+    "base_sha256": "57a93e28375cf38ee5c04283f97c9c9cfda5f68c6a080b42dab837c1d55d59bd",
+    "proposed_sha256": "cd93ea9b279d5fb6a34914fcbb0dd67d3b0a43d1c142b5f6f38006372c351541"
+  },
+  "scripts/product/memory-comparison/adjudicate.py": {
+    "base_sha256": "b5d8a1ee508a7c43d2df6b0fb430346bcdc22a579b2a6c3222b81ffb89589562",
+    "proposed_sha256": "1ec2446d4a6628d47004b6cdb492dd9a5f5e61b4ba59a288a97dfe5eade1bae4"
+  },
+  "scripts/product/memory-comparison/delivery_evidence.py": {
+    "base_sha256": null,
+    "proposed_sha256": "9f9e35db9dbc0d6d89b1a70fcfe10768645cb28bcc2440891a29ee63a2e9ad8f"
+  },
+  "scripts/product/memory-comparison/runner.py": {
+    "base_sha256": "9e9133442229ea0bbd6e5342dd98ccc5f742d6696818b1cbf630b434f08bddf8",
+    "proposed_sha256": "d777c7af89b70548de8646710f3cfb1c71140a47086e8f56cc231dac568b8246"
+  },
+  "scripts/product/memory-comparison/test_delivery_evidence.py": {
+    "base_sha256": null,
+    "proposed_sha256": "d15a14dcc99506fb43a9678107a7dd5d7ed8f1f255b67421a864801b79df4f3b"
+  }
+}

@@ -358,10 +358,10 @@ pub use retained_receipts::{
 };
 pub use retained_surfaces::{
     RetainedLcmExecutionPortV1, RetainedLcmRequestV1, RetainedMemoryExecutionPortV1,
-    RetainedMemoryRequestV1, RetainedSessionExecutionPortV1, RetainedSessionRequestV1,
-    RetainedSurfaceExecutionContextV1, RetainedSurfaceExecutionErrorV1,
-    RetainedSurfaceExecutionFutureV1, RetainedSurfaceOperation, RetainedSurfacePortsV1,
-    RetainedSurfaceServiceV1, retained_surface_application_operation,
+    RetainedMemoryRequestV1, RetainedProviderControlExecutionPortV1,
+    RetainedSessionExecutionPortV1, RetainedSessionRequestV1, RetainedSurfaceExecutionContextV1,
+    RetainedSurfaceExecutionErrorV1, RetainedSurfaceExecutionFutureV1, RetainedSurfaceOperation,
+    RetainedSurfacePortsV1, RetainedSurfaceServiceV1, retained_surface_application_operation,
     retained_surface_catalog_contribution, retained_surface_execution_problem,
     retained_surface_handler_descriptors, retained_surface_operation_is_effect,
     retained_surface_outcome_matches_terminal, retained_surface_problem_matches_terminal,

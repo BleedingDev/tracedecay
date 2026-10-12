@@ -1,0 +1,18 @@
+{
+  "basis": "current Git index; working edits are unstaged",
+  "patch_sha256": "d8cd7062fcfbab0e53b987d4eb861d3930e201318b229ce04f9d3950d07ee4c1",
+  "files": [
+    {
+      "file": "crates/tracedecay-memory-provider-registry/src/recall_port.rs",
+      "index_blob": "b4a5199861dbb1582d44d041749fc68c2628ee8e",
+      "before_sha256": "c38fa92e002f8dfbcaefc96efc126fe337f8e501174ac0b374b3c8be1a856da6",
+      "after_sha256": "7f8ae27a55a89bd53ee7aef94b1fa8167b858a1795b86e8d3ec416bddc4b45c2"
+    },
+    {
+      "file": "crates/tracedecay-memory-provider-registry/tests/recall_port.rs",
+      "index_blob": "af2d0ebea927317af4f62a2ad9f72557397f9f62",
+      "before_sha256": "11878a223bbfa1091095f50c6f91b523a04b28d200fcd8fdf9b56d5a18babf1a",
+      "after_sha256": "5cf1bcb68b82ee9dd73434a4af2c7602f24ba1d8ac20319171e8b638b968c21e"
+    }
+  ]
+}

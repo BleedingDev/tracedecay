@@ -4,6 +4,8 @@ use crate::support::*;
 use serde_json::{Value, json};
 use std::fs;
 use tracedecay::daemon::ProductionProjectCompositionHarnessV1;
+use tracedecay_contracts::memory::CognitiveRecallTemporalQuery;
+use tracedecay_domain::UtcMicros;
 use tracedecay_domain::errors::{Result as TraceDecayResult, TraceDecayError};
 use tracedecay_mcp::ToolResult;
 
@@ -347,6 +349,132 @@ async fn context_memory_controls_filter_disable_and_preserve_markdown() {
     assert!(text.contains("Long memory control fact"));
     assert!(text.contains(&"x".repeat(300)));
     assert!(!text.contains("..."));
+    fixture.harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn context_withholds_current_facts_for_historical_memory_queries() {
+    let fixture = setup_production_project().await;
+    let content = "Helper function historical reviews must retain canonical memory provenance.";
+    let added = call_production_fact_tool(
+        &fixture,
+        "tracedecay_fact_store_add",
+        json!({
+            "content": content,
+            "category": "decision",
+            "entities": ["helper function historical review"],
+            "trust": 0.91,
+            "source_label": "mcp-context-test"
+        }),
+    )
+    .await;
+    let fact_id = committed_fact_id(&added).to_owned();
+    let task = "helper function historical review canonical memory provenance";
+    let current = CognitiveRecallTemporalQuery::current(UtcMicros(1_000));
+    for temporal_query in [None, Some(current.clone())] {
+        let result = call_production_tool(
+            &fixture,
+            "tracedecay_context",
+            json!({"task": task, "format": "json", "temporal_query": temporal_query}),
+        )
+        .await
+        .unwrap();
+        assert_ne!(result.value["isError"], true, "{:?}", result.value);
+        let payload: Value = serde_json::from_str(extract_text(&result.value)).unwrap();
+        assert!(
+            payload["memory_matches"]
+                .as_array()
+                .is_some_and(|hits| { hits.iter().any(|hit| hit["fact"]["fact_id"] == fact_id) }),
+            "{payload}"
+        );
+        assert_eq!(payload["retrieval"]["memory"]["state"], "ran");
+        assert!(
+            payload.get("memory_temporal_coverage").is_none(),
+            "{payload}"
+        );
+    }
+
+    let historical = [
+        ("as_of", current.clone().with_as_of(UtcMicros(500)).unwrap()),
+        (
+            "interval",
+            current
+                .clone()
+                .with_interval(UtcMicros(100), UtcMicros(900))
+                .unwrap(),
+        ),
+        ("history", current.with_history()),
+    ];
+    for (mode, temporal_query) in &historical {
+        let result = call_production_tool(
+            &fixture,
+            "tracedecay_context",
+            json!({"task": task, "format": "json", "temporal_query": temporal_query}),
+        )
+        .await
+        .unwrap();
+        assert_ne!(result.value["isError"], true, "{:?}", result.value);
+        let payload: Value = serde_json::from_str(extract_text(&result.value)).unwrap();
+        assert_eq!(payload["memory_matches"], json!([]), "{payload}");
+        assert!(payload.get("memory_graph_coverage").is_none(), "{payload}");
+        assert!(payload.get("memory_matches_error").is_none(), "{payload}");
+        assert_eq!(payload["retrieval"]["memory"]["state"], "unavailable");
+        assert_eq!(
+            payload["memory_temporal_coverage"],
+            json!({
+                "kind": "withheld_current_only", "requested_mode": mode,
+            })
+        );
+    }
+    let history = &historical[2].1;
+    let markdown = call_production_tool(
+        &fixture,
+        "tracedecay_context",
+        json!({"task": task, "format": "markdown", "temporal_query": history}),
+    )
+    .await
+    .unwrap();
+    let text = extract_text(&markdown.value);
+    assert!(
+        text.contains("canonical fact search supports only current memory."),
+        "{text}"
+    );
+    assert!(!text.contains(content), "{text}");
+
+    let disabled = call_production_tool(
+        &fixture,
+        "tracedecay_context",
+        json!({"task": task, "format": "json", "temporal_query": history, "include_memory": false}),
+    )
+    .await
+    .unwrap();
+    let payload: Value = serde_json::from_str(extract_text(&disabled.value)).unwrap();
+    assert_eq!(payload["memory_matches"], json!([]));
+    assert_eq!(payload["retrieval"]["memory"]["state"], "not_requested");
+    assert!(
+        payload.get("memory_temporal_coverage").is_none(),
+        "{payload}"
+    );
+
+    let server = fixture.harness.server(&fixture.project_root).unwrap();
+    let invalid = handle_real_server_tool_call_raw(
+        &server,
+        "tracedecay_context",
+        json!({
+            "task": task,
+            "temporal_query": CognitiveRecallTemporalQuery::current(UtcMicros(i64::MAX)),
+        }),
+    )
+    .await;
+    let problem = refusal_problem(&invalid["result"]);
+    assert_eq!(problem["kind"], "invalid_request", "{invalid}");
+    assert_eq!(problem["code"], "application.surface.invalid_request");
+    assert!(
+        problem["message"]
+            .as_str()
+            .unwrap()
+            .contains("cognitive recall evaluation time")
+    );
     fixture.harness.shutdown().await;
 }
 

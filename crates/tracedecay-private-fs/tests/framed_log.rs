@@ -5,11 +5,16 @@ use std::io::ErrorKind;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::io::Write;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use tracedecay_private_fs::framed_log::DurableFileBatch;
+#[cfg(all(
+    feature = "test-helpers",
+    any(target_os = "linux", target_os = "macos")
+))]
+use tracedecay_private_fs::framed_log::sync_latency;
 use tracedecay_private_fs::framed_log::{DirectorySyncPolicy, atomic_write_prepared, read_bounded};
 
 #[test]
@@ -112,6 +117,130 @@ fn prepared_publish_is_private_and_readable_through_the_adapter() {
                 & 0o777,
             0o600
         );
+    }
+}
+
+#[cfg(all(
+    feature = "test-helpers",
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+fn durable_batch_defers_full_sync_and_refuses_publication_without_every_member() {
+    let root = tempfile::tempdir().expect("batch fixture root");
+    let destination = root.path().join("head");
+    atomic_write_prepared(
+        &destination,
+        "batch-fixture",
+        b"old generation",
+        |_| Ok(()),
+        DirectorySyncPolicy::Strict,
+    )
+    .expect("initial publication");
+
+    let members = [
+        root.path().join("first.tmp"),
+        root.path().join("second.tmp"),
+    ];
+    let syncs = sync_latency::inject(root.path(), std::time::Duration::ZERO);
+    let mut batch = DurableFileBatch::new();
+    for path in &members {
+        let mut file = fs::File::create(path).expect("member file");
+        file.write_all(b"sealed segment").expect("member bytes");
+        batch.written(path, &file).expect("record member");
+    }
+    assert_eq!(syncs.syncs(), 0, "writes defer the full-sync barriers");
+
+    batch.sync().expect("batch sync");
+    assert_eq!(syncs.syncs(), members.len() as u64);
+    for path in &members {
+        assert_eq!(fs::read(path).expect("durable member"), b"sealed segment");
+    }
+    drop(syncs);
+
+    fs::remove_file(&members[1]).expect("remove staged member");
+    let error = atomic_write_prepared(
+        &destination,
+        "batch-fixture",
+        b"new generation",
+        |_| batch.sync(),
+        DirectorySyncPolicy::Strict,
+    )
+    .expect_err("missing member prevents publication");
+    assert_eq!(error.kind(), ErrorKind::NotFound);
+    assert_eq!(
+        fs::read(&destination).expect("published head"),
+        b"old generation"
+    );
+    assert_eq!(
+        fs::read(&members[0]).expect("remaining member"),
+        b"sealed segment"
+    );
+}
+
+#[cfg(all(
+    feature = "test-helpers",
+    any(target_os = "linux", target_os = "macos")
+))]
+#[test]
+fn durable_batch_cancellation_stops_between_syncs_and_after_the_final_barrier() {
+    let root = tempfile::tempdir().expect("cancelled batch fixture root");
+    let destination = root.path().join("head");
+    atomic_write_prepared(
+        &destination,
+        "batch-fixture",
+        b"old generation",
+        |_| Ok(()),
+        DirectorySyncPolicy::Strict,
+    )
+    .expect("initial publication");
+    let staged_root = root.path().join("staged");
+    fs::create_dir(&staged_root).expect("staged directory");
+    let members = [
+        staged_root.join("first.tmp"),
+        staged_root.join("second.tmp"),
+    ];
+    for path in &members {
+        fs::write(path, b"sealed segment").expect("staged bytes");
+    }
+
+    // The two-member batch checks interruption between barriers; the
+    // one-member batch checks interruption after its final barrier.
+    for paths in [members.as_slice(), &members[..1]] {
+        let mut batch = DurableFileBatch::new();
+        for path in paths {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .expect("staged member");
+            batch.written(path, &file).expect("record member");
+        }
+        let syncs = sync_latency::inject(&staged_root, std::time::Duration::ZERO);
+        let error = atomic_write_prepared(
+            &destination,
+            "batch-fixture",
+            b"new generation",
+            |_| {
+                batch.sync_with_checkpoint(
+                    || {
+                        if syncs.syncs() > 0 {
+                            Err(std::io::Error::new(
+                                ErrorKind::Interrupted,
+                                "cancelled seal",
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    |error| error,
+                )
+            },
+            DirectorySyncPolicy::Strict,
+        )
+        .expect_err("cancelled batch must not publish");
+        assert_eq!(error.kind(), ErrorKind::Interrupted);
+        assert_eq!(syncs.syncs(), 1, "cancellation stops further barriers");
+        assert_eq!(fs::read(&destination).expect("head"), b"old generation");
     }
 }
 

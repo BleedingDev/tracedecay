@@ -1128,7 +1128,7 @@ fn canonical_message_text(content: &serde_json::Value) -> ProjectionStoreResult<
         .iter()
         .filter_map(
             |block| match block.get("type").and_then(serde_json::Value::as_str)? {
-                "text" | "input_text" | "output_text" => block
+                "text" | "Text" | "input_text" | "output_text" => block
                     .get("text")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned),
@@ -1692,6 +1692,69 @@ mod tests {
         assert_eq!(fields.model.as_deref(), Some("model.fixture"));
         assert_eq!(fields.timestamp, Some(42));
         assert_eq!(fields.tool_names.as_deref(), Some("Read"));
+    }
+
+    #[test]
+    fn codex_completed_agent_message_projects_visible_text_with_native_identity() {
+        let envelope = CanonicalObservationEnvelopeV1::new(
+            ProviderId::new("codex").unwrap(),
+            "event_msg",
+            ObservationId::new("record.fixture").unwrap(),
+            CanonicalObservationRelationsV1::new(SessionId::new("session.fixture").unwrap())
+                .with_message_id(ObservationId::new("agent.item.fixture").unwrap()),
+            vec![CanonicalObservationFactV1::Message {
+                role: CanonicalMessageRoleV1::Assistant,
+                content: json!([
+                    {"type": "Text", "text": "The first visible paragraph."},
+                    {"type": "Text", "text": "The second visible paragraph."}
+                ]),
+                model: Some("model.fixture".to_owned()),
+                timestamp: Some(42),
+            }],
+            CanonicalObservationEvidenceV1::new(
+                ObservationOrderingDomainV1::FileBytes,
+                ObservationSourceRangeV1::new(10, 20).unwrap(),
+            ),
+        )
+        .unwrap();
+        let fixture = observation_without_native_record_id(&envelope);
+        let observation = DurableObservationV1::new(
+            ObservationIdentityMaterialV1::for_native_record(
+                fixture.source().clone(),
+                fixture.scope().clone(),
+                fixture.identity().generation(),
+                envelope.evidence().range(),
+                envelope.evidence().ordering_domain(),
+                envelope.stable_record_id().clone(),
+            )
+            .unwrap(),
+            fixture.receipt().clone(),
+            fixture.retention_class().clone(),
+            fixture.payload().clone(),
+        )
+        .unwrap();
+
+        let projection = derive_canonical_projection(&observation).unwrap();
+        let output = projection.message().unwrap();
+        assert_eq!(output.message().provider, "codex");
+        assert_eq!(output.message().session_id, "session.fixture");
+        assert_eq!(output.message().message_id, "agent.item.fixture");
+        assert_eq!(output.message().role, "assistant");
+        assert_eq!(output.message().kind.as_deref(), Some("message"));
+        assert_eq!(
+            output.message().text,
+            "The first visible paragraph.\n\nThe second visible paragraph."
+        );
+        assert_eq!(output.message().model.as_deref(), Some("model.fixture"));
+        assert_eq!(output.message().timestamp, Some(42));
+        assert_eq!(
+            output.provenance().observation_id(),
+            observation.observation_id()
+        );
+        assert_eq!(
+            output.provenance().receipt(),
+            observation.receipt().receipt()
+        );
     }
 
     #[test]

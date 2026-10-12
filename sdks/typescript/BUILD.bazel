@@ -1,6 +1,7 @@
 load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_library")
 load("@npm//:defs.bzl", "npm_link_all_packages")
 load("@npm//sdks/typescript:@rslib/core/package_json.bzl", rslib_bin = "bin")
+load("@npm//sdks/typescript:vitest/package_json.bzl", vitest_bin = "bin")
 
 npm_link_all_packages(name = "node_modules")
 
@@ -27,5 +28,13 @@ js_binary(
     name = "typed_terminal_live",
     entry_point = "test/typed-terminal-live.mjs",
     data = [":dist", "package.json"],
+    visibility = ["//visibility:public"],
+)
+
+vitest_bin.vitest_test(
+    name = "client_test",
+    args = ["run", "test/client.test.ts"],
+    chdir = package_name(),
+    data = [":pkg", ":node_modules", "test/client.test.ts", "tsconfig.json"],
     visibility = ["//visibility:public"],
 )

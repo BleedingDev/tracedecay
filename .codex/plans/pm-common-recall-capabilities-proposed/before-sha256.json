@@ -1,0 +1,12 @@
+[
+  {
+    "file": "crates/tracedecay-memory-provider-registry/src/recall_port.rs",
+    "index_blob": "b4a5199861dbb1582d44d041749fc68c2628ee8e",
+    "before_sha256": "c38fa92e002f8dfbcaefc96efc126fe337f8e501174ac0b374b3c8be1a856da6"
+  },
+  {
+    "file": "crates/tracedecay-memory-provider-registry/tests/recall_port.rs",
+    "index_blob": "af2d0ebea927317af4f62a2ad9f72557397f9f62",
+    "before_sha256": "11878a223bbfa1091095f50c6f91b523a04b28d200fcd8fdf9b56d5a18babf1a"
+  }
+]
