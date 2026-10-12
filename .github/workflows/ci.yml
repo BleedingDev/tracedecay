@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       run_os:
-        description: "Also run the macOS matrix"
+        description: "Also run full macOS and Windows tests"
         type: boolean
         default: false
       run_hosts:
@@ -35,8 +35,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Drafts run cheap gates. Ready PRs and pushes run the Bazel Linux authority;
-  # dispatch can request additional OS and stock-host journeys.
+  # Drafts run cheap gates. Ready PRs and pushes run Bazel Linux validation
+  # and Windows compilation; dispatch can request full OS and host journeys.
   scope-gate:
     name: Scope gate
     permissions:
@@ -495,9 +495,9 @@ jobs:
         run: test "${{ needs.linux-test.result }}" = "success"
 
   windows-test:
-    name: Test Windows
-    needs: scope-gate
-    if: ${{ needs.scope-gate.outputs.run-os == 'true' }}
+    name: Windows checks
+    needs: [scope-gate, gates]
+    if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
     runs-on: windows-latest
     timeout-minutes: 330
     steps:
@@ -517,11 +517,24 @@ jobs:
         id: bazel
         with:
           cache-key: ci-windows-test
-          test-tools: "true"
+          test-tools: ${{ needs.scope-gate.outputs.run-os }}
+
+      # Check the shipped MSVC target without linking test executables or
+      # applying Linux's Clippy warning policy to this compiler-only check.
+      - name: Compile the Windows workspace
+        if: ${{ needs.scope-gate.outputs.run-os != 'true' }}
+        shell: bash
+        run: >-
+          bazel build --config=ci
+          --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
+          --output_groups=clippy_checks
+          --@rules_rust//rust/settings:clippy_flag=-Aclippy::all
+          //...
 
       # `bazel test` builds every target in the pattern, so tests start
       # while the rest of the workspace still links.
       - name: Build and test the workspace
+        if: ${{ needs.scope-gate.outputs.run-os == 'true' }}
         shell: bash
         run: bazel test --config=ci //...
 
@@ -564,30 +577,6 @@ jobs:
 
       - name: Run blocking Clippy policy
         run: bazel build --config=ci --config=clippy //...
-
-      # Master pushes run no Windows lane, so `cfg(windows)` code otherwise
-      # first compiles in the release build. Bazel has no MSVC toolchain on
-      # Linux, so this cross-target type check stays on Cargo: `cargo check`
-      # needs no linker, and mingw supplies the C compiler the native build
-      # scripts run. macOS has no equivalent: its build scripts need the Apple
-      # SDK headers.
-      - name: Install pinned toolchain and Windows check target
-        run: |
-          rustup toolchain install
-          rustup target add x86_64-pc-windows-gnu
-
-      - uses: ./.github/actions/setup-pnpm
-
-      - name: Install the Windows C cross-compiler
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
-
-      - name: Check the Windows target
-        run: >-
-          cargo check --workspace --all-targets --locked
-          --target x86_64-pc-windows-gnu
-          --features tracedecay/test-transport,tracedecay/test-helpers,tracedecay-cli/test-transport
 
       - name: Save compiled Bazel actions
         if: always() && !cancelled() && github.ref == 'refs/heads/master' && steps.bazel.outputs.disk-cache-key != ''
