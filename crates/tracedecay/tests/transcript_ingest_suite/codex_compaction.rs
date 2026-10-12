@@ -12,6 +12,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use tempfile::TempDir;
+#[cfg(unix)]
+use tracedecay_domain::ObservationScopeV1;
 use tracedecay_domain::ProjectId;
 #[cfg(unix)]
 use tracedecay_lcm::{
@@ -24,6 +26,10 @@ use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1
 use tracedecay_runtime_core::config::ProfileRoot;
 #[cfg(unix)]
 use tracedecay_runtime_core::test_executable::write_executable_script;
+#[cfg(unix)]
+use tracedecay_sessions::observation::ObservationCancellation;
+#[cfg(unix)]
+use tracedecay_sessions::runtime::hosts::codex::codex_observation_source_v2;
 use tracedecay_sessions::runtime::{SessionProvider, with_transcript_source_profile};
 
 #[cfg(unix)]
@@ -204,7 +210,7 @@ done
         .await
         .unwrap();
     drop(enrollment);
-    write_codex_rollout_with_compaction(&home, &project, "codex-compact");
+    let rollout = write_codex_rollout_with_compaction(&home, &project, "codex-compact");
 
     let daemon = spawn_tracedecay_daemon(&home);
     let event = serde_json::json!({
@@ -241,9 +247,34 @@ done
     );
     drop(daemon);
 
-    let runtime = HostAdmissionTestRuntimeV1::project(&profile, &project, project_id)
+    let runtime = HostAdmissionTestRuntimeV1::project(&profile, &project, project_id.clone())
         .await
         .unwrap();
+
+    let source = codex_observation_source_v2("codex-compact").unwrap();
+    let cursor = runtime
+        .project_observation_source_cursor_for_test(&source)
+        .await
+        .unwrap()
+        .expect("PostCompact must durably admit its exact transcript window");
+    assert_eq!(
+        cursor.position(),
+        std::fs::metadata(&rollout).unwrap().len()
+    );
+
+    // PostCompact returns before projection settles. Drain its durable work
+    // after stopping the daemon, without rereading or admitting the rollout.
+    let drained = runtime
+        .facade()
+        .drain_projection_queue(
+            "codex",
+            &ObservationScopeV1::Project { project_id },
+            &ObservationCancellation::default(),
+            32,
+        )
+        .await
+        .unwrap();
+    assert!(!drained.deferred);
 
     let status = runtime
         .lcm_status_for_test("codex", Some("codex-compact"))
