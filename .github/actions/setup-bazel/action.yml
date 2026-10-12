@@ -4,10 +4,11 @@ description: >
   disk cache named by `cache-key`. Jobs with the same configuration and
   runner image share a restore prefix. Callers retain compiled actions on
   master and may also save within a PR's merge-ref scope for later pushes to
-  that same PR. Bazelisk and repository caches are saved only on master.
+  that same PR. Bazelisk and repository caches are saved on master, and
+  also by `save-download-caches` jobs on runners with a remote cache.
   With `test-tools`, also installs the host tools the test suites spawn.
-  Runners that ship a remote cache in the user Bazel configuration (Depot)
-  keep it and skip the disk-cache archive.
+  Runners with their own remote Bazel cache (Depot) keep it and skip the
+  disk-cache archive.
 
 inputs:
   cache-key:

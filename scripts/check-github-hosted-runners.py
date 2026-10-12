@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Require every Actions job to resolve to a standard GitHub-hosted runner.
 
-The one exception is the organization's ephemeral Depot runners: an exact
-approved label, or a Depot runner variable whose fallback is hosted, so the
+The one exception is the organization's ephemeral Depot runners, selected
+through an approved repository variable whose fallback is hosted, so the
 workflows still run on GitHub's fleet wherever the variable is unset.
 """
 
@@ -37,13 +37,9 @@ STANDARD_GITHUB_HOSTED_RUNNERS = frozenset(
         "macos-14",
     }
 )
-# Repository variables an operator sets to an approved Depot label, keyed by
-# the Depot labels each may name.
-DEPOT_RUNNERS = {
-    "DEPOT_LINUX_RUNNER": frozenset({"depot-ubuntu-24.04-8"}),
-    "DEPOT_WINDOWS_RUNNER": frozenset({"depot-windows-2025-8"}),
-}
-APPROVED_DEPOT_RUNNERS = frozenset().union(*DEPOT_RUNNERS.values())
+# Repository variables an operator sets to an approved Depot label:
+# depot-ubuntu-24.04-8 and depot-windows-2025-8 respectively.
+DEPOT_RUNNER_VARIABLES = frozenset({"DEPOT_LINUX_RUNNER", "DEPOT_WINDOWS_RUNNER"})
 DEPOT_RUNNER_EXPRESSION = re.compile(
     r"\$\{\{\s*vars\.([A-Z_]+)\s*\|\|\s*'([^']+)'\s*\}\}"
 )
@@ -116,13 +112,11 @@ def validate_workflow(path: Path) -> None:
             raise PolicyViolation(
                 f"{authority} uses runner labels/groups instead of one hosted label"
             )
-        if "${{" not in runner and runner in APPROVED_DEPOT_RUNNERS:
-            continue
         if "${{" not in runner:
             require_hosted_label(runner, authority)
         elif match := DEPOT_RUNNER_EXPRESSION.fullmatch(runner):
             variable, fallback = match.groups()
-            if variable not in DEPOT_RUNNERS:
+            if variable not in DEPOT_RUNNER_VARIABLES:
                 raise PolicyViolation(
                     f"{authority} selects its runner from unapproved variable {variable!r}"
                 )

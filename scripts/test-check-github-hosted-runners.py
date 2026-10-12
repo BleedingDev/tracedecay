@@ -136,9 +136,8 @@ class GitHubHostedRunnerPolicyTests(unittest.TestCase):
             "&& 'ubuntu-24.04' || inputs.runner }}\n"
         )
 
-    def test_accepts_approved_depot_runners(self) -> None:
+    def test_accepts_approved_depot_runner_variables(self) -> None:
         for runner in (
-            "depot-ubuntu-24.04-8",
             "${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}",
             "${{ vars.DEPOT_WINDOWS_RUNNER || 'windows-latest' }}",
         ):
@@ -149,7 +148,7 @@ class GitHubHostedRunnerPolicyTests(unittest.TestCase):
 
     def test_rejects_unapproved_depot_runners(self) -> None:
         for runner in (
-            "depot-ubuntu-24.04-64",
+            "depot-ubuntu-24.04-8",
             "${{ vars.RUNNER || 'ubuntu-latest' }}",
             "${{ vars.DEPOT_LINUX_RUNNER || 'tracedecay-linux-64core' }}",
             "${{ vars.DEPOT_LINUX_RUNNER || inputs.runner }}",
