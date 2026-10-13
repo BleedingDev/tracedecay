@@ -1,0 +1,102 @@
+{
+  "task": "ncm-rs-023",
+  "status": "join-verified-not-accepted",
+  "claim": "No task 023 acceptance is claimed. HOST-STABLE has not been declared and the Beads import is pending. This receipt records that the backend branch merged cleanly with host head 3881741df and that every host lane and the standalone backend gate pass on the joined tree.",
+  "joined_tree": {
+    "head": "ce4b8fb20",
+    "merge_commit": "dc0166d23 (origin/feat/pluggable-memory-providers-v2 @ 3881741df into feat/ncm-biomem-rust-v1; no conflicts)",
+    "join_commit": "f94a67076 (direction-test fixture patch applied, footprint fence base = host_base_commit 3881741df)"
+  },
+  "workspace": {
+    "cargo check --workspace --all-targets --locked": "ok (6 pre-existing host warnings, none in NCM crates)"
+  },
+  "host_lanes_on_joined_tree": {
+    "hygiene (tracedecay-memory-hygiene: untrusted_recall_text, secret_classes, false_positives, transient_evidence)": "pass (5+11+9+28)",
+    "registry-contract (advisory_metadata_containment, recall_context_pack)": "pass (14+22)",
+    "provider-neutral crates (provider-api, fabric, provider-native, provider-registry, conformance, evaluation)": "pass (all test binaries ok, 0 failed)",
+    "retention lane (nextest: vector_retention_tests, generation_retention_test, vector_writer_fence_survives_runtime_remount, code-index-runtime retention/vector_source)": "pass (19 run, 19 passed)",
+    "claude host journey (tracedecay-cli product_memory_provider_claude_host_journey, memory-provider-host+test-transport)": "pass (1 run, 1 passed)"
+  },
+  "policy_checks_on_joined_tree": {
+    "check-memory-dependency-direction.py (real graph)": "memory dependency direction verified",
+    "tests/product_memory_dependency_direction_test.py": "27/27 OK (fixture patch landed in f94a67076)",
+    "tests/product_memory_dependency_policy_test.py": "OK",
+    "tests/product_ncm_surface_audit_test.py": "OK",
+    "check-provider-registry-contract.py": "OK",
+    "check-product-upstream-floor.py": "verified",
+    "tests/product_patch_footprint_policy_test.py": "fails exactly as on the host head (floor advance pending); zero diagnostics mention NCM paths"
+  },
+  "backend_gate_on_joined_tree": {
+    "receipt": "../backend/ce4b8fb20613c9feaa62724240fce6c37c5ea487.json",
+    "status": "pass",
+    "blockers": [],
+    "test_populations": [
+      [
+        "core_no_default",
+        {
+          "failed": 0,
+          "ignored": 0,
+          "passed": 85
+        }
+      ],
+      [
+        "runtime_no_default",
+        {
+          "failed": 0,
+          "ignored": 0,
+          "passed": 54
+        }
+      ],
+      [
+        "adapter_rust_backend",
+        {
+          "failed": 0,
+          "ignored": 1,
+          "passed": 80
+        }
+      ],
+      [
+        "real_embeddings",
+        {
+          "failed": 0,
+          "ignored": 0,
+          "passed": 4
+        }
+      ],
+      [
+        "isolated_text_journey",
+        {
+          "failed": 0,
+          "ignored": 0,
+          "passed": 1
+        }
+      ],
+      [
+        "adapter_real_encoder_population",
+        {
+          "failed": 0,
+          "ignored": 0,
+          "passed": 1
+        }
+      ]
+    ],
+    "journey": "pass",
+    "journey_facts": {
+      "restart_recall": "persisted",
+      "delete": "absent",
+      "restart_after_delete": "absent",
+      "replay": "capability_unsupported",
+      "restore_revocation": "not_resurrected",
+      "ltm_active_after_consolidate": 1,
+      "path_stripped_of_python": true
+    },
+    "ownership_fence": "scoped to host_base_commit 3881741df via product/ncm/bootstrap/ownership.json; no allowed-path violations"
+  },
+  "host_integration_state": "The host does not mount the NCM provider yet: no crate on feat/pluggable-memory-providers-v2 references tracedecay-memory-provider-ncm, so host-level NCM behaviour is unreachable until task 024 (registry/daemon mount).",
+  "still_gated": [
+    "HOST-STABLE declaration by the stabilization agent",
+    "Beads import of the ncm-biomem-rs.v1 work package",
+    "task 024 mount, then combined gate on the mounted tree"
+  ],
+  "notes": "product/ncm/plan/join/023-join-notes.md"
+}

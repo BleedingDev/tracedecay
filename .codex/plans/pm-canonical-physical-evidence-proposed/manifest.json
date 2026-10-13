@@ -1,0 +1,19 @@
+{
+  "status": "draft only; no live apply or Cargo",
+  "files": [
+    {
+      "path": "crates/tracedecay/src/daemon/retained_owner/cognitive_recall/test_context_evidence.rs",
+      "baseline_sha256": "5e571b4426f88621f2dbfa84367c3cb22d276d5545903bc9096e0ef7ee54be62",
+      "candidate_sha256": "f609cb334bdb9797bf951b6ac784b3226a02265e95130059406748d595c0666f",
+      "live_still_matches_baseline": true
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/retained_owner/provider_history.rs",
+      "baseline_sha256": "122e5c9c2d7f7cf7feb33f0620e5e473691ef0d4b139a7d870bcdcd7eecd1164",
+      "candidate_sha256": "110e930d354c8b9c3127a1e258a0613546b6ab3f2274423b8e80cfde14d2368a",
+      "live_still_matches_baseline": true
+    }
+  ],
+  "patch_sha256": "5ab711fd99926d61683eba6e17b0f5bea8095cbe14a17bf856dff185e5ae5be5",
+  "patch": ".codex/plans/pm-canonical-physical-evidence-proposed/integration.patch"
+}

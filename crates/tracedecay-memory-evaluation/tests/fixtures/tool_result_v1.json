@@ -1,0 +1,387 @@
+{
+  "final_tokens": 75,
+  "canonical_tokens": 3,
+  "advisory_tokens": 72,
+  "candidate_body_tokens": 1,
+  "representation": "tool_result_v1",
+  "tokenizer_identity": "tiktoken.o200k_base",
+  "tokenizer_revision": "tiktoken-rs-0.12",
+  "candidates": [],
+  "tool_result": {
+    "representation": "tool_result_v1",
+    "tokenizer": {
+      "identity": "tiktoken.o200k_base",
+      "revision": "tiktoken-rs-0.12"
+    },
+    "payload_syntax_spans": [
+      {
+        "content_index": 1,
+        "start": 0,
+        "end": 2,
+        "text": "{ ",
+        "sha256": "e2200f74356624e2e0b2a6e149922e8fd77b57481b1f6511c5f925f2c99d0821"
+      },
+      {
+        "content_index": 1,
+        "start": 42,
+        "end": 45,
+        "text": ",\n ",
+        "sha256": "808b0d30b6af60f0a662ded570086cdfd11a84ae1ceb58c226aa1ab8ec32402b"
+      },
+      {
+        "content_index": 1,
+        "start": 1152,
+        "end": 1154,
+        "text": " }",
+        "sha256": "15715d5ca91fe9c1de7947083abca074bb304712ebf119996712abf31472579f"
+      }
+    ],
+    "raw_carrier": {
+      "artifact_path": "development-only/stdout",
+      "utf8": "{\n \"content\": [\n  {\n   \"type\": \"text\",\n   \"text\": \"warning\"\n  },\n  {\n   \"type\": \"text\",\n   \"text\": \"{ \\\"canonical\\\" : {\\\"note\\\":\\\"caf\\u00e9\\\\u0020safe\\\"},\\n \\\"advisory_provider_memory\\\" : {\\\"provider_id\\\": \\\"development.provider\\\", \\\"registration_revision\\\": 1, \\\"recall_trace\\\": {\\\"trace_ref\\\": \\\"recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\", \\\"request_id\\\": \\\"actual-host-request\\\"}, \\\"canonical_history_replay\\\": {\\\"delivery_scope\\\": {\\\"project\\\": \\\"development\\\", \\\"session\\\": \\\"s\\\"}}, \\\"lane_notice\\\": \\\"Provider words remain inside the charged presentation.\\\", \\\"candidates\\\": [{\\\"candidate_id\\\": \\\"host.alias.survivor\\\", \\\"content\\\": \\\"Use caf\\u00e9 mode.\\\", \\\"provenance\\\": \\\"Canonical observer source\\\", \\\"explanation\\\": \\\"Use caf\\u00e9 mode. Metadata must also be reviewed.\\\", \\\"provenance_evidence\\\": {\\\"sources\\\": [{\\\"source_id\\\": \\\"source\\\", \\\"revision\\\": \\\"r1\\\", \\\"lineage_id\\\": \\\"lineage\\\", \\\"origin\\\": {\\\"kind\\\": \\\"development\\\"}, \\\"content_sha256\\\": \\\"2efee32c38ef260eb3666a7557b378937848d9fad22c17306154f154b8c3bace\\\"}], \\\"recall\\\": {\\\"trace_ref\\\": \\\"recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\", \\\"item_ref\\\": \\\"recall-item-v1:0\\\"}}}]} }\"\n  },\n  {\n   \"type\": \"text\",\n   \"text\": \"metrics\"\n  },\n  {\n   \"type\": \"image\",\n   \"data\": \"development-only\",\n   \"mimeType\": \"image/png\"\n  }\n ],\n \"isError\": false\n}\n",
+      "byte_length": 1528,
+      "sha256": "ccf4cfeb3475acc96b6d165b2a415929f99d8edf87373b9451d70eecf391b868"
+    },
+    "projection": {
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "warning"
+          },
+          {
+            "type": "text",
+            "text": "{ \"canonical\" : {\"note\":\"café\\u0020safe\"},\n \"advisory_provider_memory\" : {\"provider_id\": \"development.provider\", \"registration_revision\": 1, \"recall_trace\": {\"trace_ref\": \"recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"request_id\": \"actual-host-request\"}, \"canonical_history_replay\": {\"delivery_scope\": {\"project\": \"development\", \"session\": \"s\"}}, \"lane_notice\": \"Provider words remain inside the charged presentation.\", \"candidates\": [{\"candidate_id\": \"host.alias.survivor\", \"content\": \"Use café mode.\", \"provenance\": \"Canonical observer source\", \"explanation\": \"Use café mode. Metadata must also be reviewed.\", \"provenance_evidence\": {\"sources\": [{\"source_id\": \"source\", \"revision\": \"r1\", \"lineage_id\": \"lineage\", \"origin\": {\"kind\": \"development\"}, \"content_sha256\": \"2efee32c38ef260eb3666a7557b378937848d9fad22c17306154f154b8c3bace\"}], \"recall\": {\"trace_ref\": \"recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"item_ref\": \"recall-item-v1:0\"}}}]} }"
+          },
+          {
+            "type": "text",
+            "text": "metrics"
+          },
+          {
+            "type": "image",
+            "data": "development-only",
+            "mimeType": "image/png"
+          }
+        ],
+        "isError": false
+      },
+      "text_blocks": [
+        {
+          "content_index": 0,
+          "text": "warning"
+        },
+        {
+          "content_index": 1,
+          "text": "{ \"canonical\" : {\"note\":\"café\\u0020safe\"},\n \"advisory_provider_memory\" : {\"provider_id\": \"development.provider\", \"registration_revision\": 1, \"recall_trace\": {\"trace_ref\": \"recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"request_id\": \"actual-host-request\"}, \"canonical_history_replay\": {\"delivery_scope\": {\"project\": \"development\", \"session\": \"s\"}}, \"lane_notice\": \"Provider words remain inside the charged presentation.\", \"candidates\": [{\"candidate_id\": \"host.alias.survivor\", \"content\": \"Use café mode.\", \"provenance\": \"Canonical observer source\", \"explanation\": \"Use café mode. Metadata must also be reviewed.\", \"provenance_evidence\": {\"sources\": [{\"source_id\": \"source\", \"revision\": \"r1\", \"lineage_id\": \"lineage\", \"origin\": {\"kind\": \"development\"}, \"content_sha256\": \"2efee32c38ef260eb3666a7557b378937848d9fad22c17306154f154b8c3bace\"}], \"recall\": {\"trace_ref\": \"recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"item_ref\": \"recall-item-v1:0\"}}}]} }"
+        },
+        {
+          "content_index": 2,
+          "text": "metrics"
+        }
+      ],
+      "payload_content_index": 1,
+      "host_evidence": [
+        {
+          "kind": "json_member",
+          "pointer": "/canonical",
+          "value": {
+            "note": "café safe"
+          },
+          "authority": "canonical",
+          "section": "canonical_facts"
+        }
+      ],
+      "advisory": {
+        "kind": "json_member",
+        "pointer": "/advisory_provider_memory",
+        "value": {
+          "provider_id": "development.provider",
+          "registration_revision": 1,
+          "recall_trace": {
+            "trace_ref": "recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "request_id": "actual-host-request"
+          },
+          "canonical_history_replay": {
+            "delivery_scope": {
+              "project": "development",
+              "session": "s"
+            }
+          },
+          "lane_notice": "Provider words remain inside the charged presentation.",
+          "candidates": [
+            {
+              "candidate_id": "host.alias.survivor",
+              "content": "Use café mode.",
+              "provenance": "Canonical observer source",
+              "explanation": "Use café mode. Metadata must also be reviewed.",
+              "provenance_evidence": {
+                "sources": [
+                  {
+                    "source_id": "source",
+                    "revision": "r1",
+                    "lineage_id": "lineage",
+                    "origin": {
+                      "kind": "development"
+                    },
+                    "content_sha256": "2efee32c38ef260eb3666a7557b378937848d9fad22c17306154f154b8c3bace"
+                  }
+                ],
+                "recall": {
+                  "trace_ref": "recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "item_ref": "recall-item-v1:0"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "text_blocks": [
+      {
+        "content_index": 0,
+        "text": "warning",
+        "sha256": "4bd9354bb652233497a0f42647464b81b83a83654fcf1511263a5d0120d74c91",
+        "utf8_bytes": 7,
+        "tokens": 1
+      },
+      {
+        "content_index": 1,
+        "text": "{ \"canonical\" : {\"note\":\"café\\u0020safe\"},\n \"advisory_provider_memory\" : {\"provider_id\": \"development.provider\", \"registration_revision\": 1, \"recall_trace\": {\"trace_ref\": \"recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"request_id\": \"actual-host-request\"}, \"canonical_history_replay\": {\"delivery_scope\": {\"project\": \"development\", \"session\": \"s\"}}, \"lane_notice\": \"Provider words remain inside the charged presentation.\", \"candidates\": [{\"candidate_id\": \"host.alias.survivor\", \"content\": \"Use café mode.\", \"provenance\": \"Canonical observer source\", \"explanation\": \"Use café mode. Metadata must also be reviewed.\", \"provenance_evidence\": {\"sources\": [{\"source_id\": \"source\", \"revision\": \"r1\", \"lineage_id\": \"lineage\", \"origin\": {\"kind\": \"development\"}, \"content_sha256\": \"2efee32c38ef260eb3666a7557b378937848d9fad22c17306154f154b8c3bace\"}], \"recall\": {\"trace_ref\": \"recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"item_ref\": \"recall-item-v1:0\"}}}]} }",
+        "sha256": "3587b8b0ec2ac52344945d79d21e787baebc6a0229219051c0f96ca2a82679b6",
+        "utf8_bytes": 1154,
+        "tokens": 73
+      },
+      {
+        "content_index": 2,
+        "text": "metrics",
+        "sha256": "177a7ea3611fe6b138557deaf44941614b66c0ece1766308044c8b65c8ba2123",
+        "utf8_bytes": 7,
+        "tokens": 1
+      }
+    ],
+    "canonical_spans": [
+      {
+        "content_index": 1,
+        "pointer": "/canonical",
+        "start": 2,
+        "end": 42,
+        "sha256": "37352e8553f742d022e9d73de5d50b43d107f8073d7014834210d63631069a47",
+        "value": {
+          "note": "café safe"
+        },
+        "source_refs": [
+          "canonical-source"
+        ],
+        "authority": "canonical",
+        "section": "canonical_facts",
+        "text": "\"canonical\" : {\"note\":\"café\\u0020safe\"}"
+      }
+    ],
+    "canonical_sha256": "37352e8553f742d022e9d73de5d50b43d107f8073d7014834210d63631069a47",
+    "advisory_spans": [
+      {
+        "content_index": 0,
+        "attribution": "unclassified_text",
+        "pointer": null,
+        "start": 0,
+        "end": 7,
+        "sha256": "4bd9354bb652233497a0f42647464b81b83a83654fcf1511263a5d0120d74c91",
+        "value": "warning"
+      },
+      {
+        "content_index": 1,
+        "attribution": "observed_advisory_member",
+        "pointer": "/advisory_provider_memory",
+        "start": 45,
+        "end": 1152,
+        "sha256": "162d1a4c4c482a7b0ed7d88a3d75ec6f0b2d2811be0c0e5bd3fbd9b024527230",
+        "value": {
+          "provider_id": "development.provider",
+          "registration_revision": 1,
+          "recall_trace": {
+            "trace_ref": "recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "request_id": "actual-host-request"
+          },
+          "canonical_history_replay": {
+            "delivery_scope": {
+              "project": "development",
+              "session": "s"
+            }
+          },
+          "lane_notice": "Provider words remain inside the charged presentation.",
+          "candidates": [
+            {
+              "candidate_id": "host.alias.survivor",
+              "content": "Use café mode.",
+              "provenance": "Canonical observer source",
+              "explanation": "Use café mode. Metadata must also be reviewed.",
+              "provenance_evidence": {
+                "sources": [
+                  {
+                    "source_id": "source",
+                    "revision": "r1",
+                    "lineage_id": "lineage",
+                    "origin": {
+                      "kind": "development"
+                    },
+                    "content_sha256": "2efee32c38ef260eb3666a7557b378937848d9fad22c17306154f154b8c3bace"
+                  }
+                ],
+                "recall": {
+                  "trace_ref": "recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "item_ref": "recall-item-v1:0"
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "content_index": 2,
+        "attribution": "unclassified_text",
+        "pointer": null,
+        "start": 0,
+        "end": 7,
+        "sha256": "177a7ea3611fe6b138557deaf44941614b66c0ece1766308044c8b65c8ba2123",
+        "value": "metrics"
+      }
+    ],
+    "advisory_blocks": [
+      {
+        "content_index": 0,
+        "text": "warning",
+        "sha256": "4bd9354bb652233497a0f42647464b81b83a83654fcf1511263a5d0120d74c91",
+        "tokens": 1
+      },
+      {
+        "content_index": 1,
+        "text": "\"advisory_provider_memory\" : {\"provider_id\": \"development.provider\", \"registration_revision\": 1, \"recall_trace\": {\"trace_ref\": \"recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"request_id\": \"actual-host-request\"}, \"canonical_history_replay\": {\"delivery_scope\": {\"project\": \"development\", \"session\": \"s\"}}, \"lane_notice\": \"Provider words remain inside the charged presentation.\", \"candidates\": [{\"candidate_id\": \"host.alias.survivor\", \"content\": \"Use café mode.\", \"provenance\": \"Canonical observer source\", \"explanation\": \"Use café mode. Metadata must also be reviewed.\", \"provenance_evidence\": {\"sources\": [{\"source_id\": \"source\", \"revision\": \"r1\", \"lineage_id\": \"lineage\", \"origin\": {\"kind\": \"development\"}, \"content_sha256\": \"2efee32c38ef260eb3666a7557b378937848d9fad22c17306154f154b8c3bace\"}], \"recall\": {\"trace_ref\": \"recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"item_ref\": \"recall-item-v1:0\"}}}]}",
+        "sha256": "162d1a4c4c482a7b0ed7d88a3d75ec6f0b2d2811be0c0e5bd3fbd9b024527230",
+        "tokens": 70
+      },
+      {
+        "content_index": 2,
+        "text": "metrics",
+        "sha256": "177a7ea3611fe6b138557deaf44941614b66c0ece1766308044c8b65c8ba2123",
+        "tokens": 1
+      }
+    ],
+    "advisory_review_sha256": "8f57aec11166485db4ede803a3881734e911a7ac2b0e88714ba76d9f8156edf9",
+    "final_tokens": 75,
+    "canonical_tokens": 3,
+    "advisory_tokens": 72,
+    "candidate_body_tokens": 1,
+    "candidates": [
+      {
+        "candidate_ref": "original-provider-id",
+        "content": "Use café mode.",
+        "content_sha256": "2efee32c38ef260eb3666a7557b378937848d9fad22c17306154f154b8c3bace",
+        "sources": [
+          {
+            "source_id": "source",
+            "revision": "r1",
+            "lineage_id": "lineage",
+            "origin": {
+              "kind": "development"
+            },
+            "content_sha256": "2efee32c38ef260eb3666a7557b378937848d9fad22c17306154f154b8c3bace"
+          }
+        ],
+        "scope_match": true,
+        "provenance": "available",
+        "presentation_span": {
+          "pointer": "/advisory_provider_memory/candidates/0",
+          "start": 539,
+          "end": 1150,
+          "sha256": "02db1f960c1a3a1c9681210ad450fdcc579ed2b6279c1758aecbed985b01d1c3",
+          "value": {
+            "candidate_id": "host.alias.survivor",
+            "content": "Use café mode.",
+            "provenance": "Canonical observer source",
+            "explanation": "Use café mode. Metadata must also be reviewed.",
+            "provenance_evidence": {
+              "sources": [
+                {
+                  "source_id": "source",
+                  "revision": "r1",
+                  "lineage_id": "lineage",
+                  "origin": {
+                    "kind": "development"
+                  },
+                  "content_sha256": "2efee32c38ef260eb3666a7557b378937848d9fad22c17306154f154b8c3bace"
+                }
+              ],
+              "recall": {
+                "trace_ref": "recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "item_ref": "recall-item-v1:0"
+              }
+            }
+          }
+        },
+        "presentation_sha256": "02db1f960c1a3a1c9681210ad450fdcc579ed2b6279c1758aecbed985b01d1c3",
+        "final_join": {
+          "status": "bound",
+          "trace_ref": "recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "item_ref": "recall-item-v1:0",
+          "provider_rank": 0,
+          "retained_candidate_id": "original-provider-id",
+          "compiled_stage": "injected"
+        },
+        "candidate": {
+          "request_id": "q",
+          "candidate_ref": "original-provider-id",
+          "label": "useful",
+          "provenance": "available",
+          "scope_match": true,
+          "contains_forgotten_source": false
+        },
+        "source_ids": [
+          "source"
+        ],
+        "required_fact_refs": [
+          "q/required_facts/0"
+        ],
+        "annotation_reason": "development source-grounded review",
+        "annotation_presentation_sha256": "02db1f960c1a3a1c9681210ad450fdcc579ed2b6279c1758aecbed985b01d1c3",
+        "annotation_advisory_review_sha256": "8f57aec11166485db4ede803a3881734e911a7ac2b0e88714ba76d9f8156edf9",
+        "presentation_review": {
+          "candidate_metadata": true,
+          "shared_text": true,
+          "source_attribution": true,
+          "prohibited_claims": true
+        },
+        "prohibited_claims_absent": true
+      }
+    ],
+    "retained_trace": {
+      "status": "observed",
+      "artifact": {
+        "artifact_path": "development-only/trace",
+        "utf8": "{\"trace_id\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"request_id\": \"actual-host-request\", \"provider_id\": \"development.provider\", \"registration_revision\": 1, \"requested_count\": 1, \"degraded\": false, \"items\": [{\"candidate_id\": \"original-provider-id\", \"provider_rank\": 0, \"stage\": \"injected\", \"host_reason_code\": \"injected\", \"host_decision\": {\"decision\": \"injected\"}, \"tokens\": 5}], \"token_summary\": null}",
+        "byte_length": 430,
+        "sha256": "190aae79f55b677bfe77c6a24d75020e704fb9c73bf83c568c458e158af83445"
+      },
+      "correlation": {
+        "trace_ref": "recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "request_id": "actual-host-request"
+      },
+      "provider_id": "development.provider",
+      "registration_revision": 1,
+      "delivery_scope": {
+        "project": "development",
+        "session": "s"
+      },
+      "store_evidence": {
+        "id": "observed"
+      },
+      "daemon_identity": {
+        "pid": 101,
+        "process_run_id": "development"
+      }
+    },
+    "model_input_tokens": {
+      "status": "unmeasured",
+      "reason": "No complete model API boundary observed."
+    }
+  }
+}

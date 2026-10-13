@@ -71,6 +71,7 @@ pub use session::{
     WorkflowQueryModeV1, WorkflowRunV1, WorkflowStatusV1, WorkflowsResultV1,
 };
 
+use crate::retained_surfaces::ProviderControlResultV1;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -138,6 +139,7 @@ pub enum RetainedSurfaceResultV1 {
     FactStoreList(FactStoreListResultV1),
     FactFeedback(FactFeedbackResultV1),
     MemoryStatus(MemoryStatusResultV1),
+    ProviderControl(ProviderControlResultV1),
     SessionRefreshStatus(SessionRefreshStatusResultV1),
     SessionRefreshCancel(SessionRefreshCancelResultV1),
     SessionRefreshBegin(SessionRefreshBeginResultV1),
@@ -177,6 +179,23 @@ impl RetainedSurfaceResultV1 {
             Operation::FactStoreList => Self::FactStoreList(from_value(value)?),
             Operation::FactFeedback => Self::FactFeedback(from_value(value)?),
             Operation::MemoryStatus => Self::MemoryStatus(from_value(value)?),
+            Operation::ProviderFeedback
+            | Operation::ProviderCorrection
+            | Operation::ProviderDeleteBySource
+            | Operation::ProviderHealth
+            | Operation::ProviderInspection
+            | Operation::ProviderMaintenance
+            | Operation::ProviderSnapshotExport
+            | Operation::ProviderSnapshotRestore
+            | Operation::ProviderReplay => {
+                let result: ProviderControlResultV1 = from_value(value)?;
+                if result.operation() != operation {
+                    return Err(serde::de::Error::custom(
+                        "provider-control result names a different operation",
+                    ));
+                }
+                Self::ProviderControl(result)
+            }
             Operation::SessionRefreshStatus => Self::SessionRefreshStatus(from_value(value)?),
             Operation::SessionRefreshCancel => Self::SessionRefreshCancel(from_value(value)?),
             Operation::SessionRefreshBegin => Self::SessionRefreshBegin(from_value(value)?),

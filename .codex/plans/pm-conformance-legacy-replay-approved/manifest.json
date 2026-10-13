@@ -1,0 +1,32 @@
+{
+  "approved_legacy_patch_sha256": "f2c7c11c1592ea45a486778d0265a79a4726e7a96d6fb204db0f8428fae9efec",
+  "approved_replay_patch_sha256": "d9b88db96a3804474661c7f3a2f89f8f205f3b3f8eb5d44041b0aeb5a0cbc4f3",
+  "files": [
+    {
+      "path": "crates/tracedecay/src/daemon/retained_owner/native_common_factory_tests.rs",
+      "baseline_sha256": "b692c0250d167b83564966065dee796d88f31b2d62a6d109c8b2b3ab48880ffd",
+      "candidate_sha256": "09bae1acb3612d4713439b50bbe5e336d03eb31bc90d57c473030f380983bac3"
+    },
+    {
+      "path": "crates/tracedecay-memory-conformance/src/compatibility/legacy.rs",
+      "baseline_sha256": null,
+      "candidate_sha256": "c253482b9047755cd12838e5739bdfd82c4ea81719e01f41ce4fb21c2f772c21"
+    },
+    {
+      "path": "crates/tracedecay-memory-conformance/src/compatibility.rs",
+      "baseline_sha256": "7f02e6573c79011592262546b14f9034c50ffc0dadea61332c627f62b399cab3",
+      "candidate_sha256": "9fe2c03d2153af5caab881418c8b283ca323820415695e6aad95a4f07de217d4"
+    },
+    {
+      "path": "crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs",
+      "baseline_sha256": "a046cbeb76a54719aca02b9aa6d2668a99c0b3d6155ba599d5cc1c6185481045",
+      "candidate_sha256": "16b69239f0e1f63ec7d8bf6b7449c3996c1b685205aefafd16e95da719bd5ea4"
+    },
+    {
+      "path": "product/contracts/memory-provider-v1/common-advisory-profile.md",
+      "baseline_sha256": "edd90fa7d217200071b3062220a39d31380f5077348faac566f477cfb1d67a14",
+      "candidate_sha256": "eac0e7b018ccf9c54fb6d4349b5a598f6f723b73a04546aee8c771853a0fe3a3"
+    }
+  ],
+  "combined_patch_sha256": "8a19e3c85123367a28898894b9591aa8445cef79ee4580d76821799a4135ce97"
+}

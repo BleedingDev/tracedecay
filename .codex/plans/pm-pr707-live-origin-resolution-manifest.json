@@ -1,0 +1,20 @@
+{
+  "head": "42aee2dee05862a8693d3d2da0588c40860cf94d",
+  "merge_head": "fc77acecabe1982203dfa6849c7a3d2f10000ff0",
+  "files": {
+    "crates/tracedecay-agent-hosts/src/hooks/daemon_ports.rs": "8a61e43c619bb16f4ef6715d41308aacc3f7873e75640749bdda6863375a62bc",
+    "crates/tracedecay-agent-hosts/src/hooks/dispatch.rs": "a2f351ea72a5d5acd9032c9cac55bf15f1606b4327803de39a5fc92f2d6abc59",
+    "crates/tracedecay-cli/src/hook_capture_cmd.rs": "987bc1d067c15506eae6a3e5232fd0b8c29c7ba9ee6915810f1b7edec4c86355",
+    "crates/tracedecay-hooks/src/capture.rs": "965e85b54ed4669185fc8fcf4652619de149a2f5928d23f01e6b67f743afdbf2",
+    "crates/tracedecay-hooks/src/capture_tests.rs": "3619975b8dc7e662caefbde75d120f6e80c35000c1f0b23cb86da84c8b0501e7",
+    "crates/tracedecay-sessions/src/runtime/store_access/transcript.rs": "d5e85f112b88ae2f8cd6a2fff03d7b7cecaceb38a45843a21d7cb6271aba4c74"
+  },
+  "checks": [
+    "Owned conflict markers removed",
+    "Direct rustfmt --check edition2024 skip_children=true passed for six files",
+    "Scoped git diff --check passed",
+    "All capture API callsites located; CLI and capture tests use Duration",
+    "No Cargo, tests, git add or commit"
+  ],
+  "api_adaptation": "capture_native_event_with_delivery_writer final argument is Duration, measured independently from each spool lock attempt. No replay-only compatibility API restored."
+}

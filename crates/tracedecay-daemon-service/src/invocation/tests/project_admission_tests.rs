@@ -1,7 +1,15 @@
 //! Project-runtime request admission and quiescence coverage.
 
 use super::*;
+use tracedecay_contracts::{
+    ConfigurationGetRequestV1, ConfigurationMutationReceipt, ConfigurationSetRequestV1,
+    ResolvedSetting,
+};
 use tracedecay_daemon_protocol::GitReadSurfaceRequest;
+use tracedecay_domain::configuration::{
+    CodeIndexWorkerSelectionV1, ConfigurationValueV1, SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY,
+    SettingKey,
+};
 use tracedecay_tool_catalog::ApplicationSurfaceOperation;
 
 #[test]
@@ -488,6 +496,240 @@ async fn same_authority_routes_alias_one_retained_runtime() {
         matches!(foreign, Err(TraceDecayError::Config { ref message })
             if message == "a different retained runtime is already registered for this project"),
         "a foreign authorized scope must still be refused, not aliased: {foreign:?}"
+    );
+}
+
+#[tokio::test]
+async fn configuration_remains_callable_after_publication_failure() {
+    if tracedecay_code_index_runtime::parallelism::installed_worker_status().is_none() {
+        let resident_memory =
+            tracedecay_runtime_core::resident_memory::ProcessResidentMemoryV1::new(
+                tracedecay_runtime_core::resident_memory::DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1,
+            );
+        let budget = resident_memory.snapshot();
+        tracedecay_code_index_runtime::parallelism::install_worker_plan(
+            CodeIndexWorkerSelectionV1::Automatic {},
+            budget.limit_bytes.saturating_sub(budget.used_bytes),
+        )
+        .expect("install canonical worker authority before configuration registration");
+    }
+    let profile = tempfile::TempDir::new().expect("profile directory");
+    let directory = tempfile::TempDir::new().expect("project directory");
+    let project_root = directory
+        .path()
+        .canonicalize()
+        .expect("canonical project root");
+    let profile_root = profile
+        .path()
+        .canonicalize()
+        .expect("canonical profile root");
+    let project_id = ProjectId::new("project.configuration.failed").expect("project id");
+    let database = tracedecay_global_db::tests::harness::RegisteredGlobalDbTestRuntime::project(
+        &profile_root,
+        &project_root,
+        project_id.clone(),
+    )
+    .await
+    .expect("registered configuration store");
+    let profile_id = database
+        .profile_database()
+        .binding()
+        .shard_id
+        .profile_id
+        .clone();
+    let layout = tracedecay_runtime_core::storage::profile_sharded_layout(
+        &project_root,
+        &profile_root,
+        project_id.as_str(),
+    )
+    .expect("registered project layout");
+    let opened = tracedecay_project::config::open_runtime_configuration_for_registered_database(
+        &project_root,
+        &layout,
+        database.project_database_arc().expect("project database"),
+    )
+    .await
+    .expect("persist canonical project configuration");
+    let (_, opened) = opened.into_parts();
+    let (configuration, _) =
+        ProjectConfigurationRuntime::open(opened).expect("configuration runtime");
+    let configuration = Arc::new(configuration);
+    let scope =
+        tracedecay_code_index_runtime::resolved_scope_for_project(&project_root, &project_id)
+            .expect("canonical project scope");
+    let service = DaemonInvocationService::default();
+    let observed_at = now_micros();
+    let deadline = Deadline::new(UtcMicros(observed_at.0 + 30_000_000)).expect("deadline");
+    DaemonConfigurationRuntimeRegistrar::new(&service)
+        .register(
+            project_root.clone(),
+            Arc::clone(&configuration),
+            scope.clone(),
+            profile_id,
+            ActorId::new("actor.configuration.failed").expect("actor"),
+            deadline.expires_at,
+            None,
+            canonical_sha256(&"configuration.failed.policy").expect("policy digest"),
+        )
+        .await
+        .expect("register retained configuration owner");
+    assert!(
+        configuration
+            .observed_runtime_configuration()
+            .await
+            .expect("observed activation")
+            .is_none(),
+        "registering configuration authority must not claim full runtime activation"
+    );
+    let publication = service
+        .project_runtimes
+        .begin_publication(&project_root)
+        .expect("begin full owner publication");
+    assert!(
+        service
+            .project_runtimes
+            .mark_publication_failed(&publication)
+    );
+    let registry = Arc::new(Mutex::new(LspSessionRegistry::default()));
+    let request = |id: &str, operation, body| {
+        DaemonInvocationRequest::configuration(
+            id,
+            operation,
+            body,
+            observed_at,
+            deadline.clone(),
+            CancellationContext::active(format!("cancel.{id}")).expect("cancellation"),
+        )
+        .with_resolved_scope(Some(scope.clone()))
+        .expect("resolved project scope")
+    };
+    let read = |response: DaemonInvocationResponse| -> ResolvedSetting {
+        match response.outcome {
+            DaemonInvocationOutcome::Configuration {
+                outcome: ApplicationOutcome::Evidence(packet),
+                ..
+            } => serde_json::from_value(packet.payload.expect("configuration evidence"))
+                .expect("resolved setting"),
+            other => panic!("expected configuration evidence, got {other:?}"),
+        }
+    };
+    let key = SettingKey::new(SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY).expect("setting key");
+    let get = |id: &str| {
+        request(
+            id,
+            ApplicationSurfaceOperation::ConfigurationGet,
+            ConfigurationWireRequestV1::Get(ConfigurationGetRequestV1 { key: key.clone() }),
+        )
+    };
+    let before = read(
+        service
+            .invoke(
+                &registry,
+                Some(&project_root),
+                None,
+                None,
+                None,
+                get("request.configuration.failed.before"),
+            )
+            .await,
+    );
+    let ConfigurationValueV1::Unsigned(original) = before.effective_value else {
+        panic!("watch debounce must be an unsigned setting");
+    };
+    let desired = ConfigurationValueV1::Unsigned(original.checked_add(1).expect("fixture value"));
+    let set = |id: &str, value| {
+        request(
+            id,
+            ApplicationSurfaceOperation::ConfigurationSet,
+            ConfigurationWireRequestV1::Set(ConfigurationSetRequestV1 {
+                layer: ConfigurationLayerIdV1::Project {
+                    project_id: project_id.clone(),
+                },
+                key: key.clone(),
+                value,
+                expected_revision: before.revision_id.clone(),
+                idempotency_key: ConfigurationIdempotencyKey::new(id).expect("idempotency key"),
+            }),
+        )
+    };
+    let committed = service
+        .invoke(
+            &registry,
+            Some(&project_root),
+            None,
+            None,
+            None,
+            set("request.configuration.failed.commit", desired.clone()),
+        )
+        .await;
+    let receipt: ConfigurationMutationReceipt = match committed.outcome {
+        DaemonInvocationOutcome::Configuration {
+            outcome: ApplicationOutcome::Effect(effect),
+            ..
+        } => serde_json::from_value(effect.payload.expect("configuration receipt"))
+            .expect("typed mutation receipt"),
+        other => panic!("expected committed configuration effect, got {other:?}"),
+    };
+    assert_eq!(receipt.base_revision_id, before.revision_id);
+    assert_ne!(receipt.result_revision_id, before.revision_id);
+    let conflict = application_problem_from(
+        service
+            .invoke(
+                &registry,
+                Some(&project_root),
+                None,
+                None,
+                None,
+                set(
+                    "request.configuration.failed.stale",
+                    ConfigurationValueV1::Unsigned(original),
+                ),
+            )
+            .await,
+    );
+    assert_eq!(conflict.kind(), ApplicationProblemKind::Conflict);
+    let after = read(
+        service
+            .invoke(
+                &registry,
+                Some(&project_root),
+                None,
+                None,
+                None,
+                get("request.configuration.failed.after"),
+            )
+            .await,
+    );
+    assert_eq!(after.effective_value, desired);
+    assert_eq!(after.revision_id, receipt.result_revision_id);
+    assert!(
+        configuration
+            .observed_runtime_configuration()
+            .await
+            .expect("observed activation")
+            .is_none()
+    );
+    for request in [
+        memory_status_request("request.configuration.failed.memory"),
+        storage_status_request("request.configuration.failed.storage"),
+    ] {
+        let problem = application_problem_from(
+            service
+                .invoke(&registry, Some(&project_root), None, None, None, request)
+                .await,
+        );
+        assert_eq!(problem.kind(), ApplicationProblemKind::ExecutionFailed);
+        assert_eq!(problem.retry(), RetryDirective::Never);
+        assert_eq!(
+            problem
+                .diagnostic()
+                .map(|diagnostic| diagnostic.code.as_str()),
+            Some("application.runtime.owner_failed")
+        );
+    }
+    assert_eq!(
+        service.project_runtimes.publication_state(&project_root),
+        Some(ProjectRuntimePublicationStateV1::Failed)
     );
 }
 

@@ -1,0 +1,7 @@
+{
+  "file": "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs",
+  "patch": ".codex/plans/pm-session-bootstrap-scope-import.patch",
+  "sha256": "19bdea5c2b349f8686e1c02e664315219961734e12ec9ad06f309058817d8a84",
+  "baseline_sha256": "85c48f34fcfea7cec3a260aac0fbdedfec5ede9a9a7a1fc08611d828c9b56495",
+  "proposed_sha256": "69bd173052a82191782657a3e4760f3266fbe93d972fce6c7c56d5d1eec163d2"
+}

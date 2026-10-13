@@ -1878,6 +1878,8 @@ async fn catch_up_codex_project_rollout(
     admission: &MemoryHostAdmission,
     max_new_bytes: u64,
 ) {
+    tracedecay_runtime_core::storage::pin_fixture_repository_identity(project_root, "project-a")
+        .unwrap();
     for _ in 0..4_096 {
         let pass = try_admit_codex_jsonl_observations_for_project_with_admission(
             path,
@@ -1997,6 +1999,8 @@ async fn batch_refusal_reuses_pre_context_switch_frames() {
     let project_b = temp.path().join("project-b");
     std::fs::create_dir_all(&project_a).unwrap();
     std::fs::create_dir_all(&project_b).unwrap();
+    tracedecay_runtime_core::storage::pin_fixture_repository_identity(&project_a, "project-a")
+        .unwrap();
     let path = temp.path().join("context-switch.jsonl");
     let lines = [
         json!({

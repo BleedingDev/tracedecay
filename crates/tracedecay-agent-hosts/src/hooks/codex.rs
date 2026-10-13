@@ -257,9 +257,9 @@ pub async fn hook_codex_post_tool_use(runtime: &HookRuntimeV1) -> i32 {
 /// Codex `PostCompact` hook handler.
 ///
 /// Codex exposes a pressure boundary but no authenticated compacted payload.
-/// The daemon lands the session's rollout through the canonical transcript
-/// ingest route and then runs the daemon-owned compression journey; the hook
-/// itself only forwards the boundary and fails open.
+/// The daemon admits one canonical window for the current session and leaves
+/// summary convergence to its background owner. The hook forwards the boundary
+/// and fails open.
 #[tracing::instrument(name = "hosts.hooks.codex.post_compact", level = "trace", skip_all)]
 pub async fn hook_codex_post_compact(runtime: &HookRuntimeV1) -> i32 {
     let event = read_hook_event!(

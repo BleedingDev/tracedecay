@@ -3,9 +3,11 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tracedecay_contracts::ApplicationProblemRecord;
+pub use tracedecay_daemon_protocol::application_surface::{
+    decode_primitive_request, decode_selector_request, require_object_args,
+};
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{
     CursorBindingMismatchV1, CursorBindingV1, decode_bound_cursor, encode_bound_cursor,
@@ -134,59 +136,6 @@ pub fn tool_json(response_handle_root: Option<&Path>, args: &Value, value: &Valu
 /// The single rejection every dispatch family returns for a name it does not own.
 pub fn unknown_tool_error(tool_name: &str) -> TraceDecayError {
     TraceDecayError::project_route("unknown_tool", false, format!("unknown tool: {tool_name}"))
-}
-
-/// Rejects tool arguments that are not a JSON object.
-pub fn require_object_args(args: &Value, tool_name: &str) -> Result<()> {
-    if args.is_object() {
-        return Ok(());
-    }
-    Err(TraceDecayError::Config {
-        message: format!("invalid arguments: {tool_name} expects a JSON object"),
-    })
-}
-
-/// Decode one catalog-owned primitive request after removing keys owned by
-/// the MCP transport rather than the application operation. The session and
-/// thread keys are host route identity: the server routes the call by them
-/// before dispatch, so they never belong to the request body.
-pub fn decode_primitive_request<T: DeserializeOwned>(args: &Value, tool_name: &str) -> Result<T> {
-    decode_request_without(args, tool_name, &["project_selector"])
-}
-
-/// [`decode_primitive_request`] for a request whose own contract names a
-/// registered project through `project_selector`, so routing never consumed
-/// it.
-pub fn decode_selector_request<T: DeserializeOwned>(args: &Value, tool_name: &str) -> Result<T> {
-    decode_request_without(args, tool_name, &[])
-}
-
-fn decode_request_without<T: DeserializeOwned>(
-    args: &Value,
-    tool_name: &str,
-    routed_keys: &[&str],
-) -> Result<T> {
-    require_object_args(args, tool_name)?;
-    let mut request = args.clone();
-    if let Some(object) = request.as_object_mut() {
-        for key in [
-            "format",
-            "__mcp_request_id",
-            "_meta",
-            "session_id",
-            "sessionId",
-            "thread_id",
-            "threadId",
-        ]
-        .iter()
-        .chain(routed_keys)
-        {
-            object.remove(*key);
-        }
-    }
-    serde_json::from_value(request).map_err(|error| TraceDecayError::Config {
-        message: format!("invalid arguments for {tool_name}: {error}"),
-    })
 }
 
 /// Rejects a zero result limit with a typed error.

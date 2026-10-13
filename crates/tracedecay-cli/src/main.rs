@@ -38,6 +38,7 @@ mod hook_cmd;
 mod lsp_cmd;
 mod macos_codesign;
 mod monitor_cmd;
+mod ncm_cmd;
 mod process_allocator;
 mod product_runtime;
 mod project_cmd;
@@ -882,6 +883,7 @@ enum CommandFamily {
     Project,
     Runtime,
     Agent,
+    Ncm,
     Hook,
     Update,
     Configuration,
@@ -895,6 +897,7 @@ impl CommandFamily {
             Self::Project => "project",
             Self::Runtime => "runtime",
             Self::Agent => "agent",
+            Self::Ncm => "ncm",
             Self::Hook => "hook",
             Self::Update => "update",
             Self::Configuration => "configuration",
@@ -914,6 +917,7 @@ impl CommandFamily {
             | Commands::Storage { .. }
             | Commands::Wipe { .. }
             | Commands::List { .. } => Self::Project,
+            Commands::Ncm { .. } => Self::Ncm,
             Commands::Tool { .. }
             | Commands::Work { .. }
             | Commands::Workflow { .. }
@@ -1053,6 +1057,17 @@ fn validate_host_bundle_options(
         }
         return Ok(());
     }
+    // The opt-in NCM worker lifecycle takes `--yes` for confirmed changes and
+    // owns no host component, preview, or adoption.
+    if matches!(family, CommandFamily::Ncm) {
+        if host_bundle.component.is_some() || host_bundle.dry_run || host_bundle.adopt {
+            return Err(tracedecay_domain::errors::TraceDecayError::Config {
+                message: "ncm accepts --yes for confirmed lifecycle changes; --component, --dry-run, and --adopt are only valid with agent lifecycle commands"
+                    .to_string(),
+            });
+        }
+        return Ok(());
+    }
     // `--component`, `--dry-run`, and `--yes` are declared as global flags so
     // clap accepts them before the subcommand is known, but they are only
     // meaningful for the agent-lifecycle commands. Enforcing that scope here
@@ -1108,6 +1123,10 @@ async fn dispatch_command(
         CommandFamily::Agent => dispatch_agent_command(profile, command, host_bundle)
             .await
             .map(lifecycle_command_outcome),
+        CommandFamily::Ncm => {
+            dispatch_ncm_command(profile, command, host_bundle.yes).await?;
+            Ok(CommandOutcome::Success)
+        }
         CommandFamily::Hook => dispatch_hook_command(profile, command).await,
         CommandFamily::Update => dispatch_update_command(profile, command)
             .await
@@ -1122,6 +1141,17 @@ async fn dispatch_command(
             Ok(CommandOutcome::Success)
         }
     }
+}
+
+async fn dispatch_ncm_command(
+    profile: &ProfileRoot,
+    command: Commands,
+    assume_yes: bool,
+) -> tracedecay_domain::errors::Result<()> {
+    let Commands::Ncm { action } = command else {
+        unreachable!("non-NCM command passed to NCM dispatcher");
+    };
+    ncm_cmd::handle_ncm_action(profile, action, assume_yes).await
 }
 
 async fn dispatch_project_command(
@@ -1903,7 +1933,7 @@ enum CommandStartupPolicy {
 
 impl CommandStartupPolicy {
     fn for_command(command: &Commands) -> Self {
-        if hook_capture_cmd::is_native_hook_command(command) {
+        if CommandFamily::for_command(command) == CommandFamily::Hook {
             return Self::SkipAll;
         }
 
@@ -1942,7 +1972,8 @@ impl CommandStartupPolicy {
             | Commands::Wipe { .. }
             | Commands::Projects { .. }
             | Commands::Daemon { .. }
-            | Commands::Serve { .. } => Self::SkipAll,
+            | Commands::Serve { .. }
+            | Commands::Ncm { .. } => Self::SkipAll,
             // Inspection-only commands retain ordinary startup maintenance but
             // do not need the unrelated agent-install health check.
             Commands::CurrentCounter { .. }

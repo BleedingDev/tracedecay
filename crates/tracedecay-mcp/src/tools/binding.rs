@@ -164,6 +164,15 @@ fn application_surface_branch_sensitivity(
         | ApplicationSurfaceOperation::FactStoreList
         | ApplicationSurfaceOperation::FactFeedback
         | ApplicationSurfaceOperation::MemoryStatus
+        | ApplicationSurfaceOperation::ProviderFeedback
+        | ApplicationSurfaceOperation::ProviderCorrection
+        | ApplicationSurfaceOperation::ProviderDeleteBySource
+        | ApplicationSurfaceOperation::ProviderHealth
+        | ApplicationSurfaceOperation::ProviderInspection
+        | ApplicationSurfaceOperation::ProviderMaintenance
+        | ApplicationSurfaceOperation::ProviderSnapshotExport
+        | ApplicationSurfaceOperation::ProviderSnapshotRestore
+        | ApplicationSurfaceOperation::ProviderReplay
         | ApplicationSurfaceOperation::SessionRefreshStatus
         | ApplicationSurfaceOperation::SessionRefreshCancel
         | ApplicationSurfaceOperation::SessionRefreshBegin
@@ -351,6 +360,12 @@ const BINDING_GROUPS: &[BindingGroup] = binding_groups![
         "tracedecay_multi_root_execute"],
     [None, RegisteredProjectAccess::SelectorOnly, "tracedecay_fact_feedback"],
     [None, RegisteredProjectAccess::SelectorOnly, "tracedecay_project_context"],
+    [None, RegisteredProjectAccess::ActiveProjectOnly,
+        "tracedecay_provider_feedback", "tracedecay_provider_correction",
+        "tracedecay_provider_delete_by_source", "tracedecay_provider_health",
+        "tracedecay_provider_inspection", "tracedecay_provider_maintenance",
+        "tracedecay_provider_snapshot_export", "tracedecay_provider_snapshot_restore",
+        "tracedecay_provider_replay"],
     [None, RegisteredProjectAccess::ActiveProjectOnly,
         "tracedecay_lcm_describe", "tracedecay_lcm_doctor", "tracedecay_lcm_expand", "tracedecay_lcm_expand_query",
         "tracedecay_lcm_grep", "tracedecay_lcm_load_session", "tracedecay_lcm_status",
@@ -766,6 +781,12 @@ fn verified_effect_journey(tool_name: &str) -> bool {
             | "tracedecay_fact_store_remove"
             | "tracedecay_fact_store_supersede"
             | "tracedecay_fact_feedback"
+            | "tracedecay_provider_feedback"
+            | "tracedecay_provider_correction"
+            | "tracedecay_provider_delete_by_source"
+            | "tracedecay_provider_maintenance"
+            | "tracedecay_provider_snapshot_restore"
+            | "tracedecay_provider_replay"
             | "tracedecay_session_refresh_begin"
             | "tracedecay_session_refresh_cancel"
             | "tracedecay_configuration_set"
@@ -1231,6 +1252,17 @@ mod tests {
         ("tracedecay_fact_store_list", BranchSensitivity::Independent),
         ("tracedecay_fact_store_supersede", BranchSensitivity::Independent),
         ("tracedecay_fact_feedback", BranchSensitivity::Independent),
+        // Provider controls resolve retained namespace and source authority;
+        // they do not read the checkout or code graph.
+        ("tracedecay_provider_feedback", BranchSensitivity::Independent),
+        ("tracedecay_provider_correction", BranchSensitivity::Independent),
+        ("tracedecay_provider_delete_by_source", BranchSensitivity::Independent),
+        ("tracedecay_provider_health", BranchSensitivity::Independent),
+        ("tracedecay_provider_inspection", BranchSensitivity::Independent),
+        ("tracedecay_provider_maintenance", BranchSensitivity::Independent),
+        ("tracedecay_provider_snapshot_export", BranchSensitivity::Independent),
+        ("tracedecay_provider_snapshot_restore", BranchSensitivity::Independent),
+        ("tracedecay_provider_replay", BranchSensitivity::Independent),
         ("tracedecay_memory_status", BranchSensitivity::Independent),
         ("tracedecay_session_refresh_status", BranchSensitivity::Independent),
         ("tracedecay_session_refresh_cancel", BranchSensitivity::Independent),

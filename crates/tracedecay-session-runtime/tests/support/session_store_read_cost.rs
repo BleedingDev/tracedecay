@@ -401,6 +401,31 @@ pub async fn probe_drain_after_wal_restart(
     padding: &mut SessionCursor,
     timestamp: i64,
 ) -> u64 {
+    advance_wal_to_next_generation(facade, fixture, padding, timestamp).await;
+    let (project, scope) = (fixture.project.as_path(), fixture.scope());
+    let database = fixture
+        .runtime
+        .registered_database(HostAdmissionScope::Project)
+        .unwrap();
+    let checkpointed = writer_telemetry(database).wal.checkpointed_frames;
+    let read = probe_one_message(facade, project, &scope, probed, timestamp).await;
+    assert_eq!(
+        writer_telemetry(database).wal.checkpointed_frames,
+        checkpointed,
+        "the drain query comparison must not include a periodic checkpoint"
+    );
+    read
+}
+
+/// Advances the WAL through its ordinary checkpoint/reuse cycle before a
+/// query probe. An empty writer transaction orders after the writer's
+/// trailing automatic checkpoint without changing the WAL.
+pub async fn advance_wal_to_next_generation(
+    facade: &HostAdmissionFacade<'_>,
+    fixture: &DrainFixture,
+    padding: &mut SessionCursor,
+    timestamp: i64,
+) {
     let (project, scope) = (fixture.project.as_path(), fixture.scope());
     let wal = session_store_path(fixture).with_extension("db-wal");
     let sequence = wal_checkpoint_sequence(&wal);
@@ -425,14 +450,19 @@ pub async fn probe_drain_after_wal_restart(
         .runtime
         .registered_database(HostAdmissionScope::Project)
         .unwrap();
-    let checkpointed = writer_telemetry(database).wal.checkpointed_frames;
-    let read = probe_one_message(facade, project, &scope, probed, timestamp).await;
-    assert_eq!(
-        writer_telemetry(database).wal.checkpointed_frames,
-        checkpointed,
-        "the drain query comparison must not include a periodic checkpoint"
-    );
-    read
+    await_previous_writer_work(database).await;
+}
+
+/// A reader query can overlap the writer's trailing checkpoint. This SELECT
+/// and its empty commit use the authorized writer actor, so their reply
+/// proves that actor finished the preceding command's checkpoint.
+async fn await_previous_writer_work(database: &RegisteredGlobalDb) {
+    database
+        .writer_connection()
+        .unwrap()
+        .execute_batch("SELECT 1;")
+        .await
+        .unwrap();
 }
 
 /// Captures `messages_per_session` new messages on each of `sessions` without
@@ -726,8 +756,12 @@ pub async fn retention_writer_steps(database: &RegisteredGlobalDb) -> u64 {
     steps_after - steps_before
 }
 
-/// Runs one maintenance retention tick and returns the bytes the process read.
+/// Measures one retention tick between ordered writer round trips. A periodic WAL
+/// copy belongs to the preceding ingest, so a probe that includes one must
+/// fail rather than attribute the copy to retention's reads.
 pub async fn retention_tick_read_bytes(database: &RegisteredGlobalDb) -> u64 {
+    await_previous_writer_work(database).await;
+    let checkpointed = writer_telemetry(database).wal.checkpointed_frames;
     let before = process_read_bytes();
     let report = run_registered_store_retention(
         database,
@@ -737,5 +771,12 @@ pub async fn retention_tick_read_bytes(database: &RegisteredGlobalDb) -> u64 {
     )
     .await;
     assert!(report.succeeded(), "retention must succeed");
-    process_read_bytes() - before
+    let read = process_read_bytes() - before;
+    await_previous_writer_work(database).await;
+    assert_eq!(
+        writer_telemetry(database).wal.checkpointed_frames,
+        checkpointed,
+        "the retention query comparison must not include a periodic checkpoint"
+    );
+    read
 }

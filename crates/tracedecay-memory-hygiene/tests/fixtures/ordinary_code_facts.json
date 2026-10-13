@@ -1,0 +1,100 @@
+{
+  "description": "Ordinary code facts that must survive the admitted hygiene pipeline byte-identical. Every entry is durable knowledge a coding agent should be able to remember; anything here that starts being redacted or withheld is a false positive.",
+  "cases": [
+    {
+      "id": "git_commit_sha",
+      "why": "A 40-character git SHA is hex-only, so the entropy detector must not treat it as a token.",
+      "payload": { "note": "commit 3bc562b8a1f0d9e7c6b5a4d3e2f1a0b9c8d7e6f5 introduced the seam" }
+    },
+    {
+      "id": "sha256_test_vector",
+      "why": "A 64-character hex digest pinned in a test fixture is a durable fact.",
+      "payload": {
+        "note": "the empty-object canonical digest is 44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+      }
+    },
+    {
+      "id": "hex_constants",
+      "why": "Hexadecimal literals and colour tables are hex-only.",
+      "payload": { "note": "sentinels are 0xdeadbeefcafebabe and 0xfeedfacedeadbeef; the accent colour is #ff00aa" }
+    },
+    {
+      "id": "long_identifiers",
+      "why": "Long CamelCase and snake_case identifiers have no digit, so the entropy detector must stay quiet.",
+      "payload": {
+        "note": "CamelCaseIdentifiersAreFineEvenWhenLong",
+        "symbol": "compile_credential_patterns_for_observation_profile"
+      }
+    },
+    {
+      "id": "token_budget_metadata",
+      "why": "token_budget, token_count, and token_limit are on the sanitizer's safe-metadata allowlist.",
+      "payload": {
+        "note": "fn token_budget(limit: usize) -> TokenCount",
+        "token_budget": 4000,
+        "token_count": 128,
+        "token_limit": 8192
+      }
+    },
+    {
+      "id": "prose_using_the_word_secret",
+      "why": "The word 'secret' in prose is not a credential.",
+      "payload": { "note": "secret sauce of the planner is union-find over the candidate set" }
+    },
+    {
+      "id": "sk_test_prose",
+      "why": "A fixture-profile name that shares a credential prefix's letters but is not a token.",
+      "payload": { "note": "Use the sk-test fixture profile for dry runs" }
+    },
+    {
+      "id": "credential_prefix_identifiers",
+      "why": "Configuration keys, cloud regions, and package names can begin with issuer-like prefixes without carrying credential material.",
+      "payload": {
+        "npm_config_registry": "https://registry.npmjs.org/",
+        "npm_config_cache": ".cache/npm",
+        "npm_package_version": "1.2.3",
+        "hf_hub_download_timeout": 30,
+        "region": "ASIA_SOUTHEAST_1",
+        "package": "sk-learn-preprocessing"
+      }
+    },
+    {
+      "id": "documented_bind_address",
+      "why": "A documented default bind address is durable configuration knowledge, so the port class annotates rather than rewrites.",
+      "payload": { "note": "the dashboard binds 127.0.0.1:8080 by default" }
+    },
+    {
+      "id": "stable_temp_path",
+      "why": "A stable, non-instance temporary location is a durable fact about where scratch output goes.",
+      "payload": { "note": "scratch output goes under /tmp/cache" }
+    },
+    {
+      "id": "uuid",
+      "why": "A UUID is hex with hyphens and carries no entropy signal.",
+      "payload": { "note": "the fixture project id is 550e8400-e29b-41d4-a716-446655440000" }
+    },
+    {
+      "id": "package_manager_preference",
+      "why": "The canonical shape of a durable user preference.",
+      "payload": { "note": "Use pnpm rather than npm for installs in this repo" }
+    },
+    {
+      "id": "nested_structure",
+      "why": "Nesting, arrays, numbers, booleans, and nulls must all survive unchanged.",
+      "payload": {
+        "decision": {
+          "id": "adr-0007",
+          "accepted": true,
+          "supersedes": null,
+          "alternatives": ["one binary", "two binaries", "a daemon plus a thin client"],
+          "revision": 3
+        }
+      }
+    },
+    {
+      "id": "run_log_phrasing_in_prose",
+      "why": "Run-log phrasing inside a durable sentence annotates rather than rewrites.",
+      "payload": { "note": "the incremental pass finished in 12.4s on the reference machine" }
+    }
+  ]
+}

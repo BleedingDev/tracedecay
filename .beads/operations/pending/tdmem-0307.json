@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "attempt": 1,
+  "issue_id": "tdmem-0307",
+  "mode": "complete",
+  "actor": "assistant",
+  "claim_comment": "Closing the smallest provider composition mount only after the root default remains exactly production, memory-fabric is an explicit one-dependency feature, disabled resolution excludes every provider crate, enabled resolution reaches one product-owned registry, that registry constructs one finite fabric plus one Native adapter without side effects, and no concrete adapter type appears in host or public transport crates.",
+  "checks": [
+    {
+      "name": "focused default-off feature tests",
+      "argv": ["python3", "tests/product_memory_composition_feature_test.py"],
+      "timeout_seconds": 120
+    },
+    {
+      "name": "real default-off composition contract",
+      "argv": ["python3", "scripts/product/check-memory-composition-feature.py", "--repo", "."],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "real dependency direction remains valid",
+      "argv": ["python3", "scripts/product/check-memory-dependency-direction.py", "--repo", ".", "--policy", "product/architecture/memory-dependency-policy.json"],
+      "timeout_seconds": 300
+    },
+    {
+      "name": "workspace metadata remains locked",
+      "argv": ["cargo", "metadata", "--locked", "--format-version", "1", "--no-deps"],
+      "timeout_seconds": 300
+    },
+    {
+      "name": "provider registry formatting",
+      "argv": ["cargo", "fmt", "--package", "tracedecay-memory-provider-registry", "--", "--check"],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "provider registry strict Clippy",
+      "argv": ["cargo", "clippy", "-p", "tracedecay-memory-provider-registry", "--all-targets", "--locked", "--", "-D", "warnings"],
+      "timeout_seconds": 900
+    },
+    {
+      "name": "provider registry focused tests",
+      "argv": ["cargo", "test", "-p", "tracedecay-memory-provider-registry", "--locked"],
+      "timeout_seconds": 900
+    },
+    {
+      "name": "TraceDecay compiles without Memory Fabric",
+      "argv": ["cargo", "check", "-p", "tracedecay", "--lib", "--no-default-features", "--locked"],
+      "timeout_seconds": 1800
+    },
+    {
+      "name": "TraceDecay compiles with explicit Memory Fabric",
+      "argv": ["cargo", "check", "-p", "tracedecay", "--lib", "--no-default-features", "--features", "memory-fabric", "--locked"],
+      "timeout_seconds": 1800
+    },
+    {
+      "name": "provider API remains green",
+      "argv": ["cargo", "test", "-p", "tracedecay-memory-provider-api", "--locked"],
+      "timeout_seconds": 600
+    },
+    {
+      "name": "fabric remains green",
+      "argv": ["cargo", "test", "-p", "tracedecay-memory-fabric", "--locked"],
+      "timeout_seconds": 600
+    },
+    {
+      "name": "Native adapter remains green",
+      "argv": ["cargo", "test", "-p", "tracedecay-memory-provider-native", "--locked"],
+      "timeout_seconds": 600
+    },
+    {
+      "name": "canonical provider Rust bindings remain generated",
+      "argv": ["python3", "scripts/product/generate-memory-provider-rust.py", "--repo", ".", "--check"],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "upstream patch footprint remains valid",
+      "argv": ["python3", "scripts/product/check-patch-footprint-policy.py", "--repo", ".", "--policy", "product/upstream/patch-footprint-policy.json", "--map", "product/upstream/convergence-map.json"],
+      "timeout_seconds": 300
+    },
+    {
+      "name": "working tree has no whitespace damage",
+      "argv": ["git", "diff", "--check"],
+      "timeout_seconds": 60
+    }
+  ],
+  "acceptance_criteria": [
+    "Default build remains exactly the existing production feature graph and resolves no provider registry or adapter.",
+    "Explicit memory-fabric activation constructs one bounded MemoryFabric through one product-owned registry path and registers one Native adapter at an explicit revision and mode.",
+    "No concrete provider type or registry dependency leaks into host-specific integration, CLI, MCP, dashboard API, SDK, or any root source outside runtime_ports.rs.",
+    "Generated provider contracts remain the authority and all API, fabric, Native, dependency, and upstream-footprint gates remain green."
+  ],
+  "close_reason": "Added one explicit default-off Memory Fabric feature, one product-owned Native composition registry, and one thin root mount with machine-checked isolation and unchanged default behavior.",
+  "close_comment": "Evidence: tracedecay-memory-provider-registry depends only on the provider API, fabric, and Native adapter; compose_native_memory creates finite fabric limits, validates a positive registration revision, constructs NativeProvider behind Arc<dyn MemoryProvider>, and registers exactly one tracedecay.native provider without opening a store, starting a worker, reading environment/configuration, or handshaking. Root Cargo keeps default exactly [production], keeps production free of memory-fabric, and maps memory-fabric only to the optional registry dependency. runtime_ports.rs contains the sole feature-gated root delegate and names neither NativeProvider nor the Native crate. The focused verifier rejects default activation, non-optional wiring, concrete adapter imports, and registry leaks; dependency policy makes the registry the sole narrow concrete composition owner; disabled/enabled cargo-tree receipts are asserted during materialization; dedicated CI compiles both root graphs and tests the registry."
+}

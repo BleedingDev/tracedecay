@@ -15,7 +15,7 @@ use tracedecay_application::project_open_authorization::project_open_work_grant;
 use tracedecay_contracts::{
     ApplicationContractError, ResolvedScope, TemporalRetrievalPort, now_micros,
 };
-use tracedecay_domain::{ProjectId, UtcMicros, canonical_sha256};
+use tracedecay_domain::{ProjectId, UserProfileId, UtcMicros, canonical_sha256};
 
 use super::DaemonInvocationState;
 use crate::mcp::McpServer;
@@ -61,6 +61,48 @@ const LSP_DIAGNOSTICS_QUIET: Duration = Duration::from_secs(2);
 pub(super) use tracedecay_daemon_service::{
     LSP_WORKSPACE_CAPABILITY_ID_V1, LSP_WORKSPACE_USE_CASE_ID_V1,
 };
+
+/// Configuration owns its admitted shard independently of session and provider
+/// activation, so an unavailable Full owner can still be repaired through CAS.
+pub(super) async fn register_project_configuration_owner(
+    invocation: &DaemonInvocationState,
+    project_root: &Path,
+    graph: &tracedecay_project::project::TraceDecay,
+    scope: &ResolvedScope,
+    profile_id: &UserProfileId,
+) -> Result<()> {
+    let configuration = graph
+        .configuration_runtime()
+        .client()
+        .current()
+        .await
+        .map_err(|error| TraceDecayError::Config {
+            message: format!("project-open configuration currentness failed: {error}"),
+        })?;
+    let access =
+        daemon_owned_project_source_access_at(scope, project_root, &configuration, now_micros())
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("project-open configuration access denied: {error}"),
+            })?;
+    let policy_digest =
+        super::project_delivery_mount::project_configuration_policy_digest(scope, &access)?;
+    invocation
+        .configuration_runtime_registrar()
+        .register(
+            project_root.to_path_buf(),
+            Arc::clone(graph.configuration_runtime()),
+            scope.clone(),
+            profile_id.clone(),
+            access.requester,
+            access.grant_expires_at,
+            None,
+            policy_digest,
+        )
+        .await
+        .map_err(|error| TraceDecayError::Config {
+            message: format!("project-open configuration runtime registration failed: {error}"),
+        })
+}
 
 async fn install_project_open_source_edit_owners(
     server: &McpServer,
@@ -394,7 +436,6 @@ pub(super) async fn register_project_open_production_owners(
             .map_err(|error| TraceDecayError::Config {
             message: format!("project-open source access denied: {error}"),
         })?;
-    let grant_expires_at = access.grant_expires_at;
     let requester = access.requester.clone();
     let temporal = Arc::new(DaemonSessionLookupPrimitiveV1::new(
         server.project_session_application_retrieval_service(&access.scope)?,
@@ -450,27 +491,6 @@ pub(super) async fn register_project_open_production_owners(
             &access,
         )
         .await?;
-    let configuration_profile_id = server
-        .profile_identity()
-        .ok_or_else(|| TraceDecayError::Config {
-            message: "project-open configuration requires exact profile authority".to_owned(),
-        })?
-        .profile_id()
-        .clone();
-    tracing::Instrument::instrument(invocation.configuration_runtime_registrar().register(
-            project_root.to_path_buf(),
-            Arc::clone(graph.configuration_runtime()),
-            scope.clone(),
-            configuration_profile_id,
-            requester.clone(),
-            grant_expires_at,
-            None,
-            configuration_policy_digest.clone(),
-        ), tracing::trace_span!("daemon.project.open.owners.configuration"))
-    .await
-    .map_err(|error| TraceDecayError::Config {
-        message: format!("project-open configuration runtime registration failed: {error}"),
-    })?;
     let retained_observed_at = now_micros();
     let retained_grant =
         project_open_retained_grant(&access, retained_observed_at).map_err(|error| {
@@ -495,7 +515,7 @@ pub(super) async fn register_project_open_production_owners(
         message: format!("project-open retained runtime registration failed: {error}"),
     })?;
     // Mount the native-integration authority under the same pinned policy
-    // digest the configuration runtime just registered, so the coordinator's
+    // digest used by the core configuration owner, so the coordinator's
     // stale/denied predicates and the handler's minted grants agree on one
     // policy identity. Non-Git projects advertise no native mutation
     // authority; the handler keeps answering the typed unavailable result.
@@ -658,7 +678,7 @@ pub(super) async fn register_project_open_production_owners(
     tracing::info!(
         event = "project_open_owner_phase",
         project = %project_root.display(),
-        phase = "configuration_runtime_registered",
+        phase = "full_runtime_owners_registered",
         step_elapsed_ms = owner_phase_started.elapsed().as_millis(),
         elapsed_ms = owner_registration_started.elapsed().as_millis(),
     );

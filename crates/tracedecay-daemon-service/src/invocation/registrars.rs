@@ -896,111 +896,86 @@ impl DaemonConfigurationRuntimeRegistrar {
         policy_manifest_digest: ManifestDigest,
     ) -> Result<(), TraceDecayError> {
         self.ensure_worker_plan()?;
-        if self
-            .service
-            .project_runtimes
-            .holds::<RegisteredConfigurationRuntime>(&project_root)
-            .await
-        {
-            return Ok(());
-        }
         let policy_digest = AccessPolicyDigest::new(policy_manifest_digest.as_str().to_owned())
             .map_err(|error| TraceDecayError::Config {
                 message: format!("configuration policy authority is invalid: {error}"),
             })?;
-        let evidence = ScopeRevalidationEvidenceV1 {
-            resolved_scope_digest: scope.scope_digest.clone(),
-            membership_digest,
-            authorization_policy_digest: policy_digest.clone(),
-            policy_epoch: 1,
-        };
-        let current =
-            runtime
-                .client()
-                .current()
-                .await
-                .map_err(|error| TraceDecayError::Config {
-                    message: format!("configuration layer authority unavailable: {error}"),
-                })?;
-        let direct_layers = mounted_configuration_layers(
-            &runtime.configuration_target().project_id,
-            &profile_id,
-            current.snapshot(),
-        )
-        .map_err(|error| TraceDecayError::Config {
-            message: format!("configuration layer authority invalid: {error:?}"),
-        })?;
-        let grants = DaemonConfigurationGrantAuthority {
-            actor: actor.clone(),
-            policy_epoch: 1,
-            policy_digest,
-            expires_at,
-            direct_layers: Arc::new(direct_layers),
-            grants: Arc::new(RwLock::new(BTreeMap::new())),
-        };
-        let current = runtime.client().current().await.map_err(|error| {
-            TraceDecayError::Config {
-                message: format!(
-                    "configuration runtime activation could not read the current revision: {error}"
-                ),
-            }
-        })?;
-        runtime
-            .record_runtime_activation(Some(current.revision_id().clone()), None, now_micros())
-            .await
-            .map_err(|error| TraceDecayError::Config {
-                message: format!("configuration runtime activation could not be recorded: {error}"),
-            })?;
-        runtime.install_authorities(
-            Arc::new(DaemonConfigurationScopeResolution { actor, evidence }),
-            Arc::new(PolicyBackedConfigurationMutationAuthorization::new(
-                grants.clone(),
-            )),
-        )?;
-        let project_identity = InvocationProjectRuntimeIdentityV1::new(
-            profile_id,
-            scope.project_id.clone(),
-            project_root.clone(),
-        );
-        #[cfg(any(test, feature = "test-helpers"))]
-        let registration_return_pause = match self
-            .service
-            .take_configuration_runtime_registration_pause(&project_root)
-            .await
-        {
-            Some(pause) => {
-                let super::ConfigurationRuntimeRegistrationPauseV1 {
-                    before_registration,
-                    allow_registration,
-                    after_registration,
-                    allow_return,
-                    ..
-                } = pause;
-                let _ = before_registration.send(());
-                let _ = allow_registration.await;
-                Some((after_registration, allow_return))
-            }
-            None => None,
-        };
         self.service
             .project_runtimes
-            .publish(
+            .register_or_reconcile(
                 project_root.clone(),
-                RegisteredConfigurationRuntime {
-                    runtime,
-                    scope,
-                    project_identity,
-                    actor: grants.actor.clone(),
-                    grants,
-                    feedback_refresh: Arc::new(RwLock::new(None)),
+                |registered: &mut RegisteredConfigurationRuntime| {
+                    if registered.scope == scope
+                        && registered.actor == actor
+                        && registered.project_identity.profile_id() == &profile_id
+                        && registered
+                            .project_identity
+                            .matches_project_root(&project_root)
+                        && registered.runtime.registered_database().binding()
+                            == runtime.registered_database().binding()
+                        && registered.grants.policy_digest == policy_digest
+                    {
+                        Ok(())
+                    } else {
+                        Err(TraceDecayError::Config {
+                            message:
+                                "configuration runtime does not match the registered authority"
+                                    .to_owned(),
+                        })
+                    }
+                },
+                || async {
+                    let evidence = ScopeRevalidationEvidenceV1 {
+                        resolved_scope_digest: scope.scope_digest.clone(),
+                        membership_digest,
+                        authorization_policy_digest: policy_digest.clone(),
+                        policy_epoch: 1,
+                    };
+                    let current = runtime.client().current().await.map_err(|error| {
+                        TraceDecayError::Config {
+                            message: format!("configuration layer authority unavailable: {error}"),
+                        }
+                    })?;
+                    let direct_layers = mounted_configuration_layers(
+                        &runtime.configuration_target().project_id,
+                        &profile_id,
+                        current.snapshot(),
+                    )
+                    .map_err(|error| TraceDecayError::Config {
+                        message: format!("configuration layer authority invalid: {error:?}"),
+                    })?;
+                    let grants = DaemonConfigurationGrantAuthority {
+                        actor: actor.clone(),
+                        policy_epoch: 1,
+                        policy_digest: policy_digest.clone(),
+                        expires_at,
+                        direct_layers: Arc::new(direct_layers),
+                        grants: Arc::new(RwLock::new(BTreeMap::new())),
+                    };
+                    runtime.install_authorities(
+                        Arc::new(DaemonConfigurationScopeResolution {
+                            actor: actor.clone(),
+                            evidence,
+                        }),
+                        Arc::new(PolicyBackedConfigurationMutationAuthorization::new(
+                            grants.clone(),
+                        )),
+                    )?;
+                    Ok(RegisteredConfigurationRuntime {
+                        runtime: Arc::clone(&runtime),
+                        scope: scope.clone(),
+                        project_identity: InvocationProjectRuntimeIdentityV1::new(
+                            profile_id.clone(),
+                            scope.project_id.clone(),
+                            project_root.clone(),
+                        ),
+                        actor: actor.clone(),
+                        grants,
+                        feedback_refresh: Arc::new(RwLock::new(None)),
+                    })
                 },
             )
             .await?;
-        #[cfg(any(test, feature = "test-helpers"))]
-        if let Some((after_registration, allow_return)) = registration_return_pause {
-            let _ = after_registration.send(());
-            let _ = allow_return.await;
-        }
         Ok(())
     }
 
@@ -1246,6 +1221,26 @@ impl DaemonRetainedRuntimeRegistrar {
                 message: "retained runtime grant does not match its project authority".to_owned(),
             });
         }
+        #[cfg(any(test, feature = "test-helpers"))]
+        let registration_return_pause = match self
+            .service
+            .take_retained_runtime_registration_pause(&project_root)
+            .await
+        {
+            Some(pause) => {
+                let super::RetainedRuntimeRegistrationPauseV1 {
+                    before_registration,
+                    allow_registration,
+                    after_registration,
+                    allow_return,
+                    ..
+                } = pause;
+                let _ = before_registration.send(());
+                let _ = allow_registration.await;
+                Some((after_registration, allow_return))
+            }
+            None => None,
+        };
         self.service
             .project_runtimes
             .register_or_reconcile(
@@ -1270,7 +1265,13 @@ impl DaemonRetainedRuntimeRegistrar {
                     })
                 },
             )
-            .await
+            .await?;
+        #[cfg(any(test, feature = "test-helpers"))]
+        if let Some((after_registration, allow_return)) = registration_return_pause {
+            let _ = after_registration.send(());
+            let _ = allow_return.await;
+        }
+        Ok(())
     }
 }
 

@@ -19,12 +19,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--format", choices=("tar.gz", "zip"), required=True)
     parser.add_argument("--entry-name", required=True)
+    parser.add_argument(
+        "--companion",
+        action="append",
+        default=[],
+        metavar="SOURCE=ENTRY_NAME",
+        help="include a regular file with mode 0644, in declaration order",
+    )
     parser.add_argument("--epoch", type=int, required=True)
     return parser.parse_args()
 
 
 def validate_entry_name(entry_name: str) -> None:
-    if not entry_name or Path(entry_name).name != entry_name:
+    if (
+        not entry_name
+        or entry_name in {".", ".."}
+        or "/" in entry_name
+        or "\\" in entry_name
+        or "\0" in entry_name
+        or Path(entry_name).name != entry_name
+    ):
         raise ValueError("entry name must be a nonempty basename")
 
 
@@ -78,8 +92,8 @@ def write_zip(
 
 def read_entry(path: Path, entry_name: str, mode: int) -> tuple[str, bytes, int]:
     validate_entry_name(entry_name)
-    if not path.is_file():
-        raise FileNotFoundError(f"release input does not exist: {path}")
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise ValueError(f"release input must be a regular file, not a symlink: {path}")
     payload = path.read_bytes()
     if not payload:
         raise ValueError(f"release input is empty: {path}")
@@ -92,6 +106,16 @@ def main() -> None:
     if args.epoch < 0:
         raise ValueError("epoch must be nonnegative")
     entries = [read_entry(args.binary, args.entry_name, 0o755)]
+    entry_names = {args.entry_name}
+    for companion in args.companion:
+        source, separator, entry_name = companion.partition("=")
+        if not separator or not source:
+            raise ValueError("companion must name SOURCE=ENTRY_NAME")
+        validate_entry_name(entry_name)
+        if entry_name in entry_names:
+            raise ValueError(f"duplicate release entry name: {entry_name}")
+        entry_names.add(entry_name)
+        entries.append(read_entry(Path(source), entry_name, 0o644))
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     if args.format == "tar.gz":

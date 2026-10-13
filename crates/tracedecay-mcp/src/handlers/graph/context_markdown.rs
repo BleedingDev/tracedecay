@@ -21,13 +21,13 @@ use crate::tools::render::{self, Md, RankedRow, ranked_rows_md};
 use serde_json::Value;
 use tracedecay_code_index::graph_projection::CodeGraphSymbolSummaryV1;
 use tracedecay_contracts::retrieval::{
-    ContextCodeBlockV1, ContextExtensionPointV1, ContextLexicalAnchorV1, ContextPlanV1,
-    ContextRelatedOmissionV1, ContextResultV1, ContextRetrievalPlanV1, ContextSearchMatchV1,
-    ContextStageV1, PrimitiveSymbolLocationV1,
+    ContextCodeBlockV1, ContextExtensionPointV1, ContextLexicalAnchorV1,
+    ContextMemoryContributionV1, ContextPlanV1, ContextRelatedOmissionV1, ContextResultV1,
+    ContextRetrievalPlanV1, ContextSearchMatchV1, ContextStageV1, PrimitiveSymbolLocationV1,
 };
 use tracedecay_domain::RelationEdgeKindV1;
 use tracedecay_domain::code_intelligence::{NodeKind, Visibility};
-use tracedecay_domain::errors::Result;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_graph_query::VerifiedGraphQuery;
 
 use super::context_support::{context_markdown_lane_preview, insert_context_memory_section};
@@ -43,9 +43,17 @@ pub(crate) fn render_context(
     result: &ContextResultV1,
 ) -> Result<ToolResult> {
     let value = serde_json::to_value(result)?;
+    let contribution =
+        ContextMemoryContributionV1::from_canonical_result(result).map_err(|error| {
+            TraceDecayError::Config {
+                message: error.to_string(),
+            }
+        })?;
     if render::wants_json(args) {
         let text = render::finalize(response_handle_root, args, &value, String::new);
-        return Ok(text_tool_result(&text, Vec::new()));
+        return Ok(
+            text_tool_result(&text, Vec::new()).with_context_memory_contribution(contribution)
+        );
     }
     let mut output = freshness_lines(&result.freshness);
     output.push_str(&context_markdown(
@@ -69,6 +77,7 @@ pub(crate) fn render_context(
     insert_context_memory_section(
         &mut output,
         &result.memory_matches,
+        result.memory_temporal_coverage.as_ref(),
         result.memory_matches_error.as_deref(),
     );
     if let Some(plan) = &result.plan {
@@ -98,7 +107,7 @@ pub(crate) fn render_context(
     append_retrieval_budget_md(&mut output, &result.retrieval);
     let preview = context_markdown_lane_preview(&output);
     let text = render::markdown_preview_with_handle(response_handle_root, &output, &preview);
-    Ok(text_tool_result(&text, Vec::new()))
+    Ok(text_tool_result(&text, Vec::new()).with_context_memory_contribution(contribution))
 }
 
 fn context_markdown(

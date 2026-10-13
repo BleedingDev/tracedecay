@@ -1,7 +1,8 @@
-//! Writer-transaction counters for observation admission batching.
+//! Reader and writer work counters for observation admission batching.
 //!
-//! These tests count durable product transactions (`RuntimeTransactionScopeV1`
-//! rows in the rusqlite-runtime idempotency ledger), not elapsed time.
+//! These tests count snapshot queries and durable product transactions
+//! (`RuntimeTransactionScopeV1` rows in the rusqlite-runtime idempotency ledger),
+//! not elapsed time.
 
 use serde_json::json;
 use std::sync::Arc;
@@ -676,6 +677,62 @@ async fn persist_observations_dispatches_one_runtime_command_independent_of_batc
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn covered_duplicate_replay_reads_one_snapshot_independent_of_batch_size() {
+    let mut expected_snapshot_probes = None;
+    for count in [1, BATCH_SIZE, ABOVE_WRITER_COALESCING_LIMIT] {
+        let tmp = TempDir::new().unwrap();
+        let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
+            .await
+            .unwrap();
+        let store = runtime
+            .observation_store(HostAdmissionScope::Profile)
+            .unwrap();
+        initialize_writer_authority(&runtime, &store).await;
+        let session_id =
+            SessionId::new(format!("session.observation-batch.covered-replay.{count}")).unwrap();
+        let writes = sequential_writes(&session_id, count + 1);
+        let retained = store.persist_observations(writes.clone()).await.unwrap();
+        assert_eq!(retained.len(), writes.len());
+        let frontier = writes.last().unwrap().next_cursor().clone();
+        let before = writer_txn_census(&runtime).await;
+
+        let (outcomes, runtime_commands, snapshot_probes) =
+            persist_with_work_census(&store, writes[..count].to_vec()).await;
+
+        assert_eq!(outcomes.len(), count);
+        for (outcome, retained) in outcomes.iter().zip(&retained) {
+            assert!(matches!(
+                outcome.outcome(),
+                ObservationPersistOutcome::ExactDuplicate(_)
+            ));
+            assert_eq!(outcome.outcome().receipt(), retained.outcome().receipt());
+        }
+        assert_eq!(runtime_commands, 0);
+        assert_eq!(writer_txn_census(&runtime).await, before);
+        assert_eq!(
+            store
+                .get_source_cursor(frontier.source(), frontier.scope())
+                .await
+                .unwrap(),
+            Some(frontier)
+        );
+        match expected_snapshot_probes {
+            Some(expected) => assert_eq!(
+                snapshot_probes, expected,
+                "covered replay must not reload a suffix snapshot for each duplicate"
+            ),
+            None => {
+                assert!(
+                    snapshot_probes > 0,
+                    "the census must observe actual snapshot queries"
+                );
+                expected_snapshot_probes = Some(snapshot_probes);
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn persist_observations_partitions_large_windows_by_exact_admission_bytes() {
     let tmp = TempDir::new().unwrap();
     let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
@@ -846,6 +903,137 @@ async fn persist_observations_keeps_cursor_cas_collision_and_file_identity() {
         .expect("committed cursor");
     assert_eq!(cursor.file_identity(), Some(0xfeed_face));
     assert_eq!(cursor.resume_fingerprint(), Some(0xcafe_babe));
+}
+
+#[tokio::test]
+async fn retained_duplicate_rescan_restores_frontier_before_new_batch_records() {
+    let tmp = TempDir::new().unwrap();
+    let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
+        .await
+        .unwrap();
+    let store = runtime
+        .observation_store(HostAdmissionScope::Profile)
+        .unwrap();
+    let session_id = SessionId::new("session.observation-batch.lost-frontier").unwrap();
+    let writes = sequential_writes(&session_id, 5);
+    let retained = store
+        .persist_observations(writes[..2].to_vec())
+        .await
+        .unwrap();
+    let database = runtime
+        .registered_database(HostAdmissionScope::Profile)
+        .unwrap();
+    let transaction = database.begin_write_transaction().await.unwrap();
+    transaction
+        .execute("DELETE FROM source_cursors", ())
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    let stale_expected = ObservationSourceCursorV1::for_ordering(
+        writes[0].observation().source().clone(),
+        writes[0].observation().scope().clone(),
+        ObservationSourceGenerationV1::new(2).unwrap(),
+        ObservationOrderingDomainV1::FileBytes,
+        1,
+    )
+    .unwrap();
+    let stale = anchored_write(writes[0].observation().clone(), Some(stale_expected));
+    let before_denial = writer_txn_census(&runtime).await;
+    assert!(matches!(
+        store.persist_observation(stale).await.unwrap_err(),
+        ObservationStoreError::CursorConflict { .. }
+    ));
+    assert_eq!(writer_txn_census(&runtime).await, before_denial);
+    assert!(
+        store
+            .get_source_cursor(
+                writes[0].observation().source(),
+                writes[0].observation().scope()
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let recovered = store
+        .persist_observations(writes[..4].to_vec())
+        .await
+        .unwrap();
+    assert_eq!(recovered.len(), 4);
+    for index in 0..2 {
+        assert!(matches!(
+            recovered[index].outcome(),
+            ObservationPersistOutcome::ExactDuplicate(_)
+        ));
+        assert_eq!(
+            recovered[index].outcome().receipt(),
+            retained[index].outcome().receipt()
+        );
+    }
+    assert!(
+        recovered[2..].iter().all(|outcome| {
+            matches!(outcome.outcome(), ObservationPersistOutcome::Committed(_))
+        })
+    );
+    assert_eq!(
+        store
+            .get_source_cursor(
+                writes[0].observation().source(),
+                writes[0].observation().scope()
+            )
+            .await
+            .unwrap()
+            .as_ref(),
+        Some(writes[3].next_cursor())
+    );
+
+    // The new records pruned the repaired prefix's coverage rows. Losing
+    // the frontier again must replay its retained observations, rather than
+    // trust an earlier runtime receipt whose coverage is no longer present.
+    let transaction = database.begin_write_transaction().await.unwrap();
+    transaction
+        .execute("DELETE FROM source_cursors", ())
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    let recovered_again = store.persist_observations(writes.clone()).await.unwrap();
+    assert_eq!(recovered_again.len(), 5);
+    for index in 0..4 {
+        assert!(matches!(
+            recovered_again[index].outcome(),
+            ObservationPersistOutcome::ExactDuplicate(_)
+        ));
+        assert_eq!(
+            recovered_again[index].outcome().receipt(),
+            recovered[index].outcome().receipt()
+        );
+    }
+    assert!(matches!(
+        recovered_again[4].outcome(),
+        ObservationPersistOutcome::Committed(_)
+    ));
+    assert_eq!(
+        store
+            .get_source_cursor(
+                writes[0].observation().source(),
+                writes[0].observation().scope()
+            )
+            .await
+            .unwrap()
+            .as_ref(),
+        Some(writes[4].next_cursor())
+    );
+
+    let before_replay = writer_txn_census(&runtime).await;
+    let replay = store.persist_observations(writes).await.unwrap();
+    assert!(replay.iter().all(|outcome| {
+        matches!(
+            outcome.outcome(),
+            ObservationPersistOutcome::ExactDuplicate(_)
+        )
+    }));
+    assert_eq!(writer_txn_census(&runtime).await, before_replay);
 }
 
 #[tokio::test]

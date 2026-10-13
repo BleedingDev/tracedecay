@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "attempt": 1,
+  "issue_id": "tdmem-0106",
+  "mode": "complete",
+  "actor": "assistant",
+  "claim_comment": "Versioning and validating the foundational ADR set for provider boundary, authority, monorepo layout, execution-topology gate, persistence/recovery, context compilation, observer isolation, and upstream convergence.",
+  "checks": [
+    {
+      "name": "foundational ADR contract tests",
+      "argv": ["python3", "tests/product_foundational_adrs_test.py"],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "foundational ADR repository validation",
+      "argv": [
+        "python3",
+        "scripts/product/check-foundational-adrs.py",
+        "--repo",
+        ".",
+        "--manifest",
+        "product/architecture/adr/manifest.json",
+        "--issues",
+        ".beads/issues.jsonl"
+      ],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "upstream patch-footprint remains within policy",
+      "argv": [
+        "python3",
+        "scripts/product/check-patch-footprint-policy.py",
+        "--repo",
+        ".",
+        "--policy",
+        "product/upstream/patch-footprint-policy.json",
+        "--map",
+        "product/upstream/convergence-map.json"
+      ],
+      "timeout_seconds": 180
+    }
+  ],
+  "acceptance_criteria": [
+    "All foundational ADRs are versioned.",
+    "Rejected alternatives include direct ProjectMemoryFactStore implementation and provider-name branching.",
+    "Each decision points to executable verification beads."
+  ],
+  "close_reason": "Versioned and executable-validated the complete foundational ADR set, including a deliberate NCM topology decision gate and binding authority, isolation, recovery, context, and convergence invariants.",
+  "close_comment": "Evidence: product/architecture/adr/manifest.json indexes eight accepted foundational decisions. ADR-0001 through ADR-0008 cover the provider boundary, TraceDecay/Native authority, product-owned crate layout and dependency direction, topology-neutral lifecycle plus deferred NCM transport gate, bounded durable observation delivery and recovery, TraceDecay-owned deterministic context compilation, mechanical observer non-interference and explicit activation, and isolated upstream convergence trains. Every ADR includes context, decision, consequences, rejected alternatives, invariants, executable verification beads, and review triggers. scripts/product/check-foundational-adrs.py cross-checks document sections, required rejections, real Beads IDs, dependency order, M0 evidence authorities, and the deferred NCM gate; tests/product_foundational_adrs_test.py rejects missing decisions, duplicate IDs, weakened sections, unknown beads, omitted ProjectMemoryFactStore/provider-name rejections, premature NCM selection, forward dependencies, authority drift, and status drift."
+}

@@ -670,7 +670,7 @@ async fn tracedecay_context_rejects_malformed_requests() {
     .await;
     assert_rejected(
         &unknown,
-        "invalid arguments for tracedecay_context: unknown field `not_a_context_field`, expected one of `task`, `max_nodes`, `include_code`, `max_code_blocks`, `mode`, `include_memory`, `memory_limit`, `memory_min_trust`, `lexical_anchors`, `prefer_symbol`, `budget_tokens`",
+        "invalid arguments for tracedecay_context: unknown field `not_a_context_field`, expected one of `task`, `max_nodes`, `include_code`, `max_code_blocks`, `mode`, `include_memory`, `memory_limit`, `memory_min_trust`, `temporal_query`, `exclusions`, `lexical_anchors`, `prefer_symbol`, `budget_tokens`",
     );
 
     let mode = handle_real_server_tool_call_raw(

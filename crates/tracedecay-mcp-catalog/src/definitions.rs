@@ -12,9 +12,15 @@
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::LazyLock;
+#[cfg(test)]
+use tracedecay_contracts::RetainedSurfaceOperation;
 use tracedecay_tool_catalog::{
     ApplicationSurfaceOperation, CatalogValidationError, ExecutableBindingRegistryV1, OperationId,
     ScopeDimension,
+};
+#[cfg(test)]
+use tracedecay_tool_catalog::{
+    BindingSurface, CapabilityManifestV1, CatalogContributionV1, SurfaceBindingV1,
 };
 
 use crate::McpCatalogError;
@@ -549,6 +555,25 @@ fn spawn_definition_worker(
                 "failed to start {name} tool catalog worker: {error}"
             ))
         })
+}
+
+#[cfg(test)]
+fn retained_capability_for_operation(
+    contribution: &CatalogContributionV1,
+    operation: RetainedSurfaceOperation,
+) -> Option<&CapabilityManifestV1> {
+    let capability_id = contribution
+        .bindings()
+        .iter()
+        .find(|binding| {
+            binding.surface() == BindingSurface::Mcp
+                && binding.operation().as_str() == operation.as_str()
+        })
+        .map(SurfaceBindingV1::capability_id)?;
+    contribution
+        .capabilities()
+        .iter()
+        .find(|capability| capability.capability_id() == capability_id)
 }
 
 fn add_lcm_storage_scope_property(definitions: &mut [ToolDefinition]) {

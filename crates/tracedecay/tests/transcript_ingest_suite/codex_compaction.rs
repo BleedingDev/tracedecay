@@ -1,26 +1,39 @@
 //! Codex context-compaction ingestion and daemon-owned summary publication.
-//! Transcript reads retain exact native evidence; only the PostCompact effect
-//! may turn that evidence or an app-server result into an LCM summary node.
+//! PostCompact retains exact native evidence. The LCM owner publishes summaries
+//! through the configured app-server authority.
 
 #[cfg(unix)]
 use std::io::Write;
 #[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(unix)]
 use std::process::Stdio;
+#[cfg(unix)]
+use std::time::Duration;
 
 use tempfile::TempDir;
+#[cfg(unix)]
+use tracedecay_domain::ObservationScopeV1;
 use tracedecay_domain::ProjectId;
 #[cfg(unix)]
 use tracedecay_lcm::{
-    LcmContentSlice, LcmDescribeRequest, LcmDescribeTarget, LcmExpandRequest, LcmExpandTarget,
+    LcmCompressionRequest, LcmContentSlice, LcmDescribeRequest, LcmDescribeTarget,
+    LcmExpandRequest, LcmExpandTarget, LcmSummarizerMode,
 };
+#[cfg(unix)]
+use tracedecay_project::project::TraceDecayOpenOptions;
 use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_runtime_core::config::ProfileRoot;
 #[cfg(unix)]
 use tracedecay_runtime_core::test_executable::write_executable_script;
+#[cfg(unix)]
+use tracedecay_sessions::observation::ObservationCancellation;
+#[cfg(unix)]
+use tracedecay_sessions::runtime::hosts::codex::codex_observation_source_v2;
 use tracedecay_sessions::runtime::{SessionProvider, with_transcript_source_profile};
 
 #[cfg(unix)]
-use crate::common::{spawn_tracedecay_daemon, tracedecay_command_with_home};
+use crate::common::{TestChildProcess, spawn_tracedecay_daemon, tracedecay_command_with_home};
 #[cfg(unix)]
 use crate::restart_atomicity::mark_test_project;
 use crate::support::setup;
@@ -159,7 +172,7 @@ fn configure_codex_summarizer(
 
 #[cfg(unix)]
 #[tokio::test]
-async fn codex_post_compact_hook_commits_app_server_summary_through_daemon_effect() {
+async fn codex_post_compact_defers_summary_to_the_lcm_owner() {
     let tmp = TempDir::new().unwrap();
     let (home, project) = setup(&tmp);
     let profile = home.join(".tracedecay");
@@ -197,7 +210,7 @@ done
         .await
         .unwrap();
     drop(enrollment);
-    write_codex_rollout_with_compaction(&home, &project, "codex-compact");
+    let rollout = write_codex_rollout_with_compaction(&home, &project, "codex-compact");
 
     let daemon = spawn_tracedecay_daemon(&home);
     let event = serde_json::json!({
@@ -208,16 +221,20 @@ done
         "context_window_size": 128_000
     });
     let mut hook = tracedecay_command_with_home(&home);
-    let mut child = hook
+    let child = hook
         .arg("hook-codex-post-compact")
         .current_dir(&project)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
         .unwrap();
-    writeln!(child.stdin.take().unwrap(), "{event}").unwrap();
-    let output = child.wait_with_output().unwrap();
+    let mut child = TestChildProcess::new(child);
+    writeln!(child.stdin_mut().unwrap(), "{event}").unwrap();
+    let output = child
+        .wait_with_output(Duration::from_secs(5))
+        .expect("PostCompact must return within the host deadline");
     assert!(
         output.status.success(),
         "Codex PostCompact hook failed: {}",
@@ -225,14 +242,86 @@ done
     );
     assert!(
         !String::from_utf8_lossy(&output.stderr).contains("PostCompact daemon call failed"),
-        "the PostCompact hook must not fail open around the daemon effect: {}",
+        "the PostCompact hook must not fail open around canonical intake: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     drop(daemon);
 
-    let runtime = HostAdmissionTestRuntimeV1::project(&profile, &project, project_id)
+    let runtime = HostAdmissionTestRuntimeV1::project(&profile, &project, project_id.clone())
         .await
         .unwrap();
+
+    let source = codex_observation_source_v2("codex-compact").unwrap();
+    let cursor = runtime
+        .project_observation_source_cursor_for_test(&source)
+        .await
+        .unwrap()
+        .expect("PostCompact must durably admit its exact transcript window");
+    assert_eq!(
+        cursor.position(),
+        std::fs::metadata(&rollout).unwrap().len()
+    );
+
+    // PostCompact returns before projection settles. Drain its durable work
+    // after stopping the daemon, without rereading or admitting the rollout.
+    let drained = runtime
+        .facade()
+        .drain_projection_queue(
+            "codex",
+            &ObservationScopeV1::Project { project_id },
+            &ObservationCancellation::default(),
+            32,
+        )
+        .await
+        .unwrap();
+    assert!(!drained.deferred);
+
+    let status = runtime
+        .lcm_status_for_test("codex", Some("codex-compact"))
+        .await
+        .unwrap();
+    assert_eq!(status.raw_message_count, 4);
+
+    // The real background owner may settle before the daemon stops. Otherwise
+    // drive its canonical LCM effect explicitly, without requiring the host
+    // callback to wait for the configured app-server.
+    if status.summary_node_count == 0 {
+        let _configuration_project = runtime
+            .open_project_graph_read_only_for_test(
+                &project,
+                TraceDecayOpenOptions::for_profile(&ProfileRoot::new(&profile).with_home(&home)),
+            )
+            .await
+            .unwrap();
+        let compressed = runtime
+            .lcm_compress_for_test(LcmCompressionRequest {
+                provider: "codex".to_string(),
+                session_id: "codex-compact".to_string(),
+                messages: Vec::new(),
+                current_tokens: Some(124_000),
+                focus_topic: None,
+                ignore_session_patterns: Vec::new(),
+                stateless_session_patterns: Vec::new(),
+                ignore_message_patterns: Vec::new(),
+                expected_current_frontier_store_id: None,
+                threshold_tokens: None,
+                max_assembly_tokens: None,
+                leaf_chunk_tokens: None,
+                max_source_messages: None,
+                summary_fan_in: None,
+                incremental_max_depth: None,
+                fresh_tail_count: None,
+                dynamic_leaf_chunk_enabled: None,
+                dynamic_leaf_chunk_max: None,
+                context_length: Some(128_000),
+                reserve_tokens_floor: None,
+                summarizer: LcmSummarizerMode::HermesAuxiliary,
+            })
+            .await
+            .unwrap();
+        assert_eq!(compressed.status, "ok");
+        assert_eq!(compressed.summary_nodes_created, 1);
+    }
 
     let status = runtime
         .lcm_status_for_test("codex", Some("codex-compact"))

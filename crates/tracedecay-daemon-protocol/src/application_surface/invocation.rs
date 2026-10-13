@@ -999,6 +999,15 @@ pub fn application_surface_feedback_operation(
         | ApplicationSurfaceOperation::FactStoreList
         | ApplicationSurfaceOperation::FactFeedback
         | ApplicationSurfaceOperation::MemoryStatus
+        | ApplicationSurfaceOperation::ProviderFeedback
+        | ApplicationSurfaceOperation::ProviderCorrection
+        | ApplicationSurfaceOperation::ProviderDeleteBySource
+        | ApplicationSurfaceOperation::ProviderHealth
+        | ApplicationSurfaceOperation::ProviderInspection
+        | ApplicationSurfaceOperation::ProviderMaintenance
+        | ApplicationSurfaceOperation::ProviderSnapshotExport
+        | ApplicationSurfaceOperation::ProviderSnapshotRestore
+        | ApplicationSurfaceOperation::ProviderReplay
         | ApplicationSurfaceOperation::SessionRefreshStatus
         | ApplicationSurfaceOperation::SessionRefreshCancel
         | ApplicationSurfaceOperation::SessionRefreshBegin

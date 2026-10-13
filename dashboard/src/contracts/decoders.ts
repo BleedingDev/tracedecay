@@ -4114,7 +4114,7 @@ export const EffectReceiptSchema: z.ZodObject<{
 }).strict();
 
 /** Durable effect receipt terminal state. */
-export const EffectTerminationSchema: z.ZodEnum<{ "cancelled": "cancelled"; "completed": "completed"; "effect_unknown": "effect_unknown"; "failed": "failed"; "partial": "partial"; "timed_out": "timed_out" }> = z.enum(["cancelled", "completed", "effect_unknown", "failed", "partial", "timed_out"]);
+export const EffectTerminationSchema: z.ZodEnum<{ "cancelled": "cancelled"; "completed": "completed"; "effect_unknown": "effect_unknown"; "failed": "failed"; "no_change": "no_change"; "partial": "partial"; "timed_out": "timed_out" }> = z.enum(["cancelled", "completed", "effect_unknown", "failed", "no_change", "partial", "timed_out"]);
 
 export const EnvironmentSettingsPayloadV1Schema: z.ZodObject<{
   global_accounting_enabled: z.ZodType<boolean, unknown>;

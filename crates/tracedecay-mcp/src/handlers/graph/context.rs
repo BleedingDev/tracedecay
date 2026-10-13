@@ -14,7 +14,7 @@ use tracedecay_contracts::retrieval::{
     ContextResultV1, ContextRetrievalPlanV1, ContextRetrievalRouteV1, ContextSearchMatchV1,
     ContextStageV1, ContextSurfaceRequestV1, LexicalAnchorDropReasonV1, PrimitiveSymbolLocationV1,
 };
-use tracedecay_domain::errors::Result;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{
     ExactClass, MAX_CHUNK_TEXT_BYTES, RankedCandidate, RelationEdgeKindV1, RetrieverKind,
 };
@@ -522,6 +522,15 @@ where
     let deadline = ctx.deadline().cloned();
     let cancellation = ctx.cancellation().cloned();
     let request: ContextSurfaceRequestV1 = decode_primitive_request(&args, "tracedecay_context")?;
+    let admitted_at =
+        tracedecay_contracts::try_now_micros().map_err(|error| TraceDecayError::Config {
+            message: error.to_string(),
+        })?;
+    request
+        .validate_memory_policy_at(admitted_at)
+        .map_err(|error| TraceDecayError::Config {
+            message: error.to_string(),
+        })?;
     let task = request.task.as_str();
     let mode = request.mode.unwrap_or(ContextModeV1::Explore);
     let max_nodes = request
@@ -544,7 +553,7 @@ where
         .iter()
         .map(|anchor| anchor.as_str().to_owned())
         .collect();
-    let memory_options = context_memory_options(&args);
+    let memory_options = context_memory_options(&request);
     let memory_read_control =
         context_memory_read_control(&memory_options, deadline.as_ref(), cancellation.as_ref())?;
     // Graph enrichment is optional unless the caller asks for source bodies.
@@ -766,6 +775,7 @@ where
     let ContextMemoryOutcome {
         hits: memory_matches,
         graph_coverage: memory_graph_coverage,
+        temporal_coverage: memory_temporal_coverage,
         error: memory_matches_error,
     } = memory_outcome;
     let symbols = if let Some(hydrated) = search_hydration {
@@ -844,6 +854,7 @@ where
         coverage,
         memory_matches,
         memory_graph_coverage,
+        memory_temporal_coverage,
         memory_matches_error,
         verified_graph_evidence,
         plan,
@@ -881,7 +892,41 @@ where
 mod tests {
     use super::*;
     use serde_json::json;
-    use tracedecay_contracts::memory::FactSearchHitV1;
+    use tracedecay_contracts::memory::{CognitiveRecallTemporalQuery, FactSearchHitV1};
+    use tracedecay_domain::UtcMicros;
+
+    #[test]
+    fn historical_context_does_not_admit_current_fact_reads() {
+        let mut request: ContextSurfaceRequestV1 =
+            serde_json::from_value(json!({"task": "helper memory"})).unwrap();
+        let current = context_memory_options(&request);
+        assert!(context_memory_read_control(&current, None, None).is_err());
+
+        request.temporal_query =
+            Some(CognitiveRecallTemporalQuery::current(UtcMicros(100)).with_history());
+        let historical = context_memory_options(&request);
+        assert!(
+            context_memory_read_control(&historical, None, None)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            context_memory_stage(&historical, &[], None),
+            ContextStageV1::Unavailable
+        );
+
+        request.include_memory = Some(false);
+        let disabled = context_memory_options(&request);
+        assert!(
+            context_memory_read_control(&disabled, None, None)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            context_memory_stage(&disabled, &[], None),
+            ContextStageV1::NotRequested
+        );
+    }
 
     fn context_memory_hit(content: &str) -> FactSearchHitV1 {
         serde_json::from_value(json!({
@@ -984,7 +1029,7 @@ mod tests {
         let content = format!("{}tail-marker", "long memory body ".repeat(100));
         let hit = context_memory_hit(&content);
 
-        let Some(section) = context_memory_section(&[hit], None) else {
+        let Some(section) = context_memory_section(&[hit], None, None) else {
             panic!("memory hit should render");
         };
 

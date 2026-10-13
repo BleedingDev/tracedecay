@@ -441,9 +441,12 @@ async fn handle_branch_autotrack_action(
                 tracedecay_configuration::resolve_path(path),
             )
             .await?;
-            let expected_revision =
-                super::settings::current_configuration_revision(profile, &resolved.project_path)
-                    .await?;
+            let expected_revision = super::settings::current_configuration_revision(
+                profile,
+                &resolved.project_path,
+                tracedecay_domain::configuration::SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY,
+            )
+            .await?;
             let current_enabled = super::settings::current_project_setting(
                 profile,
                 &resolved.project_path,
@@ -510,9 +513,12 @@ async fn handle_branch_autotrack_action(
                 tracedecay_configuration::resolve_path(path),
             )
             .await?;
-            let expected_revision =
-                super::settings::current_configuration_revision(profile, &resolved.project_path)
-                    .await?;
+            let expected_revision = super::settings::current_configuration_revision(
+                profile,
+                &resolved.project_path,
+                tracedecay_domain::configuration::SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY,
+            )
+            .await?;
             let current = super::settings::current_project_setting(
                 profile,
                 &resolved.project_path,

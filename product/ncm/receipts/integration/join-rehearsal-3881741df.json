@@ -1,0 +1,80 @@
+{
+  "task": "ncm-rs-023",
+  "status": "rehearsal-only",
+  "claim": "No task 023 acceptance is claimed. HOST-STABLE has not been declared; 3881741df is the host branch head at rehearsal time, not an accepted tree.",
+  "rehearsal": {
+    "backend_head": "54bdf0c1c",
+    "host_head": "3881741df",
+    "merge": "git merge --no-edit 3881741df on a disposable worktree; result 0ff1903a3, no conflicts (one auto-merge in product/upstream/convergence-map.json)",
+    "disposable_worktree_removed": true
+  },
+  "backend_gate_on_joined_tree": {
+    "receipt": "backend-gate-on-rehearsal-join-0ff1903a3.json",
+    "status": "blocked",
+    "test_populations": [
+      [
+        "core_no_default",
+        {
+          "failed": 0,
+          "ignored": 0,
+          "passed": 85
+        }
+      ],
+      [
+        "runtime_no_default",
+        {
+          "failed": 0,
+          "ignored": 0,
+          "passed": 54
+        }
+      ],
+      [
+        "adapter_rust_backend",
+        {
+          "failed": 0,
+          "ignored": 1,
+          "passed": 80
+        }
+      ],
+      [
+        "real_embeddings",
+        {
+          "failed": 0,
+          "ignored": 0,
+          "passed": 4
+        }
+      ],
+      [
+        "isolated_text_journey",
+        {
+          "failed": 0,
+          "ignored": 0,
+          "passed": 1
+        }
+      ],
+      [
+        "adapter_real_encoder_population",
+        {
+          "failed": 0,
+          "ignored": 0,
+          "passed": 1
+        }
+      ]
+    ],
+    "journey": "pass",
+    "only_blocker": "allowed-path diff violations: the standalone gate fences the whole tree against base 25778c744 with tasks 001-022 ownership, so every host-branch change (retention, policy tests, sync policy) is reported; scoping that fence to the joined tree is task 023 step 4, not a backend defect."
+  },
+  "policy_checks_on_joined_tree": {
+    "check-memory-dependency-direction.py (real graph)": "memory dependency direction verified",
+    "tests/product_memory_dependency_direction_test.py": "27/27 OK with product/ncm/plan/join/023-direction-test-fixture.patch applied; 7 failures + 1 error without it (synthetic fixture does not know the backend crates or the second source contract)",
+    "tests/product_memory_dependency_policy_test.py": "OK (9)",
+    "tests/product_patch_footprint_policy_test.py": "fails as on the host head (floor advance pending); zero diagnostics mention NCM paths",
+    "tests/product_ncm_surface_audit_test.py": "OK (27)"
+  },
+  "still_gated": [
+    "HOST-STABLE declaration by the stabilization agent",
+    "Beads import of the ncm-biomem-rs.v1 work package",
+    "combined gate rerun on the accepted joined tree"
+  ],
+  "notes": "product/ncm/plan/join/023-join-notes.md"
+}

@@ -19,13 +19,15 @@ use tracedecay_domain::configuration::{
     ConfigurationAuditEventKindV1, ConfigurationCandidateV1, ConfigurationIdempotencyKey,
     ConfigurationLayerIdV1, ConfigurationReceiptId, ConfigurationRevisionId,
     ConfigurationSnapshotV1, ConfigurationValueV1, INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
-    LCM_SUMMARIZER_EXECUTABLES_SETTING_KEY, ProtectedChange, ProtectedChangePlan,
-    ProtectedChangeSnapshotError, RETIRED_CORE_SETTING_KEYS_V1, RedactedConfigurationChangeV1,
-    RollbackModeV1, RuleEffect, SOURCE_BINDINGS_SETTING_KEY,
-    SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY, ScopeControlOperationV1, SettingKey, SourceKindV1,
-    USER_CODE_INDEX_WORKERS_SETTING_KEY, USER_EXTRACTION_TIMEOUT_SECS_SETTING_KEY,
-    USER_REPEATED_QUERY_HINTS_SETTING_KEY, USER_UPLOAD_ENABLED_SETTING_KEY,
-    USER_WATCHER_DEBOUNCE_MS_SETTING_KEY, UserProfileId, WORK_TOPOLOGY_POLICY_SETTING_KEY,
+    LCM_SUMMARIZER_EXECUTABLES_SETTING_KEY, MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+    MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+    ProtectedChange, ProtectedChangePlan, ProtectedChangeSnapshotError,
+    RETIRED_CORE_SETTING_KEYS_V1, RedactedConfigurationChangeV1, RollbackModeV1, RuleEffect,
+    SOURCE_BINDINGS_SETTING_KEY, SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY, ScopeControlOperationV1,
+    SettingKey, SourceKindV1, USER_CODE_INDEX_WORKERS_SETTING_KEY,
+    USER_EXTRACTION_TIMEOUT_SECS_SETTING_KEY, USER_REPEATED_QUERY_HINTS_SETTING_KEY,
+    USER_UPLOAD_ENABLED_SETTING_KEY, USER_WATCHER_DEBOUNCE_MS_SETTING_KEY, UserProfileId,
+    WORK_TOPOLOGY_POLICY_SETTING_KEY,
 };
 use tracedecay_domain::{AccessPolicyDigest, ActorId, ManifestDigest, UtcMicros, canonical_sha256};
 #[cfg(test)]
@@ -363,6 +365,9 @@ impl<'db> GlobalDbConfigurationControlStore<'db> {
             &[
                 INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
                 LCM_SUMMARIZER_EXECUTABLES_SETTING_KEY,
+                MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+                MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+                MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
                 SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY,
             ],
             RETIRED_CORE_SETTING_KEYS_V1,

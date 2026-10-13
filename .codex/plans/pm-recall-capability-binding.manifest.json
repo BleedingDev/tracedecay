@@ -1,0 +1,25 @@
+{
+  "files": [
+    {
+      "path": "crates/tracedecay-memory-provider-registry/src/recall_admission.rs",
+      "before_sha256": "d8c0be4cb1e48b67d59a202e8d96318b248e0fc5c2846ecbda2daa6cdad6c2db",
+      "before_matches_index": true,
+      "after_sha256": "86b56cf85ff6a34cc8a02484614ffb7fd87adee68365d32c4023c5adc89f1c3a"
+    },
+    {
+      "path": "crates/tracedecay-memory-provider-registry/src/recall_port.rs",
+      "before_sha256": "7f8ae27a55a89bd53ee7aef94b1fa8167b858a1795b86e8d3ec416bddc4b45c2",
+      "before_matches_index": true,
+      "after_sha256": "045a9852df48c41f96ad348c1ad1a671b540dbcd3af2d013a8d37f1d0084cda9"
+    },
+    {
+      "path": "crates/tracedecay-memory-provider-registry/tests/recall_port.rs",
+      "before_sha256": "7077e6faaa5648bfda26170c0cad67586e359d0b5da8178e640224709e4f3906",
+      "before_matches_index": true,
+      "after_sha256": "f626c2cd0d255895a5e5e4e2e1e0d8cc3a66a7dd2a5091480c7210dd63eac0ba"
+    }
+  ],
+  "patch": ".codex/plans/pm-recall-capability-binding.patch",
+  "patch_sha256": "e582be7267fdfb3d528e5f3d33f27ec8ea173e47a6a7db57f90aeb49319deecd",
+  "rustfmt": "No new formatting differences; pre-existing indexed import/order and test wrapping left untouched."
+}

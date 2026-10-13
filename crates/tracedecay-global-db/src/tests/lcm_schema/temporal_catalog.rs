@@ -1,5 +1,13 @@
 use super::*;
 
+use tracedecay_runtime_core::db::TestRuntimeProfileIdentityV1;
+use tracedecay_runtime_core::db::engine::{QueryExecutor, Row};
+
+use crate::RegisteredGlobalDbOwnerV1;
+use crate::tests::harness::{
+    HostAdmissionScope, HostAdmissionTestRuntimeV1, seed_projected_messages,
+};
+
 #[tokio::test]
 async fn fresh_temporal_schema_stores_and_searches_a_summary_node() {
     let tmp = TempDir::new().unwrap();
@@ -316,24 +324,29 @@ async fn temporal_schema_root_retrieval_indexes_cover_catalog_and_large_query_sh
         (
             "session_occurrences",
             OCCURRENCE_ROOT_INDEX,
-            &["knowledge_at", "session_id", "occurrence_id", "generation"][..],
+            &[
+                ("knowledge_at", 1),
+                ("session_id", 0),
+                ("occurrence_id", 0),
+                ("generation", 0),
+            ][..],
             "idx_session_occurrences_root_",
         ),
         (
             "session_summary_nodes",
             SUMMARY_ROOT_INDEX,
-            &["created_at", "session_id", "summary_id"][..],
+            &[("created_at", 0), ("session_id", 0), ("summary_id", 0)][..],
             "idx_session_summary_nodes_root_",
         ),
     ] {
         let expected = expected_columns
             .iter()
-            .map(|column| ((*column).to_owned(), 0))
+            .map(|(column, descending)| ((*column).to_owned(), *descending))
             .collect::<Vec<_>>();
         assert_eq!(
             index_key_columns(&conn, index).await,
             expected,
-            "{index} must retain its exact ascending key contract"
+            "{index} must retain its exact key-order contract"
         );
 
         let index_names = table_index_names(&conn, table).await;
@@ -602,6 +615,276 @@ async fn temporal_schema_root_retrieval_indexes_cover_catalog_and_large_query_sh
             "EXPLAIN did not use {index} for {shape}: {details:?}"
         );
     }
+}
+
+async fn retained_root_index_rows(conn: &impl QueryExecutor) -> Vec<(&'static str, Vec<Row>)> {
+    let mut retained = Vec::new();
+    for (table, order) in [
+        ("observations", "observation_id"),
+        ("retrieval_anchors", "anchor_id"),
+        ("session_temporal_generations", "session_id, generation"),
+        (
+            "session_occurrences",
+            "session_id, generation, occurrence_id",
+        ),
+        ("source_cursors", "source_json, scope_json"),
+        ("session_temporal_resets", "session_id"),
+        ("session_query_cursor_keys", "key_version"),
+        ("session_relation_effect_journal", "session_id, generation"),
+        ("session_temporal_schema_migrations", "name"),
+    ] {
+        let mut rows = conn
+            .query(&format!("SELECT * FROM {table} ORDER BY {order}"), ())
+            .await
+            .unwrap();
+        let mut values = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            values.push(row);
+        }
+        retained.push((table, values));
+    }
+    retained
+}
+
+#[tokio::test]
+async fn temporal_schema_root_occurrence_index_rebuild_preserves_registered_state() {
+    let directory = TempDir::new().unwrap();
+    let runtime = HostAdmissionTestRuntimeV1::profile(directory.path())
+        .await
+        .unwrap();
+    let seeded = seed_projected_messages(&runtime, 0..3).await;
+    runtime
+        .session_temporal_store_for_test(HostAdmissionScope::Profile)
+        .unwrap()
+        .materialize_pending_session_refresh_for_test(
+            &tracedecay_domain::SessionId::new("session.audit-batch").unwrap(),
+        )
+        .await
+        .unwrap();
+    let database = runtime
+        .registered_database(HostAdmissionScope::Profile)
+        .unwrap();
+    let path = database.db_path().to_path_buf();
+    let binding = database.binding().clone();
+    let locator = database.verified_locator().clone();
+    let conn = database.writer_connection().unwrap();
+    tracedecay_session_temporal_store::request_session_temporal_reset(
+        &conn,
+        seeded[0].0.observation_id().as_str(),
+    )
+    .await
+    .unwrap();
+    let retained = retained_root_index_rows(&conn).await;
+    for table in [
+        "observations",
+        "retrieval_anchors",
+        "session_temporal_generations",
+        "session_occurrences",
+        "source_cursors",
+        "session_temporal_resets",
+    ] {
+        assert!(
+            retained
+                .iter()
+                .any(|(name, rows)| *name == table && !rows.is_empty()),
+            "the registered fixture must retain real {table} rows"
+        );
+    }
+    drop(runtime);
+
+    let old = TestConnection::open(&path);
+    old.execute_batch(
+        "DROP INDEX idx_session_occurrences_root_generation_order;
+         CREATE INDEX idx_session_occurrences_root_generation_order
+             ON session_occurrences(knowledge_at, session_id, occurrence_id, generation);",
+    )
+    .await
+    .unwrap();
+    let old_columns =
+        index_key_columns(&old, "idx_session_occurrences_root_generation_order").await;
+    assert!(old_columns.iter().all(|(_, descending)| *descending == 0));
+    drop(old);
+
+    let authority =
+        DatabaseAuthority::acquire_test(&path, "inspect root occurrence index").unwrap();
+    let fixture =
+        Database::publish_registered_test_runtime_with_retirement_control_for_profile_identity(
+            &path,
+            &authority,
+            TestDatabaseRuntimeMode::Existing,
+            TestRuntimeProfileIdentityV1::new(
+                binding.shard_id.brain_id.clone(),
+                binding.shard_id.profile_id.clone(),
+            ),
+            TestDatabaseRuntimeScope::ProfileSessions,
+        )
+        .await
+        .unwrap();
+    let (owner, inspection_runtime, inspection_retirement) = fixture.into_parts();
+    assert!(
+        RegisteredGlobalDbOwnerV1::attach_reset_refusal(&owner)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let inspected = TestConnection::open(&path);
+    assert_eq!(
+        index_key_columns(&inspected, "idx_session_occurrences_root_generation_order").await,
+        old_columns,
+        "rollback-only attach inspection must retain the ascending index"
+    );
+    assert_eq!(retained_root_index_rows(&inspected).await, retained);
+    drop(inspected);
+    drop(owner);
+    drop(inspection_runtime);
+    drop(inspection_retirement);
+    drop(authority);
+
+    let mut prior_epoch = binding.authority_epoch;
+    for _ in 0..2 {
+        let reopened = HostAdmissionTestRuntimeV1::profile(directory.path())
+            .await
+            .unwrap();
+        let database = reopened
+            .registered_database(HostAdmissionScope::Profile)
+            .unwrap();
+        assert_eq!(database.binding().shard_id, binding.shard_id);
+        assert_eq!(database.binding().incarnation, binding.incarnation);
+        assert_eq!(database.verified_locator(), &locator);
+        assert!(database.binding().authority_epoch > prior_epoch);
+        prior_epoch = database.binding().authority_epoch;
+        assert_eq!(
+            retained_root_index_rows(&database.read_connection()).await,
+            retained
+        );
+        let conn = TestConnection::open(&path);
+        assert_eq!(
+            index_key_columns(&conn, "idx_session_occurrences_root_generation_order").await,
+            old_columns
+                .iter()
+                .map(|(name, _)| (name.clone(), i64::from(name == "knowledge_at")))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            table_index_names(&conn, "session_occurrences")
+                .await
+                .into_iter()
+                .filter(|name| name.starts_with("idx_session_occurrences_root_"))
+                .collect::<Vec<_>>(),
+            ["idx_session_occurrences_root_generation_order".to_owned()]
+        );
+        drop(conn);
+        drop(reopened);
+    }
+}
+
+#[tokio::test]
+async fn temporal_schema_root_occurrence_index_rebuild_refuses_other_schema_drift() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("sessions.db");
+    drop(open_global_db(&path).await.unwrap());
+    let conn = TestConnection::open(&path);
+    conn.execute_batch(
+        "DROP INDEX idx_session_occurrences_root_generation_order;
+         CREATE INDEX idx_session_occurrences_root_generation_order
+             ON session_occurrences(knowledge_at, session_id, occurrence_id, generation);
+         DROP INDEX idx_session_occurrences_session_time;",
+    )
+    .await
+    .unwrap();
+    let columns = index_key_columns(&conn, "idx_session_occurrences_root_generation_order").await;
+    drop(conn);
+    let catalog = temporal_schema_object_catalog(&path).await;
+    let error = match open_global_db(&path).await {
+        Ok(_) => panic!("an ascending root index must not admit unrelated schema damage"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error
+            .reset_required_context()
+            .map(|(authority, _)| authority),
+        Some("session temporal")
+    );
+    assert_eq!(temporal_schema_object_catalog(&path).await, catalog);
+    let conn = TestConnection::open(&path);
+    assert_eq!(
+        index_key_columns(&conn, "idx_session_occurrences_root_generation_order").await,
+        columns
+    );
+}
+
+#[tokio::test]
+async fn temporal_schema_root_occurrence_index_rebuild_rolls_back_on_authority_drift() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("sessions.db");
+    drop(open_global_db(&path).await.unwrap());
+    let conn = TestConnection::open(&path);
+    conn.execute_batch(
+        "DROP INDEX idx_session_occurrences_root_generation_order;
+         CREATE INDEX idx_session_occurrences_root_generation_order
+             ON session_occurrences(knowledge_at, session_id, occurrence_id, generation);
+         CREATE INDEX idx_retrieval_anchors_unexpected ON retrieval_anchors(owner_json);",
+    )
+    .await
+    .unwrap();
+    let columns = index_key_columns(&conn, "idx_session_occurrences_root_generation_order").await;
+    let anchor_indexes = table_index_names(&conn, "retrieval_anchors").await;
+    drop(conn);
+    let catalog = temporal_schema_object_catalog(&path).await;
+    let error = match open_global_db(&path).await {
+        Ok(_) => panic!("the root index rebuild must roll back on unrelated authority drift"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error
+            .reset_required_context()
+            .map(|(authority, _)| authority),
+        Some("authority schema")
+    );
+    assert_eq!(temporal_schema_object_catalog(&path).await, catalog);
+    let conn = TestConnection::open(&path);
+    assert_eq!(
+        index_key_columns(&conn, "idx_session_occurrences_root_generation_order").await,
+        columns
+    );
+    assert_eq!(
+        table_index_names(&conn, "retrieval_anchors").await,
+        anchor_indexes
+    );
+}
+
+#[tokio::test]
+async fn temporal_schema_root_occurrence_index_rebuild_rejects_unreleased_key_orders() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("sessions.db");
+    drop(open_global_db(&path).await.unwrap());
+    let conn = TestConnection::open(&path);
+    conn.execute_batch(
+        "DROP INDEX idx_session_occurrences_root_generation_order;
+         CREATE INDEX idx_session_occurrences_root_generation_order
+             ON session_occurrences(knowledge_at, session_id, occurrence_id DESC, generation);",
+    )
+    .await
+    .unwrap();
+    let columns = index_key_columns(&conn, "idx_session_occurrences_root_generation_order").await;
+    drop(conn);
+    let catalog = temporal_schema_object_catalog(&path).await;
+    let error = match open_global_db(&path).await {
+        Ok(_) => panic!("an unreleased root index order must require reset"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error
+            .reset_required_context()
+            .map(|(authority, _)| authority),
+        Some("session temporal")
+    );
+    assert_eq!(temporal_schema_object_catalog(&path).await, catalog);
+    let conn = TestConnection::open(&path);
+    assert_eq!(
+        index_key_columns(&conn, "idx_session_occurrences_root_generation_order").await,
+        columns
+    );
 }
 
 #[tokio::test]

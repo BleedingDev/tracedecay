@@ -982,6 +982,9 @@ async fn install_registered_schema_stage_sequence(
             session_temporal_schema::install_session_temporal_schema(transaction).await?;
         }
         session_temporal_schema::SessionTemporalSchemaAdmission::Current => {}
+        session_temporal_schema::SessionTemporalSchemaAdmission::AscendingRootOccurrenceIndex => {
+            session_temporal_schema::rebuild_ascending_root_occurrence_index(transaction).await?;
+        }
     }
     let refused_authority = observation::ensure_observation_schema(transaction).await?;
     observation_projection::ensure_observation_projection_schema(transaction)
@@ -1027,7 +1030,11 @@ async fn install_registered_schema_stage_sequence(
     // them broken would fail every subsequent open of an otherwise
     // repairable store.
     if force_exhaustive
-        || temporal_admission != session_temporal_schema::SessionTemporalSchemaAdmission::Current
+        || matches!(
+            temporal_admission,
+            session_temporal_schema::SessionTemporalSchemaAdmission::Fresh
+                | session_temporal_schema::SessionTemporalSchemaAdmission::EmptyEarlier
+        )
     {
         ensure_authority_invariant_schema(transaction).await?;
         if !authority_invariant_triggers_intact(transaction).await? {
@@ -1053,6 +1060,13 @@ async fn install_registered_schema_stage_sequence(
             .map_err(|error| {
                 global_db_operation_error("initialize workflow index schema", error)
             })?;
+    }
+    if temporal_admission
+        == session_temporal_schema::SessionTemporalSchemaAdmission::AscendingRootOccurrenceIndex
+    {
+        // The only admitted old shape is this index. Refuse unrelated
+        // authority drift before its transactional replacement can commit.
+        validate_admitted_authority_schema(transaction, false).await?;
     }
     Ok(refused_authority)
 }

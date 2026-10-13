@@ -745,6 +745,26 @@ impl GlobalDbObservationStore {
                     )),
                 });
             };
+            if !actual_cursor()
+                .as_ref()
+                .is_some_and(|cursor| cursor.reached(write.next_cursor()))
+            {
+                if known_cursor.is_some() {
+                    return Ok(PreparedObservationPersist::AwaitsDurablePredecessor(
+                        Box::new(write),
+                    ));
+                }
+                // Observation replay is settled by the repository, including
+                // a lost frontier. A cursor command's old runtime receipt can
+                // outlive both its frontier and its pruned coverage row.
+                submit_observation_writes(
+                    &self.database,
+                    &self.runtime,
+                    vec![(0, write.clone())],
+                    Vec::new(),
+                )
+                .await?;
+            }
             return Ok(PreparedObservationPersist::ready(
                 ObservationPersistOutcome::ExactDuplicate(existing.commit_receipt().clone()),
                 existing,
@@ -784,7 +804,16 @@ impl GlobalDbObservationStore {
                 write.observation().scope().clone(),
             );
             let known_cursor = published_cursors.get(&key).cloned().map(Some);
-            let next_cursor = write.next_cursor().clone();
+            // Covered replay must retain the frontier already reached by this
+            // source instead of making later duplicates reload the suffix.
+            let next_cursor = match published_cursors
+                .get(&key)
+                .cloned()
+                .or_else(|| preflight.source_cursor(&key.0, &key.1))
+            {
+                Some(cursor) if cursor.reached(write.next_cursor()) => cursor,
+                _ => write.next_cursor().clone(),
+            };
             match self
                 .prepare_observation_persist(write, &preflight, &mut batch_state, known_cursor)
                 .await?

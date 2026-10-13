@@ -484,6 +484,19 @@ fn invalid_provider(error: String) -> RetainedSurfaceExecutionErrorV1 {
     )
 }
 
+/// Compiles the canonical message-search request into its retrieval query.
+/// Store authorization remains the responsibility of the mounted caller.
+///
+/// # Errors
+///
+/// Returns a typed error when request arguments are invalid or the retrieval
+/// query cannot be constructed.
+pub fn message_search_temporal_query(
+    request: &MessageSearchRequestV1,
+) -> Result<SessionTemporalQuery, RetainedSurfaceExecutionErrorV1> {
+    MessageSearchInput::parse(request)?.query()
+}
+
 struct MessageSearchInput {
     query: String,
     goals: bool,

@@ -1,0 +1,29 @@
+[
+  {
+    "path": ".codex/plans/pm-tool-result-delivery.numeric.patch",
+    "sha256": "552aec0fa7dcd1f52c2b7ce2c9c1e35338f2997293e5a1955884cbe8b04613d0",
+    "changed": [
+      "crates/tracedecay-memory-evaluation/src/host_retrieval/tool_result.rs",
+      "scripts/product/memory-comparison/delivery_evidence.py",
+      "scripts/product/memory-comparison/test_delivery_evidence.py"
+    ],
+    "lines": 207
+  },
+  {
+    "path": ".codex/plans/pm-tool-result-delivery.numeric-combined.patch",
+    "sha256": "fe05e0fdffb1ac63f5a3db2726eda99b81ff87aa6d82219d6d7f8e86483ff7a0",
+    "changed": [
+      "crates/tracedecay-memory-evaluation/src/host_retrieval.rs",
+      "crates/tracedecay-memory-evaluation/src/host_retrieval/tool_result.rs",
+      "crates/tracedecay-memory-evaluation/tests/fixtures/tool_result_v1.json",
+      "crates/tracedecay-memory-evaluation/tests/host_retrieval.rs",
+      "product/evaluation/host-comparison/comparison-capture.schema.json",
+      "product/evaluation/host-comparison/comparison-report.schema.json",
+      "scripts/product/memory-comparison/adjudicate.py",
+      "scripts/product/memory-comparison/delivery_evidence.py",
+      "scripts/product/memory-comparison/runner.py",
+      "scripts/product/memory-comparison/test_delivery_evidence.py"
+    ],
+    "lines": 3498
+  }
+]

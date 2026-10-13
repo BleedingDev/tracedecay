@@ -7,8 +7,8 @@
 pub mod support;
 
 use support::{
-    BASE_SESSIONS, DrainFixture, GROWN_SESSIONS, SEED_TIMESTAMP, probe_one_message,
-    retention_tick_read_bytes, seed_sessions,
+    BASE_SESSIONS, DrainFixture, GROWN_SESSIONS, SEED_TIMESTAMP, advance_wal_to_next_generation,
+    probe_one_message, retention_tick_read_bytes, retention_writer_steps, seed_sessions,
 };
 use tracedecay_sessions::admission::HostAdmissionScope;
 
@@ -16,6 +16,8 @@ use tracedecay_sessions::admission::HostAdmissionScope;
 /// since the previous tick. Payload GC, observation release, session
 /// retention, and observability pruning each select from their own cursors or
 /// candidate indexes, so an 8x larger store costs the same tick.
+/// Both probes begin just after an ordinary WAL restart; the checkpoint that
+/// copies preceding ingest's dirty pages is outside the retention measurement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retention_tick_reads_do_not_scale_with_the_session_store() {
     const STREAMED: u64 = 64;
@@ -29,7 +31,8 @@ async fn retention_tick_reads_do_not_scale_with_the_session_store() {
     let probe_timestamp = SEED_TIMESTAMP + 10_000_000;
 
     let mut streamed = seed_sessions(&facade, project, &scope, 0..BASE_SESSIONS).await;
-    retention_tick_read_bytes(database).await;
+    advance_wal_to_next_generation(&facade, &fixture, &mut streamed, probe_timestamp).await;
+    retention_writer_steps(database).await;
     for offset in 0..STREAMED {
         probe_one_message(
             &facade,
@@ -43,7 +46,8 @@ async fn retention_tick_reads_do_not_scale_with_the_session_store() {
     let base_read = retention_tick_read_bytes(database).await;
 
     seed_sessions(&facade, project, &scope, BASE_SESSIONS..GROWN_SESSIONS).await;
-    retention_tick_read_bytes(database).await;
+    advance_wal_to_next_generation(&facade, &fixture, &mut streamed, probe_timestamp).await;
+    retention_writer_steps(database).await;
     for offset in STREAMED..2 * STREAMED {
         probe_one_message(
             &facade,

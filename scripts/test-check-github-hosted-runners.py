@@ -136,6 +136,32 @@ class GitHubHostedRunnerPolicyTests(unittest.TestCase):
             "&& 'ubuntu-24.04' || inputs.runner }}\n"
         )
 
+    def test_accepts_approved_depot_runner_variables(self) -> None:
+        for runner in (
+            "${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}",
+            "${{ vars.DEPOT_WINDOWS_RUNNER || 'windows-latest' }}",
+        ):
+            with self.subTest(runner=runner), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.write_repository(root, f'jobs:\n  test:\n    runs-on: "{runner}"\n')
+                self.policy.validate_repository(root)
+
+    def test_rejects_unapproved_depot_runners(self) -> None:
+        for runner in (
+            "depot-ubuntu-24.04-8",
+            "${{ vars.RUNNER || 'ubuntu-latest' }}",
+            "${{ vars.DEPOT_LINUX_RUNNER || 'tracedecay-linux-64core' }}",
+            "${{ vars.DEPOT_LINUX_RUNNER || inputs.runner }}",
+        ):
+            with self.subTest(runner=runner):
+                self.assert_rejected(f'jobs:\n  test:\n    runs-on: "{runner}"\n')
+
+    def test_rejects_depot_label_in_release_manifest(self) -> None:
+        self.assert_rejected(
+            "jobs:\n  build:\n    runs-on: ${{ matrix.runner }}\n",
+            ("depot-ubuntu-24.04-8",),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

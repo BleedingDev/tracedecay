@@ -442,6 +442,14 @@ impl RegisteredGlobalDb {
         crate::GlobalDbObservationStore::new(self.database.clone())
     }
 
+    /// Retains this exact guarded client for canonical retrieval-anchor
+    /// disposition and redaction authority without exposing a database client.
+    pub fn retrieval_anchor_disposition_store(
+        &self,
+    ) -> impl tracedecay_store::RetrievalAnchorDispositionStore + 'static {
+        self.database.clone()
+    }
+
     /// Retains this exact client for closed runtime read/submit requests.
     ///
     /// The returned capability has no raw Store runtime, connection, or

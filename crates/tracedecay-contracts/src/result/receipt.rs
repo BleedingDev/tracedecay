@@ -156,6 +156,9 @@ impl OperationReceipt {
 #[serde(rename_all = "snake_case")]
 pub enum EffectTermination {
     Completed,
+    // The admitted command completed with verified no effect. This does not
+    // represent an unknown outcome or a policy refusal.
+    NoChange,
     Cancelled,
     TimedOut,
     Failed,
@@ -166,7 +169,7 @@ pub enum EffectTermination {
 impl From<EffectTermination> for OperationTermination {
     fn from(value: EffectTermination) -> Self {
         match value {
-            EffectTermination::Completed => Self::Completed,
+            EffectTermination::Completed | EffectTermination::NoChange => Self::Completed,
             EffectTermination::Cancelled => Self::Cancelled,
             EffectTermination::TimedOut => Self::TimedOut,
             EffectTermination::Failed => Self::Failed,
@@ -293,6 +296,13 @@ impl EffectReceipt {
         }
         if let Some(proof) = &self.external_proof {
             proof.validate()?;
+        }
+        if self.outcome == EffectTermination::NoChange
+            && (self.committed_state.is_some() || self.external_proof.is_some())
+        {
+            return Err(ApplicationContractError::Inconsistent {
+                field: "no-change effect receipt proof",
+            });
         }
         if self.outcome == EffectTermination::Completed
             && self.committed_state.is_none()

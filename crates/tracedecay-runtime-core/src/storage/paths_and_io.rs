@@ -190,7 +190,26 @@ impl PrivateStoreIo {
                 "durable private store directory path must be absolute",
             ));
         }
-        platform_create_dir_all_durable(path)
+        platform_create_dir_all_durable(path, None)
+    }
+
+    /// Creates the same durable private hierarchy while allowing the caller
+    /// to interrupt directory-lock contention and work between ancestors.
+    ///
+    /// An interruption may leave already-published ancestors. Each started
+    /// publication finishes its durability barrier before the next check.
+    /// Individual filesystem calls and durability barriers are not preempted.
+    pub fn create_dir_all_durable_interruptible(
+        path: &Path,
+        interrupt: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<()> {
+        interrupt()?;
+        if !path.is_absolute() {
+            return Err(invalid_input(
+                "durable private store directory path must be absolute",
+            ));
+        }
+        platform_create_dir_all_durable(path, Some(interrupt))
     }
 
     /// Removes one private-store file and establishes the platform namespace
@@ -416,11 +435,15 @@ fn durable_directory_lock_path(parent: &Path, destination_name: &OsStr) -> PathB
 #[cfg(unix)]
 fn create_missing_directories_locked(
     path: &Path,
+    mut interrupt: Option<&mut dyn FnMut() -> io::Result<()>>,
     mut publish: impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
+    check_directory_creation_interrupt(&mut interrupt)?;
     reject_symlink_components(path, "durable private store directory")?;
+    check_directory_creation_interrupt(&mut interrupt)?;
     let missing = missing_directories(path)?;
     let Some(highest_missing) = missing.last() else {
+        check_directory_creation_interrupt(&mut interrupt)?;
         PrivateStoreIo::create_dir_all(path)?;
         return sync_parent_directory(path);
     };
@@ -428,9 +451,11 @@ fn create_missing_directories_locked(
         .parent()
         .ok_or_else(|| invalid_input("durable private store directory has no parent directory"))?;
     if existing_parent.parent().is_some() {
+        check_directory_creation_interrupt(&mut interrupt)?;
         sync_parent_directory(existing_parent)?;
     }
     for destination in missing.iter().rev() {
+        check_directory_creation_interrupt(&mut interrupt)?;
         let parent = destination.parent().ok_or_else(|| {
             invalid_input("durable private store directory has no parent directory")
         })?;
@@ -439,7 +464,7 @@ fn create_missing_directories_locked(
             .ok_or_else(|| invalid_input("durable private store directory has no file name"))?;
         let lock_path = durable_directory_lock_path(parent, destination_name);
         reject_symlink_components(&lock_path, "durable private store directory lock")?;
-        let _lock = acquire_lock_file_blocking(&lock_path, true)?;
+        let _lock = acquire_directory_creation_lock(&lock_path, &mut interrupt)?;
         if destination.try_exists()? {
             tracedecay_private_fs::validate_private_directory(destination)?;
             continue;
@@ -450,25 +475,35 @@ fn create_missing_directories_locked(
 }
 
 #[cfg(unix)]
-fn platform_create_dir_all_durable(path: &Path) -> io::Result<()> {
-    create_missing_directories_locked(path, |destination| {
+fn platform_create_dir_all_durable(
+    path: &Path,
+    interrupt: Option<&mut dyn FnMut() -> io::Result<()>>,
+) -> io::Result<()> {
+    create_missing_directories_locked(path, interrupt, |destination| {
         PrivateStoreIo::create_private_directory(destination)?;
         sync_parent_directory(destination)
     })
 }
 
 #[cfg(windows)]
-fn platform_create_dir_all_durable(path: &Path) -> io::Result<()> {
+fn platform_create_dir_all_durable(
+    path: &Path,
+    mut interrupt: Option<&mut dyn FnMut() -> io::Result<()>>,
+) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
 
+    check_directory_creation_interrupt(&mut interrupt)?;
     reject_symlink_components(path, "durable private store directory")?;
+    check_directory_creation_interrupt(&mut interrupt)?;
     let missing = missing_directories(path)?;
     if missing.is_empty() {
+        check_directory_creation_interrupt(&mut interrupt)?;
         return PrivateStoreIo::create_dir_all(path);
     }
     for destination in missing.iter().rev() {
+        check_directory_creation_interrupt(&mut interrupt)?;
         let parent = destination.parent().ok_or_else(|| {
             invalid_input("durable private store directory has no parent directory")
         })?;
@@ -477,7 +512,7 @@ fn platform_create_dir_all_durable(path: &Path) -> io::Result<()> {
             .ok_or_else(|| invalid_input("durable private store directory has no file name"))?;
         let lock_path = durable_directory_lock_path(parent, destination_name);
         reject_symlink_components(&lock_path, "durable private store directory lock")?;
-        let _lock = acquire_lock_file_blocking(&lock_path, true)?;
+        let _lock = acquire_directory_creation_lock(&lock_path, &mut interrupt)?;
         if destination.try_exists()? {
             tracedecay_private_fs::validate_private_directory(destination)?;
             continue;
@@ -522,9 +557,14 @@ fn platform_create_dir_all_durable(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn platform_create_dir_all_durable(path: &Path) -> io::Result<()> {
+fn platform_create_dir_all_durable(
+    path: &Path,
+    mut interrupt: Option<&mut dyn FnMut() -> io::Result<()>>,
+) -> io::Result<()> {
+    check_directory_creation_interrupt(&mut interrupt)?;
     let missing = missing_directories(path)?;
     if missing.is_empty() {
+        check_directory_creation_interrupt(&mut interrupt)?;
         return PrivateStoreIo::create_dir_all(path);
     }
     Err(io::Error::new(
@@ -775,6 +815,40 @@ fn acquire_lock_file_blocking(lock_path: &Path, private: bool) -> io::Result<Fil
     let file = open_lock_file(lock_path, private)?;
     file.lock()?;
     Ok(FileLease::held(file, SIDECAR_LEASE_LABEL))
+}
+
+fn check_directory_creation_interrupt(
+    interrupt: &mut Option<&mut dyn FnMut() -> io::Result<()>>,
+) -> io::Result<()> {
+    match interrupt.as_deref_mut() {
+        Some(interrupt) => interrupt(),
+        None => Ok(()),
+    }
+}
+
+fn acquire_directory_creation_lock(
+    lock_path: &Path,
+    interrupt: &mut Option<&mut dyn FnMut() -> io::Result<()>>,
+) -> io::Result<FileLease> {
+    let Some(interrupt) = interrupt.as_deref_mut() else {
+        return acquire_lock_file_blocking(lock_path, true);
+    };
+    interrupt()?;
+    let file = open_lock_file(lock_path, true)?;
+    loop {
+        interrupt()?;
+        match file.try_lock().map_err(io::Error::from) {
+            Ok(()) => {
+                let lease = FileLease::held(file, SIDECAR_LEASE_LABEL);
+                interrupt()?;
+                return Ok(lease);
+            }
+            Err(error) if crate::db::is_lock_contended(&error) => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Appends `line` (newline-terminated) to `path` under the shared sidecar

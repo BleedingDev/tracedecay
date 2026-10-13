@@ -4,13 +4,12 @@ use tracedecay_runtime_core::config::ProfileRoot;
 use tracedecay_contracts::now_micros;
 use tracedecay_contracts::request_identity::{GlobalRequestSurface, mint_global_request_id};
 use tracedecay_contracts::{
-    ApplicationEnvelope, ApplicationOutcome, CancellationSignal, ComponentConfigurationState,
-    Deadline, EffectReceipt, ResolvedSetting,
+    ApplicationEnvelope, ApplicationOutcome, CancellationSignal, Deadline, EffectReceipt,
+    ResolvedSetting,
 };
 use tracedecay_contracts::{
     ConfigurationBatchRequestV1, ConfigurationDirectMutationRequestV1, ConfigurationGetRequestV1,
-    ConfigurationObservedStateRequestV1, ConfigurationSetRequestV1, ConfigurationUnsetRequestV1,
-    ConfigurationWireRequestV1,
+    ConfigurationSetRequestV1, ConfigurationUnsetRequestV1, ConfigurationWireRequestV1,
 };
 use tracedecay_daemon_protocol::ApplicationSurfaceRequest;
 use tracedecay_daemon_protocol::RequestedOutputFormat;
@@ -141,41 +140,16 @@ async fn invoke_configuration_surface(
     }
 }
 
+/// Mutation CAS uses the desired setting revision even before a runtime has
+/// recorded activation; component observations describe activation separately.
 pub(crate) async fn current_configuration_revision(
     profile: &ProfileRoot,
     project_path: &Path,
+    key: &str,
 ) -> tracedecay_domain::errors::Result<ConfigurationRevisionId> {
-    let envelope = invoke_configuration_surface(
-        profile,
-        Some(project_path),
-        ApplicationSurfaceOperation::ConfigurationObservedState,
-        ConfigurationWireRequestV1::ObservedState(ConfigurationObservedStateRequestV1 {}),
-    )
-    .await?;
-    let ApplicationOutcome::Evidence(evidence) = envelope.outcome else {
-        return Err(configuration_error(
-            "configuration state returned a non-evidence outcome",
-        ));
-    };
-    let states: Vec<ComponentConfigurationState> = serde_json::from_value(
-        evidence
-            .payload
-            .ok_or_else(|| configuration_error("configuration state omitted its payload"))?,
-    )
-    .map_err(|error| configuration_error(format!("invalid configuration state: {error}")))?;
-    let revision = states
-        .first()
-        .map(|state| state.desired_revision_id.clone())
-        .ok_or_else(|| configuration_error("configuration state has no runtime component"))?;
-    if states
-        .iter()
-        .any(|state| state.desired_revision_id != revision)
-    {
-        return Err(configuration_error(
-            "configuration components disagree on the desired revision",
-        ));
-    }
-    Ok(revision)
+    Ok(resolved_setting(profile, Some(project_path), key)
+        .await?
+        .revision_id)
 }
 
 pub(crate) async fn current_project_setting(

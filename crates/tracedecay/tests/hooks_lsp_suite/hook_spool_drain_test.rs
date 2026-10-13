@@ -15,6 +15,7 @@ use tracedecay_hooks::{
     HOOK_SYNCHRONOUS_BUDGET, HookDeliveryReceiptWriterV1, HookDeliveryRetentionV1,
     HookDeliverySourceReceiptV1, hook_delivery_receipt_spool_root,
 };
+use tracedecay_private_fs::framed_log::{DirectorySyncPolicy, atomic_write};
 use tracedecay_runtime_core::storage::default_profile_sharded_layout;
 
 use crate::common::{git_program, spawn_tracedecay_daemon, tracedecay_command_with_home};
@@ -268,9 +269,19 @@ fn a_failed_receipt_drain_is_reported_on_status_and_clears_when_the_spool_drains
     let layout = default_profile_sharded_layout(&project, &home.join(".tracedecay")).unwrap();
     let receipts =
         hook_delivery_receipt_spool_root(&layout.data_root, NativeHostIdentityV1::CursorDesktop);
-    drop(HookDeliveryReceiptWriterV1::open_within(&receipts, HOOK_SYNCHRONOUS_BUDGET).unwrap());
+    let writer =
+        HookDeliveryReceiptWriterV1::open_within(&receipts, HOOK_SYNCHRONOUS_BUDGET).unwrap();
     let corrupt = receipts.join(format!("{:032x}.delivery.v1.json", 7));
-    std::fs::write(&corrupt, b"not a delivery receipt").unwrap();
+    // The staging lease protects the live temporary; atomic publication keeps
+    // the drain from reading an empty or partial file as an I/O failure.
+    atomic_write(
+        &corrupt,
+        "corrupt-fixture",
+        b"not a delivery receipt",
+        DirectorySyncPolicy::Strict,
+    )
+    .unwrap();
+    drop(writer);
 
     let failed = json!({
         "status": "failed",

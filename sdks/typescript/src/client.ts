@@ -8,6 +8,7 @@ import {
   type ResultFor,
 } from "./operations";
 import { factStoreCurateReceiptMatches } from "./automation-receipt";
+import { providerControlTerminalMatches } from "./provider-control";
 import {
   applyHttpRequestControls,
   type OperationRequestOptions,
@@ -820,7 +821,20 @@ export class TraceDecayClient {
         );
       }
       try {
-        return descriptor.decodeResult(response);
+        const decoded = descriptor.decodeResult(response);
+        if (
+          descriptor.resultSemantics === "provider_control_terminal" &&
+          !await providerControlTerminalMatches(
+            descriptor.operationId,
+            decodedRequest,
+            decoded,
+          )
+        ) {
+          throw new TypeError(
+            "provider control request and effect invariants are invalid",
+          );
+        }
+        return decoded;
       } catch (cause) {
         throw new TraceDecayMalformedResponseError(
           `MCP tool ${descriptor.transport.toolName} returned an invalid ${descriptor.operation} result`,
@@ -885,6 +899,19 @@ export class TraceDecayClient {
         !await factStoreCurateReceiptMatches(decodedRequest, decoded)
       ) {
         throw new TypeError("automatic curation receipt invariants are invalid");
+      }
+      if (
+        descriptor.resultSemantics === "provider_control_terminal" &&
+        !await providerControlTerminalMatches(
+          descriptor.operationId,
+          decodedRequest,
+          decoded.outcome.value.payload,
+          decoded,
+        )
+      ) {
+        throw new TypeError(
+          "provider control request and effect invariants are invalid",
+        );
       }
       return decoded;
     } catch (cause) {

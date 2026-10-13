@@ -52,3 +52,15 @@ vendor/grafeo/*/Cargo.lock
 # Bazel
 bazel-*
 MODULE.bazel.lock
+
+# Agent patch staging and copied source trees are transient, not product inputs.
+.codex/patches/
+.codex/plans/**/*.rs
+.codex/plans/**/*.rs.candidate
+.codex/plans/**/*.patch
+.codex/plans/pm-*/**/crates/
+.codex/plans/pm-*/**/scripts/
+.codex/plans/pm-*/**/product/
+.codex/plans/pm-*/**/source/
+.codex/plans/pm-*/**/original/
+.codex/plans/pm-*/**/baseline/

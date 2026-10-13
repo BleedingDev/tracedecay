@@ -358,8 +358,6 @@ pub(crate) async fn dashboard_configuration_authorities_for_test(
             policy_digest,
         )
         .await?;
-    register_dashboard_test_retained_runtime(&service, &cg, project_root.clone(), project_id)
-        .await?;
     let operation = tracedecay_contracts::configuration_surface_operation(
         ApplicationSurfaceOperation::ConfigurationBatch.as_str(),
     )
@@ -369,6 +367,8 @@ pub(crate) async fn dashboard_configuration_authorities_for_test(
     .ok_or_else(|| TraceDecayError::Config {
         message: "dashboard configuration batch operation is not registered".to_owned(),
     })?;
+    publish_dashboard_configuration_runtime(&service, &cg, project_root.clone(), project_id)
+        .await?;
     let application_runtime = Arc::new(DashboardConfigurationRuntimeForTestV1 {
         service,
         lsp_registry: Arc::new(Mutex::new(LspSessionRegistry::default())),
@@ -385,6 +385,58 @@ pub(crate) async fn dashboard_configuration_authorities_for_test(
             &application_runtime.service,
         );
     Ok((application_runtime, profile_code_index_worker_settings))
+}
+
+/// Records configuration activation only after the fixture's real owners
+/// publish, so configuration registration alone never claims readiness.
+async fn publish_dashboard_configuration_runtime(
+    service: &DaemonInvocationService,
+    cg: &Arc<TraceDecay>,
+    project_root: PathBuf,
+    project_id: ProjectId,
+) -> Result<()> {
+    let publication = service
+        .project_runtimes
+        .begin_publication(&project_root)
+        .ok_or_else(|| TraceDecayError::Config {
+            message: "dashboard configuration runtime was not registered".to_owned(),
+        })?;
+    let published = async {
+        register_dashboard_test_retained_runtime(service, cg, project_root, project_id).await?;
+        let configuration = cg
+            .configuration_runtime()
+            .client()
+            .current()
+            .await
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("dashboard runtime configuration is unavailable: {error}"),
+            })?;
+        if !service
+            .project_runtimes
+            .mark_publication_ready(&publication)
+        {
+            return Err(TraceDecayError::Config {
+                message: "dashboard runtime publication was superseded".to_owned(),
+            });
+        }
+        cg.configuration_runtime()
+            .record_runtime_activation(
+                Some(configuration.revision_id().clone()),
+                None,
+                now_micros(),
+            )
+            .await
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("dashboard runtime activation could not be recorded: {error}"),
+            })
+    }
+    .await;
+    if published.is_err() {
+        service
+            .project_runtimes
+            .mark_publication_failed(&publication);
+    }
+    published
 }
 
 /// Registers the same retained application runtime production project-open
@@ -434,6 +486,8 @@ pub(crate) async fn register_dashboard_test_retained_runtime(
             project_retrieval: None,
             project_workflow_index: None,
             project_lcm: None,
+            #[cfg(feature = "memory-provider-host")]
+            provider_control: None,
             invocation_service: Some(service.clone()),
             configuration_digest: retained_access.configuration_digest.clone(),
         },

@@ -519,14 +519,15 @@ mod tests {
     use std::collections::BTreeMap;
 
     use serde_json::json;
+    use tracedecay_contracts::memory::CognitiveRecallTemporalMode;
     use tracedecay_contracts::retrieval::DerivesSymbolV1;
     use tracedecay_contracts::retrieval::{
-        CodeGraphReadFreshnessV1, ContextCodeBlockV1, ContextExtensionPointV1, ContextModeV1,
-        ContextPlanV1, ContextResultV1, ContextRetrievalPlanV1, ContextRetrievalRouteV1,
-        ContextSearchMatchV1, ContextStageV1, PrimitiveFreshnessStateV1, PrimitiveLaneCompleteV1,
-        PrimitiveLaneStatusV1, PrimitiveRecallV1, PrimitiveSearchCoverageV1,
-        PrimitiveSearchFreshnessV1, PrimitiveSymbolLocationV1, ServedCodeGraphGenerationV1,
-        TodoMarkerV1, TodosResultV1,
+        CodeGraphReadFreshnessV1, ContextCodeBlockV1, ContextExtensionPointV1,
+        ContextMemoryTemporalCoverageV1, ContextModeV1, ContextPlanV1, ContextResultV1,
+        ContextRetrievalPlanV1, ContextRetrievalRouteV1, ContextSearchMatchV1, ContextStageV1,
+        PrimitiveFreshnessStateV1, PrimitiveLaneCompleteV1, PrimitiveLaneStatusV1,
+        PrimitiveRecallV1, PrimitiveSearchCoverageV1, PrimitiveSearchFreshnessV1,
+        PrimitiveSymbolLocationV1, ServedCodeGraphGenerationV1, TodoMarkerV1, TodosResultV1,
     };
     use tracedecay_contracts::{ContextMemoryAnalyticsV1, InvocationAnalyticsV1};
     use tracedecay_domain::UtcMicros;
@@ -641,6 +642,7 @@ mod tests {
             },
             memory_matches: Vec::new(),
             memory_graph_coverage: None,
+            memory_temporal_coverage: None,
             memory_matches_error: None,
             verified_graph_evidence: None,
             token_budget: None,
@@ -773,6 +775,15 @@ mod tests {
                 "error": null,
             }}))
         );
+        let contribution = markdown
+            .context_memory_contribution()
+            .expect("canonical contribution");
+        assert!(
+            contribution.facts().is_empty(),
+            "analytics must not supply trimmed fact identities"
+        );
+        assert_eq!(contribution.graph_coverage(), None);
+        assert_eq!(contribution.temporal_coverage(), None);
 
         let as_json = render_graph_tool(
             None,
@@ -798,6 +809,49 @@ mod tests {
         );
         assert!(payload.get("context_memory").is_none(), "{payload}");
         assert!(payload.get("analytics").is_none(), "{payload}");
+        assert_eq!(as_json.context_memory_contribution(), Some(contribution));
+    }
+
+    #[test]
+    fn context_withholding_survives_json_and_markdown_rendering() {
+        let coverage = ContextMemoryTemporalCoverageV1::WithheldCurrentOnly {
+            requested_mode: CognitiveRecallTemporalMode::History,
+        };
+        let render = |format| {
+            let mut context = plan_context();
+            context.memory_temporal_coverage = Some(coverage);
+            render_graph_tool(
+                None,
+                &json!({"format": format}),
+                GraphToolCompletionV1 {
+                    result: GraphToolResultV1::Context(Box::new(context)),
+                    touched_files: Vec::new(),
+                    code_graph: None,
+                    analytics: None,
+                    cost: None,
+                },
+            )
+            .unwrap()
+        };
+        let markdown = render("markdown");
+        assert!(
+            texts(&markdown)
+                .join("")
+                .contains("canonical fact search supports only current memory.")
+        );
+        let json = render("json");
+        let payload: serde_json::Value = serde_json::from_str(&texts(&json)[0]).unwrap();
+        assert_eq!(
+            payload["memory_temporal_coverage"],
+            json!({
+                "kind": "withheld_current_only", "requested_mode": "history",
+            })
+        );
+        for result in [&markdown, &json] {
+            let contribution = result.context_memory_contribution().unwrap();
+            assert_eq!(contribution.facts().len(), 0);
+            assert_eq!(contribution.temporal_coverage(), Some(&coverage));
+        }
     }
 
     #[test]

@@ -16,6 +16,7 @@ use super::observation::{
 #[allow(clippy::unwrap_used)]
 mod goal_event_tests {
     use std::collections::BTreeSet;
+    use std::io::Write as _;
 
     use super::*;
     use serde_json::json;
@@ -25,6 +26,8 @@ mod goal_event_tests {
     use crate::admission::test_support::MemoryHostAdmission;
     use crate::observation::ObservationCancellation;
     use crate::runtime::hosts::codex::{
+        CODEX_HOOK_MAX_NEW_BYTES, codex_observation_source_v2,
+        try_admit_codex_jsonl_observations_for_project_session_window,
         try_admit_codex_jsonl_observations_for_project_window,
         try_admit_codex_jsonl_observations_for_project_with_admission,
     };
@@ -498,8 +501,47 @@ mod goal_event_tests {
     async fn current_user_message_reaches_project_admission_and_projection() {
         crate::runtime::jsonl_observation_admission::install_test_shared_jsonl_preparation_authority();
         let temp = tempfile::tempdir().unwrap();
-        let project = temp.path().join("project");
-        std::fs::create_dir_all(&project).unwrap();
+        let primary = temp.path().join("project");
+        std::fs::create_dir_all(&primary).unwrap();
+        let project_id = ProjectId::new("project-current-user").unwrap();
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            &primary,
+            project_id.as_str(),
+        )
+        .unwrap();
+        let project = temp.path().join("linked-worktree");
+        let git = tracedecay_runtime_core::git::try_git_program().unwrap();
+        for args in [
+            vec![
+                "-c",
+                "user.name=TraceDecay fixture",
+                "-c",
+                "user.email=fixture@example.com",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "--no-gpg-sign",
+                "-m",
+                "fixture",
+            ],
+            vec![
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                project.to_str().unwrap(),
+                "HEAD",
+            ],
+        ] {
+            let status = std::process::Command::new(git)
+                .args(&args)
+                .current_dir(&primary)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .unwrap();
+            assert!(status.success(), "fixture git {args:?} failed");
+        }
         let transcript = temp.path().join("rollout.jsonl");
         let lines = [
             json!({
@@ -535,7 +577,40 @@ mod goal_event_tests {
                 + "\n",
         )
         .unwrap();
-        let project_id = ProjectId::new("project-current-user").unwrap();
+        let rejected = MemoryHostAdmission::default();
+        let foreign_id = ProjectId::new("project-foreign-user").unwrap();
+        let refusal = try_admit_codex_jsonl_observations_for_project_with_admission(
+            &transcript,
+            &project,
+            foreign_id.clone(),
+            &rejected,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            refusal,
+            crate::runtime::source::TranscriptIngestError::HostAdmission {
+                reason: "project_identity_unavailable",
+                retryable: false,
+                ..
+            }
+        ));
+        assert_eq!(rejected.capture_call_counts(), (0, 0));
+        assert!(rejected.observations().is_empty());
+        assert!(
+            rejected
+                .get_source_cursor(
+                    &super::super::observation::codex_observation_source_v2("session-current-user")
+                        .unwrap(),
+                    &ObservationScopeV1::Project {
+                        project_id: foreign_id,
+                    },
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
         let admission = MemoryHostAdmission::default();
 
         let progress = try_admit_codex_jsonl_observations_for_project_with_admission(
@@ -550,6 +625,52 @@ mod goal_event_tests {
 
         assert_eq!(progress.frames_persisted, 2);
         let observations = admission.observations();
+        let primary_admission = MemoryHostAdmission::default();
+        let primary_progress = try_admit_codex_jsonl_observations_for_project_window(
+            &transcript,
+            &primary,
+            project_id.clone(),
+            &primary_admission,
+            u64::MAX,
+            &ObservationCancellation::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(primary_progress.frames_persisted, 2);
+        let primary_path = primary.canonicalize().unwrap();
+        let primary_records = primary_admission.observations();
+        for (linked, primary) in observations.iter().zip(&primary_records) {
+            assert_eq!(
+                linked.observation().observation_id(),
+                primary.observation().observation_id()
+            );
+            assert_eq!(
+                linked.observation().payload(),
+                primary.observation().payload()
+            );
+            assert_eq!(
+                linked.sanitization_receipt(),
+                primary.sanitization_receipt()
+            );
+        }
+        for stored in observations.iter().chain(&primary_records) {
+            let envelope: CanonicalObservationEnvelopeV1 =
+                serde_json::from_value(stored.observation().payload().clone()).unwrap();
+            let (project_path, location_path) = envelope
+                .facts()
+                .iter()
+                .find_map(|fact| match fact {
+                    CanonicalObservationFactV1::Session {
+                        project_path,
+                        location_path,
+                        ..
+                    } => Some((project_path, location_path)),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(project_path.as_deref(), primary_path.to_str());
+            assert_eq!(location_path.as_deref(), project.to_str());
+        }
         let message = observations.iter().find_map(|stored| {
             serde_json::from_value::<CanonicalObservationEnvelopeV1>(
                 stored.observation().payload().clone(),
@@ -579,6 +700,420 @@ mod goal_event_tests {
             .unwrap();
         assert_eq!(projected.projected, 2);
         assert_eq!(admission.pending_projection_count(), 0);
+    }
+
+    fn write_hook_session_rollout(
+        path: &std::path::Path,
+        project: &std::path::Path,
+        session_id: &str,
+        message_count: usize,
+        text: &str,
+    ) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+        writeln!(
+            writer,
+            "{}",
+            json!({
+                "timestamp": "2026-10-12T12:00:00.000Z",
+                "type": "session_meta",
+                "payload": {"id": session_id, "cwd": project}
+            })
+        )
+        .unwrap();
+        for ordinal in 0..message_count {
+            writeln!(
+                writer,
+                "{}",
+                json!({
+                    "timestamp": "2026-10-12T12:00:01.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "item_completed",
+                        "thread_id": session_id,
+                        "turn_id": format!("turn-{ordinal}"),
+                        "item": {
+                            "type": "UserMessage",
+                            "id": format!("{session_id}-user-{ordinal}"),
+                            "content": [{"type": "text", "text": text}]
+                        }
+                    }
+                })
+            )
+            .unwrap();
+        }
+        writer.flush().unwrap();
+    }
+
+    #[tokio::test]
+    async fn project_session_window_rejects_filename_metadata_mismatch_without_capture() {
+        crate::runtime::jsonl_observation_admission::install_test_shared_jsonl_preparation_authority();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let project = home.join("project");
+        let project_id = ProjectId::new("project-hook-session-mismatch").unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            &project,
+            project_id.as_str(),
+        )
+        .unwrap();
+        let requested = "session-requested";
+        let native = "session-native-other";
+        let transcript = home.join(format!(
+            ".codex/sessions/2026/10/12/rollout-{requested}.jsonl"
+        ));
+        write_hook_session_rollout(
+            &transcript,
+            &project,
+            native,
+            1,
+            "Native session owns this.",
+        );
+        let lookup = CodexSource::with_home(&home)
+            .find_session_transcript_paths_bounded(requested)
+            .unwrap();
+        assert_eq!(lookup.paths, vec![transcript.clone()]);
+        let admission = MemoryHostAdmission::default();
+
+        let refusal = try_admit_codex_jsonl_observations_for_project_session_window(
+            &transcript,
+            &project,
+            project_id.clone(),
+            requested,
+            &admission,
+            CODEX_HOOK_MAX_NEW_BYTES,
+            &ObservationCancellation::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            refusal,
+            crate::runtime::source::TranscriptIngestError::HostAdmission {
+                reason: "source_session_mismatch",
+                retryable: false,
+                ..
+            }
+        ));
+        assert_eq!(admission.capture_call_counts(), (0, 0));
+        assert!(admission.observations().is_empty());
+        assert_eq!(admission.pending_projection_count(), 0);
+        let scope = ObservationScopeV1::Project { project_id };
+        for session_id in [requested, native] {
+            assert!(
+                admission
+                    .get_source_cursor(&codex_observation_source_v2(session_id).unwrap(), &scope)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_hook_session_requires_native_header_identity_preserving_historical_intake() {
+        crate::runtime::jsonl_observation_admission::install_test_shared_jsonl_preparation_authority();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let project = home.join("project");
+        let project_id = ProjectId::new("project-hook-session-native-identity").unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            &project,
+            project_id.as_str(),
+        )
+        .unwrap();
+        let requested = "rollout-session-missing-native-id";
+        let directory = home.join(".codex/sessions/2026/10/12");
+        std::fs::create_dir_all(&directory).unwrap();
+        let transcript = directory.join(format!("{requested}.jsonl"));
+        let frames = [
+            json!({
+                "timestamp": "2026-10-12T12:00:00.000Z",
+                "type": "session_meta",
+                "payload": {"cwd": project}
+            }),
+            json!({
+                "timestamp": "2026-10-12T12:00:01.000Z",
+                "type": "event_msg",
+                "payload": {"type": "item_completed", "item": {"type": "AgentMessage"}}
+            }),
+        ];
+        std::fs::write(
+            &transcript,
+            frames
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let parsed = session_meta_with_provenance(&transcript).unwrap().unwrap();
+        assert_eq!(parsed.meta.session_id, requested);
+        assert!(parsed.native_thread_id.is_none());
+        let lookup = CodexSource::with_home(&home)
+            .find_session_transcript_paths_bounded(requested)
+            .unwrap();
+        assert_eq!(lookup.paths, vec![transcript.clone()]);
+        let admission = MemoryHostAdmission::default();
+
+        let refusal = try_admit_codex_jsonl_observations_for_project_session_window(
+            &transcript,
+            &project,
+            project_id.clone(),
+            requested,
+            &admission,
+            CODEX_HOOK_MAX_NEW_BYTES,
+            &ObservationCancellation::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            refusal,
+            crate::runtime::source::TranscriptIngestError::HostAdmission {
+                provider: "codex",
+                reason: "source_session_mismatch",
+                retryable: false,
+                ..
+            }
+        ));
+        assert_eq!(admission.capture_call_counts(), (0, 0));
+        assert!(admission.observations().is_empty());
+        assert!(admission.non_durable_advances().is_empty());
+        assert_eq!(admission.pending_projection_count(), 0);
+        let scope = ObservationScopeV1::Project {
+            project_id: project_id.clone(),
+        };
+        let source = codex_observation_source_v2(requested).unwrap();
+        assert!(
+            admission
+                .get_source_cursor(&source, &scope)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let historical = try_admit_codex_jsonl_observations_for_project_with_admission(
+            &transcript,
+            &project,
+            project_id,
+            &admission,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(historical.frames_persisted, 2);
+        let observations = admission.observations();
+        assert_eq!(observations.len(), 2);
+        for stored in &observations {
+            let envelope: CanonicalObservationEnvelopeV1 =
+                serde_json::from_value(stored.observation().payload().clone()).unwrap();
+            assert_eq!(envelope.relations().session_id().as_str(), requested);
+            assert!(envelope.relations().thread_id().is_none());
+        }
+        let malformed: CanonicalObservationEnvelopeV1 =
+            serde_json::from_value(observations[1].observation().payload().clone()).unwrap();
+        assert!(malformed.facts().iter().any(|fact| matches!(
+            fact,
+            CanonicalObservationFactV1::Unknown {
+                native_kind,
+                state: CanonicalUnknownStateV1::Malformed,
+            } if native_kind == "item_completed"
+        )));
+        let cursor = admission
+            .get_source_cursor(&source, &scope)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cursor.position(),
+            std::fs::metadata(&transcript).unwrap().len()
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_hook_session_intake_leaves_unrelated_rollout_untouched() {
+        crate::runtime::jsonl_observation_admission::install_test_shared_jsonl_preparation_authority();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let project = home.join("project");
+        let project_id = ProjectId::new("project-exact-hook-session").unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            &project,
+            project_id.as_str(),
+        )
+        .unwrap();
+        let session_id = "session-current-hook";
+        let unrelated_id = "session-unrelated-history";
+        let directory = home.join(".codex/sessions/2026/10/12");
+        let target = directory.join(format!("rollout-{session_id}.jsonl"));
+        let unrelated = directory.join(format!("rollout-{unrelated_id}.jsonl"));
+        write_hook_session_rollout(&target, &project, session_id, 1, "Current hook turn.");
+        write_hook_session_rollout(
+            &unrelated,
+            &project,
+            unrelated_id,
+            300,
+            &"history ".repeat(2_048),
+        );
+        assert!(
+            std::fs::metadata(&unrelated).unwrap().len()
+                > crate::runtime::jsonl_observation_admission::MAX_CAPTURE_WINDOW_BYTES
+        );
+        let lookup = CodexSource::with_home(&home)
+            .find_session_transcript_paths_bounded(session_id)
+            .unwrap();
+        assert!(!lookup.source_deferred);
+        assert_eq!(lookup.paths, vec![target.clone()]);
+        let admission = MemoryHostAdmission::default();
+
+        let progress = try_admit_codex_jsonl_observations_for_project_session_window(
+            &lookup.paths[0],
+            &project,
+            project_id.clone(),
+            session_id,
+            &admission,
+            CODEX_HOOK_MAX_NEW_BYTES,
+            &ObservationCancellation::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!progress.source_deferred);
+        assert_eq!(progress.frames_persisted, 2);
+        assert_eq!(
+            session_ids_of(&admission.observations()),
+            BTreeSet::from([session_id.to_owned()])
+        );
+        let scope = ObservationScopeV1::Project { project_id };
+        let cursor = admission
+            .get_source_cursor(&codex_observation_source_v2(session_id).unwrap(), &scope)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor.position(), std::fs::metadata(&target).unwrap().len());
+        assert!(
+            admission
+                .get_source_cursor(&codex_observation_source_v2(unrelated_id).unwrap(), &scope)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn project_session_window_defers_and_background_window_finishes_without_loss() {
+        crate::runtime::jsonl_observation_admission::install_test_shared_jsonl_preparation_authority();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let project = home.join("project");
+        let project_id = ProjectId::new("project-hook-session-continuation").unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            &project,
+            project_id.as_str(),
+        )
+        .unwrap();
+        let session_id = "session-hook-continuation";
+        let transcript = home.join(format!(
+            ".codex/sessions/2026/10/12/rollout-{session_id}.jsonl"
+        ));
+        let messages = crate::runtime::jsonl_observation_admission::MAX_CAPTURE_WINDOW + 1;
+        write_hook_session_rollout(
+            &transcript,
+            &project,
+            session_id,
+            messages,
+            "Retain this turn.",
+        );
+        let file_bytes = std::fs::metadata(&transcript).unwrap().len();
+        let scope = ObservationScopeV1::Project {
+            project_id: project_id.clone(),
+        };
+        let source = codex_observation_source_v2(session_id).unwrap();
+        let admission = MemoryHostAdmission::default();
+        let cancellation = ObservationCancellation::default();
+
+        let first = try_admit_codex_jsonl_observations_for_project_session_window(
+            &transcript,
+            &project,
+            project_id.clone(),
+            session_id,
+            &admission,
+            CODEX_HOOK_MAX_NEW_BYTES,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+
+        assert!(first.source_deferred);
+        assert!(first.frames_persisted > 0);
+        assert!(first.frames_persisted < (messages + 1) as u64);
+        let first_cursor = admission
+            .get_source_cursor(&source, &scope)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_cursor.position(), first.bytes_consumed);
+        assert!(first_cursor.position() < file_bytes);
+        assert_eq!(
+            admission.observations().len() as u64,
+            first.frames_persisted
+        );
+
+        let continuation = try_admit_codex_jsonl_observations_for_project_window(
+            &transcript,
+            &project,
+            project_id.clone(),
+            &admission,
+            CODEX_HOOK_MAX_NEW_BYTES,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+
+        assert!(!continuation.source_deferred);
+        assert_eq!(
+            first.bytes_consumed + continuation.bytes_consumed,
+            file_bytes
+        );
+        assert_eq!(admission.observations().len(), messages + 1);
+        assert_eq!(
+            session_ids_of(&admission.observations()),
+            BTreeSet::from([session_id.to_owned()])
+        );
+        let complete_cursor = admission
+            .get_source_cursor(&source, &scope)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(complete_cursor.position(), file_bytes);
+
+        let replay = try_admit_codex_jsonl_observations_for_project_session_window(
+            &transcript,
+            &project,
+            project_id,
+            session_id,
+            &admission,
+            CODEX_HOOK_MAX_NEW_BYTES,
+            &cancellation,
+        )
+        .await
+        .unwrap();
+
+        assert!(replay.resumed);
+        assert!(!replay.source_deferred);
+        assert_eq!(replay.frames_persisted, 0);
+        assert_eq!(admission.observations().len(), messages + 1);
+        assert_eq!(
+            admission.get_source_cursor(&source, &scope).await.unwrap(),
+            Some(complete_cursor)
+        );
     }
 
     #[tokio::test]
@@ -618,6 +1153,11 @@ mod goal_event_tests {
             + "\n";
         std::fs::write(&transcript, &encoded).unwrap();
         let project_id = ProjectId::new("project-windowed-provider").unwrap();
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            &project,
+            project_id.as_str(),
+        )
+        .unwrap();
         let admission = MemoryHostAdmission::default();
         let cancellation = ObservationCancellation::default();
 
@@ -717,6 +1257,11 @@ mod goal_event_tests {
         }
 
         let project_id = ProjectId::new("project-dated-rollouts").unwrap();
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            &project,
+            project_id.as_str(),
+        )
+        .unwrap();
         let scope = ObservationScopeV1::Project {
             project_id: project_id.clone(),
         };
@@ -902,6 +1447,11 @@ mod goal_event_tests {
         }
 
         let project_id = ProjectId::new("project-newest-before-older").unwrap();
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            &project,
+            project_id.as_str(),
+        )
+        .unwrap();
         let scope = ObservationScopeV1::Project {
             project_id: project_id.clone(),
         };
@@ -1017,6 +1567,11 @@ mod goal_event_tests {
         write_scoped_rollout(&home, "2026", "08", "28", "older-x", &other, "older day");
 
         let project_id = ProjectId::new("project-mixed-day").unwrap();
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            &project,
+            project_id.as_str(),
+        )
+        .unwrap();
         let scope = ObservationScopeV1::Project {
             project_id: project_id.clone(),
         };
@@ -1075,6 +1630,11 @@ mod goal_event_tests {
         let live_rollout = home.join(".codex/sessions/2026/08/29/rollout-live.jsonl");
 
         let project_id = ProjectId::new("project-live-tail").unwrap();
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            &project,
+            project_id.as_str(),
+        )
+        .unwrap();
         let scope = ObservationScopeV1::Project {
             project_id: project_id.clone(),
         };
@@ -2758,6 +3318,11 @@ mod recent_first_discovery_tests {
         let mut first_admit_ms = None;
         let mut ready_passes = 0u32;
         let project_id = ProjectId::new("project-large-codex").unwrap();
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            &project,
+            project_id.as_str(),
+        )
+        .unwrap();
         let admission = MemoryHostAdmission::default();
         let cancellation = ObservationCancellation::default();
         let deadline = Duration::from_secs(30);

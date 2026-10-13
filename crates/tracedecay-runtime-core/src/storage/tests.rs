@@ -1,6 +1,8 @@
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    #[cfg(windows)]
+    use super::paths_and_io::open_lock_file;
     use super::*;
     use serde_json::Value;
     use std::sync::{Arc, Barrier};
@@ -109,6 +111,63 @@ mod tests {
                 .expect_err("durable directory publication must require an absolute path");
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn durable_private_directory_interrupts_contended_lock_before_release() {
+        for (name, kind) in [
+            ("cancelled", io::ErrorKind::Interrupted),
+            ("expired", io::ErrorKind::TimedOut),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let target = root.path().join(name);
+            let lock_path = root.path().join(format!(".{name}.durable-directory.lock"));
+            let held = open_lock_file(&lock_path, true).unwrap();
+            held.lock().unwrap();
+            let worker_target = target.clone();
+            let (completed, result) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let mut checks = 0;
+                let outcome = PrivateStoreIo::create_dir_all_durable_interruptible(
+                    &worker_target,
+                    &mut || {
+                        // Leave enough successful checks to pass path setup
+                        // and exercise repeated contended lock attempts.
+                        checks += 1;
+                        if checks >= 32 {
+                            Err(io::Error::new(kind, "original directory creation control"))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                );
+                completed.send(outcome).unwrap();
+            });
+
+            // Keep the actual sidecar locked until the caller has returned.
+            // On regression the timeout still releases it before joining.
+            let before_release = result.recv_timeout(std::time::Duration::from_secs(2));
+            let absent_before_release = !target.exists();
+            drop(held);
+            worker.join().unwrap();
+
+            let error = before_release
+                .expect("interruption must return while the sidecar remains locked")
+                .expect_err("the original callback must interrupt directory creation");
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), "original directory creation control");
+            assert!(
+                absent_before_release,
+                "no directory may be published while waiting"
+            );
+
+            PrivateStoreIo::create_dir_all_durable_interruptible(&target, &mut || Ok(())).unwrap();
+            assert!(
+                target.is_dir(),
+                "retry must succeed after the lock is released"
+            );
+        }
     }
 
     #[cfg(unix)]

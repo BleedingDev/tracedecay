@@ -185,6 +185,15 @@ pub const fn http_application_owner_kind(
         | ApplicationSurfaceOperation::FactStoreList
         | ApplicationSurfaceOperation::FactFeedback
         | ApplicationSurfaceOperation::MemoryStatus
+        | ApplicationSurfaceOperation::ProviderFeedback
+        | ApplicationSurfaceOperation::ProviderCorrection
+        | ApplicationSurfaceOperation::ProviderDeleteBySource
+        | ApplicationSurfaceOperation::ProviderHealth
+        | ApplicationSurfaceOperation::ProviderInspection
+        | ApplicationSurfaceOperation::ProviderMaintenance
+        | ApplicationSurfaceOperation::ProviderSnapshotExport
+        | ApplicationSurfaceOperation::ProviderSnapshotRestore
+        | ApplicationSurfaceOperation::ProviderReplay
         | ApplicationSurfaceOperation::SessionRefreshStatus
         | ApplicationSurfaceOperation::SessionRefreshCancel
         | ApplicationSurfaceOperation::SessionRefreshBegin

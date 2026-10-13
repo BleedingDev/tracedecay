@@ -4,7 +4,7 @@ import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:f
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createRsbuild, loadConfig } from "@rsbuild/core";
+import { createRsbuild, loadConfig, mergeRsbuildConfig } from "@rsbuild/core";
 import { createRslib } from "@rslib/core";
 
 // Builds the committed `embedded/` artifacts the plugin bundle launches
@@ -14,6 +14,9 @@ import { createRslib } from "@rslib/core";
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const embeddedDir = path.join(packageRoot, "embedded");
 const check = process.argv.slice(2).includes("--check");
+// These single-entry bundles need traversal IDs, not dependency paths: pnpm's
+// shared store can live outside the checkout without changing the shipped bytes.
+const embeddedModuleIds = { optimization: { moduleIds: "natural" } };
 
 const outDir = await mkdtemp(path.join(tmpdir(), "tracedecay-chatgpt-ext-"));
 let appHtml;
@@ -22,7 +25,11 @@ try {
   const { content: appConfig } = await loadConfig({ cwd: packageRoot, path: path.join(packageRoot, "rsbuild.config.ts") });
   const app = await createRsbuild({
     cwd: packageRoot,
-    rsbuildConfig: { ...appConfig, output: { ...appConfig.output, distPath: { root: path.join(outDir, "app") }, cleanDistPath: false }, logLevel: "warn" },
+    rsbuildConfig: mergeRsbuildConfig(appConfig, {
+      output: { distPath: { root: path.join(outDir, "app") }, cleanDistPath: false },
+      tools: { rspack: embeddedModuleIds },
+      logLevel: "warn",
+    }),
   });
   await app.build();
   const appOut = path.join(outDir, "app");
@@ -42,7 +49,7 @@ try {
       root: packageRoot,
       logLevel: "warn",
       performance: { buildCache: false },
-      tools: { rspack: { output: { asyncChunks: false } } },
+      tools: { rspack: { ...embeddedModuleIds, output: { asyncChunks: false } } },
       lib: [
         {
           format: "esm",

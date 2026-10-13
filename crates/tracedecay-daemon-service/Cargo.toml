@@ -15,6 +15,21 @@ doctest = false
 # `DaemonInvocationService::invoke`, publication gates, and test constructors.
 # Production code is never gated by this feature.
 test-helpers = []
+# The pluggable memory-provider host (Native/NCM mount in `retained_owner`).
+# The composition root forwards its public host feature here; builds without
+# it pull no provider code or NCM runtime.
+memory-provider-host = [
+    "dep:chrono",
+    "dep:fs2",
+    "dep:hmac",
+    "dep:rusqlite",
+    "dep:zeroize",
+    "dep:tracedecay-memory-provider-registry",
+    "dep:tracedecay-memory-provider-ncm",
+    "dep:tracedecay-memory-observation",
+    "dep:tracedecay-memory-hygiene",
+    "dep:tracedecay-temporal-query",
+]
 
 [dependencies]
 hyper = { version = "1", features = ["http1", "server"] }
@@ -31,11 +46,16 @@ tracedecay-maintenance = { path = "../tracedecay-maintenance" }
 tracedecay-code-index-retention = { path = "../tracedecay-code-index-retention" }
 tracedecay-session-runtime = { path = "../tracedecay-session-runtime" }
 axum = "0.8"
+chrono = { version = "0.4.45", default-features = false, features = ["std"], optional = true }
+fs2 = { version = "0.4", optional = true }
 getrandom = "0.2"
 hex = "0.4"
+hmac = { version = "0.13.0", features = ["zeroize"], optional = true }
+rusqlite = { version = "0.40.1", default-features = false, features = ["backup"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
+zeroize = { version = "1.9.0", optional = true }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -56,12 +76,17 @@ tracedecay-graph-db = { path = "../tracedecay-graph-db" }
 tracedecay-graph-query = { path = "../tracedecay-graph-query" }
 tracedecay-hooks = { path = "../tracedecay-hooks" }
 tracedecay-lsp = { path = "../tracedecay-lsp" }
+tracedecay-memory-provider-registry = { path = "../tracedecay-memory-provider-registry", optional = true }
+tracedecay-memory-provider-ncm = { path = "../tracedecay-memory-provider-ncm", optional = true, features = ["rust-backend"] }
+tracedecay-memory-observation = { path = "../tracedecay-memory-observation", optional = true }
+tracedecay-memory-hygiene = { path = "../tracedecay-memory-hygiene", optional = true }
 tracedecay-policy = { path = "../tracedecay-policy" }
 tracedecay-runtime-core = { path = "../tracedecay-runtime-core" }
 tracedecay-query = { path = "../tracedecay-query" }
 tracedecay-rusqlite-runtime = { path = "../tracedecay-rusqlite-runtime" }
 tracedecay-session-memory = { path = "../tracedecay-session-memory" }
 tracedecay-session-temporal-store = { path = "../tracedecay-session-temporal-store" }
+tracedecay-temporal-query = { path = "../tracedecay-temporal-query", optional = true }
 tracedecay-sessions = { path = "../tracedecay-sessions" }
 tracedecay-source-edit = { path = "../tracedecay-source-edit" }
 tracedecay-store = { path = "../tracedecay-store" }
@@ -74,11 +99,15 @@ url = "2"
 libc = "0.2"
 
 [dev-dependencies]
+# The real provider fixture installs its model through the canonical encoder.
+tracedecay-memory-ncm-runtime = { path = "../tracedecay-memory-ncm-runtime", default-features = false, features = ["real-encoder"] }
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 tracedecay-code-index-runtime = { path = "../tracedecay-code-index-runtime", default-features = false, features = ["test-helpers"] }
 tracedecay-global-db = { path = "../tracedecay-global-db", features = ["test-helpers"] }
 tracedecay-runtime-core = { path = "../tracedecay-runtime-core", features = ["test-helpers"] }
+# Provider-neutral conformance fixtures for the mounted provider journey tests.
+tracedecay-memory-conformance = { path = "../tracedecay-memory-conformance" }
 # The moved lifecycle/doctor tests open projects through the registered test
 # runtime and pin the profile data directory.
 tracedecay-project = { path = "../tracedecay-project", features = ["test-helpers"] }

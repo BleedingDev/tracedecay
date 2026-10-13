@@ -169,6 +169,14 @@ _isolated_rust_test = rule(
     test = True,
 )
 
+def compiler_fixture_test(name, test_binary, **kwargs):
+    """Run compiler fixtures with the declared toolchain and isolated scratch."""
+    _isolated_rust_test(
+        name = name,
+        test_binary = test_binary,
+        **kwargs
+    )
+
 def perf_rustc_flags(opt_level):
     """The Cargo `perf` profile for one crate outside `-c opt`: its opt-level
     with debug assertions and overflow checks. `-c opt` (release) keeps the

@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "attempt": 1,
+  "issue_id": "tdmem-0305",
+  "mode": "complete",
+  "actor": "assistant",
+  "claim_comment": "Closing the memory conformance crate only after one provider-neutral harness runs mandatory descriptor, capability, handshake, health, observation, and recall checks against a dummy provider; fixtures pin exact contract, provider, implementation, and build identities; scenario and differential outputs retain only canonical terminal metadata and digests; and observer results cannot contain or replace product output.",
+  "checks": [
+    {
+      "name": "workspace resolves with conformance crate",
+      "argv": ["cargo", "metadata", "--locked", "--format-version", "1", "--no-deps"],
+      "timeout_seconds": 300
+    },
+    {
+      "name": "conformance crate formatting",
+      "argv": ["cargo", "fmt", "--package", "tracedecay-memory-conformance", "--", "--check"],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "conformance crate strict Clippy",
+      "argv": ["cargo", "clippy", "-p", "tracedecay-memory-conformance", "--all-targets", "--locked", "--", "-D", "warnings"],
+      "timeout_seconds": 900
+    },
+    {
+      "name": "conformance crate focused tests",
+      "argv": ["cargo", "test", "-p", "tracedecay-memory-conformance", "--locked"],
+      "timeout_seconds": 900
+    },
+    {
+      "name": "provider API remains green",
+      "argv": ["cargo", "test", "-p", "tracedecay-memory-provider-api", "--locked"],
+      "timeout_seconds": 600
+    },
+    {
+      "name": "fabric remains green",
+      "argv": ["cargo", "test", "-p", "tracedecay-memory-fabric", "--locked"],
+      "timeout_seconds": 600
+    },
+    {
+      "name": "Native adapter remains green",
+      "argv": ["cargo", "test", "-p", "tracedecay-memory-provider-native", "--locked"],
+      "timeout_seconds": 600
+    },
+    {
+      "name": "NCM boundary remains green",
+      "argv": ["cargo", "test", "-p", "tracedecay-memory-provider-ncm", "--locked"],
+      "timeout_seconds": 600
+    },
+    {
+      "name": "canonical provider Rust bindings remain generated",
+      "argv": ["python3", "scripts/product/generate-memory-provider-rust.py", "--repo", ".", "--check"],
+      "timeout_seconds": 180
+    },
+    {
+      "name": "upstream patch footprint remains valid",
+      "argv": ["python3", "scripts/product/check-patch-footprint-policy.py", "--repo", ".", "--policy", "product/upstream/patch-footprint-policy.json", "--map", "product/upstream/convergence-map.json"],
+      "timeout_seconds": 300
+    },
+    {
+      "name": "working tree has no whitespace damage",
+      "argv": ["git", "diff", "--check"],
+      "timeout_seconds": 60
+    }
+  ],
+  "acceptance_criteria": [
+    "The mandatory provider-neutral suite runs descriptor identity, required capabilities, handshake, health, observation acceptance, and recall against a dummy MemoryProvider and passes.",
+    "Every fixture carries a versioned contract identity, exact contract-set SHA-256, stable provider ID, exact provider build ID, and immutable implementation SHA-256, and rejects target or mandatory-operation mismatches.",
+    "Scenario and differential reports compare only provider-visible operations, typed terminals, exact-scope identities, and canonical payload digests rather than provider-internal state.",
+    "ObserverConformanceResult can retain only an opaque ProductOutputDigest plus an isolated conformance report; it contains no product-output bytes, prompt mutation surface, or active-provider replacement path."
+  ],
+  "close_reason": "Added the isolated provider-neutral memory conformance crate with exact identity fixtures, mandatory dummy-provider coverage, reusable scenario execution, differential terminal reports, and structurally isolated observer results.",
+  "close_comment": "Evidence: crates/tracedecay-memory-conformance depends only on tracedecay-memory-provider-api and is usable without the dashboard, host, fabric, Native adapter, NCM adapter, stores, or code index. FixtureIdentity pins the versioned canonical contract, contract-set digest, provider ID, provider build, and immutable implementation digest. MandatoryConformanceFixture enforces exact provider targets and fixed health/observe/recall slots. ConformanceHarness deterministically checks descriptor identity, mandatory capabilities, read-only handshake, health, observation acceptance, recall, terminal operation identity, and exact-scope digest. ProviderScenario and ScenarioRunner retain comparable typed terminal metadata and payload digests without provider state. DifferentialReport compares index-aligned external outcomes. ProductOutputDigest and ObserverConformanceResult make observer evidence incapable of carrying product-output bytes or replacing active output. The dummy-provider integration journeys pass mandatory conformance, expose a differential recall failure, and prove observer digest/report isolation. Validation branch run 33335324279 passed formatting, strict all-target Clippy, and focused tests before promotion; the serialized closure reruns those gates with the full M2 crate set and patch-policy checks."
+}

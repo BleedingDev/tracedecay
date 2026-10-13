@@ -1,0 +1,1663 @@
+#![allow(
+    clippy::expect_used,
+    clippy::field_reassign_with_default,
+    clippy::panic,
+    clippy::unwrap_used
+)]
+#![doc = "Integration tests for fenced source deletion and sanitized reconstruction."]
+
+use rusqlite::Connection;
+use serde::Serialize;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use tempfile::TempDir;
+use tracedecay_memory_ncm_core::types::{NcmConfig, RecordId, SourceId};
+use tracedecay_memory_ncm_runtime::embedding::doubles::HashEncoder;
+use tracedecay_memory_ncm_runtime::engine::{
+    FaultPoint, MaintenanceKind, MaintenanceRequest, NcmEngine, ObserveRequest, Outcome,
+    RecallRequest, RejectReason,
+};
+use tracedecay_memory_ncm_runtime::ports::{
+    Deadline, Embedding, EncoderError, EncoderIdentity, StateRoot, TextEncoder,
+};
+use tracedecay_memory_ncm_runtime::snapshot;
+use tracedecay_memory_ncm_runtime::store::{CapsuleStatus, StoredCapsule};
+
+const DEADLINE: Deadline = Deadline {
+    remaining_ms: u64::MAX,
+};
+const B_TOKEN: &str = "BETA_ERASE_TOKEN_91f36d";
+
+fn namespace() -> String {
+    "d1".repeat(32)
+}
+
+fn config() -> NcmConfig {
+    let mut config = NcmConfig::default();
+    config.terrain_resolution = 3;
+    config.stm.n_centers = 16;
+    config.stm.top_k_read = 16;
+    config.stm.top_k_write = 8;
+    config.ltm.n_centers = 16;
+    config.ltm.top_k_read = 16;
+    config.ltm.top_k_write = 8;
+    config.hybrid_candidates = 16;
+    config
+}
+
+fn root(tempdir: &TempDir) -> StateRoot {
+    StateRoot::new(tempdir.path()).expect("tempdir is absolute")
+}
+
+fn make_engine(tempdir: &TempDir) -> NcmEngine {
+    NcmEngine::new(root(tempdir), Arc::new(HashEncoder::new()), config())
+}
+
+fn observe(
+    engine: &NcmEngine,
+    namespace: &str,
+    source: &str,
+    key: &str,
+    value: &str,
+    idempotency_key: &str,
+) -> RecordId {
+    let request = observe_request(source, key, value, idempotency_key);
+    let reply = engine.observe(namespace, request);
+    assert_eq!(reply.outcome, Outcome::Success);
+    RecordId(reply.payload["record_id"].as_u64().expect("record id"))
+}
+
+fn observe_request(source: &str, key: &str, value: &str, idempotency_key: &str) -> ObserveRequest {
+    let mut request = ObserveRequest {
+        idempotency_key: idempotency_key.to_owned(),
+        payload_sha256: String::new(),
+        source: SourceId(source.to_owned()),
+        key_text: key.to_owned(),
+        value_text: value.to_owned(),
+        affect: None,
+        surprise: 0.35,
+        intensity: 1.0,
+        provenance: json!({"origin": "deletion-test", "retained_input": value}),
+        deadline: DEADLINE,
+    };
+    request.payload_sha256 = request
+        .canonical_payload_sha256()
+        .expect("observe payload serializes");
+    request
+}
+
+fn maintain(engine: &NcmEngine, namespace: &str, key: &str, kind: MaintenanceKind) {
+    let reply = engine.maintenance(
+        namespace,
+        MaintenanceRequest {
+            idempotency_key: key.to_owned(),
+            kind,
+            deadline: DEADLINE,
+        },
+    );
+    assert_eq!(reply.outcome, Outcome::Success);
+}
+
+fn inspect(engine: &NcmEngine, namespace: &str) -> Value {
+    let reply = engine.inspection(namespace);
+    assert_eq!(reply.outcome, Outcome::Success);
+    reply.payload
+}
+
+fn candidate_ids(payload: &Value) -> Vec<RecordId> {
+    payload
+        .get("Candidates")
+        .and_then(|value| value.get("candidates"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|candidate| candidate.get("record_id").and_then(Value::as_u64))
+        .map(RecordId)
+        .collect()
+}
+
+fn candidate_texts(payload: &Value) -> Vec<&str> {
+    payload
+        .get("Candidates")
+        .and_then(|value| value.get("candidates"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|candidate| {
+            ["key_text", "value_text"]
+                .into_iter()
+                .filter_map(|key| candidate.get(key).and_then(Value::as_str))
+        })
+        .collect()
+}
+
+fn sqlite_path(tempdir: &TempDir, namespace: &str) -> std::path::PathBuf {
+    tempdir
+        .path()
+        .join("namespaces")
+        .join(namespace)
+        .join("ncm.sqlite")
+}
+
+fn digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[derive(Serialize)]
+struct IntegrityReply<'a> {
+    outcome: &'a Value,
+    state_generation: &'a Value,
+    payload: &'a Value,
+}
+
+#[derive(Serialize)]
+struct IntegrityDeletionFence<'a> {
+    source: &'a Value,
+    sources: &'a Value,
+    target_epoch: &'a Value,
+    idempotency_key: &'a Value,
+    payload_sha256: &'a Value,
+    deleted_records: &'a Value,
+    deleted_record_ids: &'a Value,
+    pre_fence_state_digest: &'a Value,
+    fatigue: &'a Value,
+    steps_since_consolidation: &'a Value,
+}
+
+#[derive(Serialize)]
+struct IntegrityOperation<'a> {
+    deletion_fence: IntegrityDeletionFence<'a>,
+}
+
+#[derive(Serialize)]
+struct IntegrityBasis<'a> {
+    reply: IntegrityReply<'a>,
+    operation: IntegrityOperation<'a>,
+    state_digest: &'a str,
+}
+
+fn deletion_fence_integrity_digest(receipt: &Value) -> String {
+    let reply = &receipt["reply"];
+    let operation = &receipt["operation"]["deletion_fence"];
+    let state_digest = receipt["state_digest"].as_str().expect("state digest");
+    digest(
+        &serde_json::to_vec(&IntegrityBasis {
+            reply: IntegrityReply {
+                outcome: &reply["outcome"],
+                state_generation: &reply["state_generation"],
+                payload: &reply["payload"],
+            },
+            operation: IntegrityOperation {
+                deletion_fence: IntegrityDeletionFence {
+                    source: &operation["source"],
+                    sources: &operation["sources"],
+                    target_epoch: &operation["target_epoch"],
+                    idempotency_key: &operation["idempotency_key"],
+                    payload_sha256: &operation["payload_sha256"],
+                    deleted_records: &operation["deleted_records"],
+                    deleted_record_ids: &operation["deleted_record_ids"],
+                    pre_fence_state_digest: &operation["pre_fence_state_digest"],
+                    fatigue: &operation["fatigue"],
+                    steps_since_consolidation: &operation["steps_since_consolidation"],
+                },
+            },
+            state_digest,
+        })
+        .expect("deletion fence integrity serializes"),
+    )
+}
+
+fn support_ids(kernel: &Value) -> Vec<RecordId> {
+    let mut ids = Vec::new();
+    for layer in ["stm", "ltm"] {
+        for row in kernel[layer]["support"]
+            .as_array()
+            .expect("center support rows")
+        {
+            for id in row.as_array().expect("center support row") {
+                ids.push(RecordId(id.as_u64().expect("support record id")));
+            }
+        }
+    }
+    ids
+}
+
+#[test]
+fn deletion_rebuilds_mixed_state_and_erases_source_text_and_provenance() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let namespace = namespace();
+    let engine = make_engine(&tempdir);
+    let _a1 = observe(
+        &engine,
+        &namespace,
+        "source-a",
+        "alpha one",
+        "A retained one",
+        "a1",
+    );
+    let b1 = observe(
+        &engine,
+        &namespace,
+        "source-b",
+        &format!("{B_TOKEN} key one"),
+        &format!("{B_TOKEN} value one"),
+        "b1",
+    );
+    let _c1 = observe(
+        &engine,
+        &namespace,
+        "source-c",
+        "charlie one",
+        "C retained one",
+        "c1",
+    );
+    let _a2 = observe(
+        &engine,
+        &namespace,
+        "source-a",
+        "alpha two",
+        "A retained two",
+        "a2",
+    );
+    let b2 = observe(
+        &engine,
+        &namespace,
+        "source-b",
+        &format!("{B_TOKEN} key two"),
+        &format!("{B_TOKEN} value two"),
+        "b2",
+    );
+    let _c2 = observe(
+        &engine,
+        &namespace,
+        "source-c",
+        "charlie two",
+        "C retained two",
+        "c2",
+    );
+    maintain(
+        &engine,
+        &namespace,
+        "consolidate",
+        MaintenanceKind::Consolidate,
+    );
+    maintain(
+        &engine,
+        &namespace,
+        "merge-prune",
+        MaintenanceKind::MergePrune,
+    );
+    maintain(
+        &engine,
+        &namespace,
+        "old-checkpoint",
+        MaintenanceKind::Checkpoint,
+    );
+    let before = inspect(&engine, &namespace);
+    let original_snapshot =
+        snapshot::export(&engine, &namespace, DEADLINE).expect("snapshot before deletion exports");
+    let original_snapshot: Value =
+        serde_json::from_slice(original_snapshot.as_slice()).expect("snapshot JSON");
+    assert!(
+        original_snapshot["capsules"]
+            .as_array()
+            .expect("snapshot capsules")
+            .iter()
+            .any(|capsule| capsule["provenance"]
+                .as_str()
+                .expect("capsule provenance")
+                .contains(B_TOKEN))
+    );
+
+    let deleted = engine.delete_by_source(
+        &namespace,
+        &SourceId("source-b".to_owned()),
+        "delete-b",
+        DEADLINE,
+    );
+    assert_eq!(deleted.outcome, Outcome::Success);
+    assert_eq!(deleted.payload["deleted_records"], 2);
+    assert_eq!(deleted.payload["epoch"], 2);
+    let after = inspect(&engine, &namespace);
+    assert_ne!(after["stm_terrain_digest"], before["stm_terrain_digest"]);
+    assert_ne!(after["state_digest"], before["state_digest"]);
+    let exported =
+        snapshot::export(&engine, &namespace, DEADLINE).expect("sanitized snapshot exports");
+    let exported_text = std::str::from_utf8(exported.as_slice()).expect("snapshot UTF-8");
+    assert!(!exported_text.contains(B_TOKEN));
+    let exported: Value = serde_json::from_str(exported_text).expect("snapshot JSON");
+    let original_capsules: Vec<StoredCapsule> =
+        serde_json::from_value(original_snapshot["capsules"].clone()).expect("original capsules");
+    let exported_capsules: Vec<StoredCapsule> =
+        serde_json::from_value(exported["capsules"].clone()).expect("sanitized capsules");
+    assert_eq!(exported_capsules.len(), original_capsules.len());
+    for original in &original_capsules {
+        let retained = exported_capsules
+            .iter()
+            .find(|capsule| capsule.record_id == original.record_id)
+            .expect("deletion preserves each record identity");
+        if [b1, b2].contains(&original.record_id) {
+            assert_eq!(retained.status, CapsuleStatus::Revoked);
+            assert_eq!(retained.source_id, original.source_id);
+            assert_eq!(retained.commit_seq, original.commit_seq);
+            assert!(retained.key_text.is_empty());
+            assert!(retained.value_text.is_empty());
+            assert!(retained.key_embedding.is_empty());
+            assert!(retained.value_embedding.is_empty());
+            assert!(retained.ltm_key.is_empty());
+            assert_eq!(retained.provenance, "{}");
+        } else {
+            assert_eq!(retained, original, "unaffected capsule remains intact");
+            assert_eq!(retained.status, CapsuleStatus::Valid);
+        }
+    }
+    assert_eq!(
+        u64::try_from(
+            exported_capsules
+                .iter()
+                .filter(|capsule| capsule.status == CapsuleStatus::Revoked)
+                .count()
+        )
+        .expect("revoked count fits"),
+        deleted.payload["deleted_records"]
+            .as_u64()
+            .expect("deleted count")
+    );
+    assert!(
+        exported["capsules"]
+            .as_array()
+            .expect("capsules")
+            .iter()
+            .any(|capsule| capsule["provenance"]
+                .as_str()
+                .expect("capsule provenance")
+                .contains("A retained one"))
+    );
+
+    for query in [format!("{B_TOKEN} key one"), format!("{B_TOKEN} key two")] {
+        let recalled = engine.recall(
+            &namespace,
+            RecallRequest {
+                query_text: query,
+                top_k: 16,
+                deadline: DEADLINE,
+            },
+        );
+        assert!(matches!(
+            recalled.outcome,
+            Outcome::Success | Outcome::Empty
+        ));
+        assert!(
+            candidate_texts(&recalled.payload)
+                .iter()
+                .all(|text| !text.contains(B_TOKEN))
+        );
+        assert!(
+            candidate_ids(&recalled.payload)
+                .iter()
+                .all(|id| *id != b1 && *id != b2)
+        );
+    }
+
+    drop(engine);
+    let path = sqlite_path(&tempdir, &namespace);
+    let connection = Connection::open(&path).expect("compacted store opens");
+    let erased_capsules: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM capsules WHERE source_id = 'source-b'
+             AND status = 'revoked' AND key_text = '' AND value_text = ''
+             AND length(key_embedding) = 0 AND length(value_embedding) = 0
+             AND length(ltm_key) = 0 AND provenance = '{}'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("erased capsule count");
+    assert_eq!(erased_capsules, 2);
+    let retained_provenance: String = connection
+        .query_row(
+            "SELECT provenance FROM capsules WHERE value_text = 'A retained one'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("unaffected provenance reads");
+    assert_eq!(
+        serde_json::from_str::<Value>(&retained_provenance).expect("provenance JSON"),
+        json!({"origin": "deletion-test", "retained_input": "A retained one"})
+    );
+    let checkpoint_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM checkpoints", [], |row| row.get(0))
+        .expect("checkpoint count");
+    assert_eq!(checkpoint_count, 1, "all pre-deletion checkpoints are gone");
+    let state: Vec<u8> = connection
+        .query_row("SELECT state FROM checkpoints", [], |row| row.get(0))
+        .expect("sanitized checkpoint reads");
+    let checkpoint: Value = serde_json::from_slice(&state).expect("checkpoint JSON");
+    let ids = support_ids(&checkpoint["kernel"]);
+    assert!(!ids.contains(&b1));
+    assert!(!ids.contains(&b2));
+    drop(connection);
+    for candidate in [
+        path.clone(),
+        path.with_file_name("ncm.sqlite-wal"),
+        path.with_file_name("ncm.sqlite-shm"),
+    ] {
+        let bytes = fs::read(candidate).unwrap_or_default();
+        assert!(
+            !bytes
+                .windows(B_TOKEN.len())
+                .any(|window| window == B_TOKEN.as_bytes()),
+            "revoked source text or provenance remains in controlled SQLite bytes"
+        );
+    }
+
+    let reopened = make_engine(&tempdir);
+    let reopened_state = inspect(&reopened, &namespace);
+    assert_eq!(reopened_state["epoch"], 2);
+    assert_eq!(
+        reopened_state["stm_terrain_digest"],
+        after["stm_terrain_digest"]
+    );
+    let reopened_export = snapshot::export(&reopened, &namespace, DEADLINE)
+        .expect("reopened sanitized snapshot exports");
+    assert!(
+        !std::str::from_utf8(reopened_export.as_slice())
+            .expect("snapshot UTF-8")
+            .contains(B_TOKEN)
+    );
+    let replay = reopened.delete_by_source(
+        &namespace,
+        &SourceId("source-b".to_owned()),
+        "delete-b",
+        DEADLINE,
+    );
+    assert_eq!(replay.outcome, Outcome::Success);
+    assert_eq!(replay.state_generation, deleted.state_generation);
+    assert_eq!(replay.payload["replayed"], true);
+    assert_eq!(inspect(&reopened, &namespace)["epoch"], 2);
+
+    let scratch = TempDir::new().expect("scratch tempdir creates");
+    let scratch_engine = make_engine(&scratch);
+    observe(
+        &scratch_engine,
+        &namespace,
+        "source-a",
+        "alpha one",
+        "A retained one",
+        "sa1",
+    );
+    observe(
+        &scratch_engine,
+        &namespace,
+        "source-c",
+        "charlie one",
+        "C retained one",
+        "sc1",
+    );
+    observe(
+        &scratch_engine,
+        &namespace,
+        "source-a",
+        "alpha two",
+        "A retained two",
+        "sa2",
+    );
+    observe(
+        &scratch_engine,
+        &namespace,
+        "source-c",
+        "charlie two",
+        "C retained two",
+        "sc2",
+    );
+    maintain(
+        &scratch_engine,
+        &namespace,
+        "scratch-consolidate",
+        MaintenanceKind::Consolidate,
+    );
+    maintain(
+        &scratch_engine,
+        &namespace,
+        "scratch-merge",
+        MaintenanceKind::MergePrune,
+    );
+    maintain(
+        &scratch_engine,
+        &namespace,
+        "scratch-checkpoint",
+        MaintenanceKind::Checkpoint,
+    );
+    let scratch_state = inspect(&scratch_engine, &namespace);
+    assert_eq!(
+        after["stm_terrain_digest"],
+        scratch_state["stm_terrain_digest"]
+    );
+    assert_eq!(
+        after["ltm_terrain_digest"],
+        scratch_state["ltm_terrain_digest"]
+    );
+}
+
+#[test]
+fn interrupted_deletion_resumes_before_serving_and_bumps_epoch_once() {
+    for restart_before_recovery in [false, true] {
+        let tempdir = TempDir::new().expect("tempdir creates");
+        let namespace = namespace();
+        let engine = make_engine(&tempdir);
+        observe(
+            &engine,
+            &namespace,
+            "source-a",
+            "kept",
+            "kept value",
+            "kept",
+        );
+        let deleted_id = observe(
+            &engine,
+            &namespace,
+            "source-b",
+            &format!("{B_TOKEN} crash key"),
+            &format!("{B_TOKEN} crash value"),
+            "deleted",
+        );
+        let durable_state = || {
+            let connection = Connection::open_with_flags(
+                sqlite_path(&tempdir, &namespace),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            connection.query_row(
+                "SELECT
+                    (SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'epoch'),
+                    (SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'commit_seq'),
+                    (SELECT COUNT(*) FROM fence),
+                    (SELECT COUNT(*) FROM events),
+                    (SELECT MAX(seq) FROM events),
+                    (SELECT COUNT(*) FROM checkpoints),
+                    (SELECT COUNT(*) FROM capsules WHERE status != 'revoked'),
+                    (SELECT COUNT(*) FROM capsules WHERE source_id = 'source-b' AND status = 'revoked'
+                        AND key_text = '' AND value_text = '' AND length(key_embedding) = 0
+                        AND length(value_embedding) = 0 AND length(ltm_key) = 0 AND provenance = '{}'),
+                    (SELECT epoch FROM revocations WHERE source_id = 'source-b')",
+                [],
+                |row| {
+                    let nonnegative = |column: usize| -> rusqlite::Result<u64> {
+                        let value = row.get::<_, i64>(column)?;
+                        Ok(u64::try_from(value).expect("durable counts and generations must be nonnegative"))
+                    };
+                    Ok(json!({"epoch":nonnegative(0)?,"commit_seq":nonnegative(1)?,"fences":nonnegative(2)?,
+                        "events":nonnegative(3)?,"last_event":nonnegative(4)?,"checkpoints":nonnegative(5)?,
+                        "retained_records":nonnegative(6)?,"scrubbed_sources":nonnegative(7)?,"revocation_epoch":nonnegative(8)?}))
+                },
+            ).unwrap()
+        };
+        engine
+            .inject_fault_once(FaultPoint::AfterDeletionFenceCommit)
+            .expect("fault arms");
+        let interrupted = engine.delete_by_source(
+            &namespace,
+            &SourceId("source-b".to_owned()),
+            "crash-delete",
+            DEADLINE,
+        );
+        assert_eq!(interrupted.outcome, Outcome::EffectUnknown);
+        let assert_reads_refuse_recovery = |engine: &NcmEngine| {
+            let recalled = engine.recall(
+                &namespace,
+                RecallRequest {
+                    query_text: format!("{B_TOKEN} crash key"),
+                    top_k: 16,
+                    deadline: DEADLINE,
+                },
+            );
+            assert!(matches!(recalled.outcome, Outcome::Unavailable(_)));
+            assert_eq!(recalled.state_generation, interrupted.state_generation);
+            assert_eq!(recalled.payload, Value::Null);
+            let health = engine.common_control(
+                &namespace,
+                json!({"action":"health","expected_generation":interrupted.state_generation}),
+                DEADLINE,
+            );
+            assert!(matches!(health.outcome, Outcome::Unavailable(_)));
+            assert_eq!(health.state_generation, interrupted.state_generation);
+            assert_eq!(health.payload, Value::Null);
+        };
+        assert_reads_refuse_recovery(&engine);
+        let recovering = if restart_before_recovery {
+            drop(engine);
+            let pending = durable_state();
+            assert_eq!(pending["epoch"], 1);
+            assert_eq!(pending["commit_seq"], interrupted.state_generation);
+            assert_eq!(pending["fences"], 1);
+            let read_only = make_engine(&tempdir);
+            assert_reads_refuse_recovery(&read_only);
+            drop(read_only);
+            assert_eq!(
+                durable_state(),
+                pending,
+                "read-only calls cannot complete pending privacy recovery"
+            );
+            make_engine(&tempdir)
+        } else {
+            engine
+        };
+        assert_reads_refuse_recovery(&recovering);
+        let ready = recovering.handshake(&namespace);
+        assert_eq!(ready.outcome, Outcome::Success);
+        assert_eq!(ready.payload["epoch"], 2);
+        assert_eq!(ready.state_generation, interrupted.state_generation + 1);
+        let repeated_ready = recovering.handshake(&namespace);
+        assert_eq!(repeated_ready.outcome, Outcome::Success);
+        assert_eq!(repeated_ready.payload["epoch"], 2);
+        assert_eq!(repeated_ready.state_generation, ready.state_generation);
+        drop(recovering);
+        let completed = durable_state();
+        assert_eq!(completed["epoch"], 2);
+        assert_eq!(completed["commit_seq"], ready.state_generation);
+        assert_eq!(completed["last_event"], ready.state_generation);
+        assert_eq!(completed["fences"], 0);
+        assert_eq!(
+            completed["events"].as_u64().unwrap(),
+            interrupted.state_generation + 1
+        );
+        assert_eq!(completed["retained_records"], 1);
+        assert_eq!(completed["scrubbed_sources"], 1);
+        assert_eq!(completed["revocation_epoch"], 2);
+        assert_eq!(completed["checkpoints"], 1);
+
+        let reopened = make_engine(&tempdir);
+        let restarted_ready = reopened.handshake(&namespace);
+        assert_eq!(restarted_ready.outcome, Outcome::Success);
+        assert_eq!(restarted_ready.payload["epoch"], 2);
+        assert_eq!(restarted_ready.state_generation, ready.state_generation);
+        let recalled = reopened.recall(
+            &namespace,
+            RecallRequest {
+                query_text: format!("{B_TOKEN} crash key"),
+                top_k: 16,
+                deadline: DEADLINE,
+            },
+        );
+        assert!(!candidate_ids(&recalled.payload).contains(&deleted_id));
+        assert!(
+            candidate_texts(&recalled.payload)
+                .iter()
+                .all(|text| !text.contains(B_TOKEN))
+        );
+        let exported = snapshot::export(&reopened, &namespace, DEADLINE).unwrap();
+        assert!(
+            !std::str::from_utf8(exported.as_slice())
+                .unwrap()
+                .contains(B_TOKEN)
+        );
+        assert_eq!(
+            reopened.revoked_sources(&namespace).unwrap(),
+            vec![SourceId("source-b".to_owned())]
+        );
+        let first_completed = reopened.delete_by_source(
+            &namespace,
+            &SourceId("source-b".to_owned()),
+            "crash-delete",
+            DEADLINE,
+        );
+        assert_eq!(first_completed.outcome, Outcome::Success);
+        assert_eq!(first_completed.payload["replayed"], true);
+        assert_eq!(first_completed.state_generation, ready.state_generation);
+        let duplicate = reopened.delete_by_source(
+            &namespace,
+            &SourceId("source-b".to_owned()),
+            "crash-delete",
+            DEADLINE,
+        );
+        assert_eq!(duplicate.state_generation, ready.state_generation);
+        assert_eq!(duplicate.payload["replayed"], true);
+        drop(reopened);
+        assert_eq!(
+            durable_state(),
+            completed,
+            "restarting and reading a recovered namespace cannot bump its epoch again"
+        );
+    }
+}
+
+#[test]
+fn sanitized_tick_reset_binds_prefix_suffix_and_rejects_restart_tamper() {
+    for tamper_completion_tick in [false, true] {
+        let tempdir = TempDir::new().expect("tempdir creates");
+        let namespace = namespace();
+        let engine = make_engine(&tempdir);
+        observe(
+            &engine,
+            &namespace,
+            "source-a",
+            "prefix",
+            "retained prefix",
+            "prefix",
+        );
+        maintain(
+            &engine,
+            &namespace,
+            "prefix-advance",
+            MaintenanceKind::Advance { ticks: 2 },
+        );
+        observe(&engine, &namespace, "source-b", B_TOKEN, B_TOKEN, "deleted");
+        maintain(
+            &engine,
+            &namespace,
+            "suffix-advance",
+            MaintenanceKind::Advance { ticks: 4 },
+        );
+        let deleted = engine.delete_by_source(
+            &namespace,
+            &SourceId("source-b".to_owned()),
+            "sanitized-tick-delete",
+            DEADLINE,
+        );
+        assert_eq!(deleted.outcome, Outcome::Success, "{deleted:?}");
+        let tick_before = deleted.payload["sanitized_replay"]["tick_before"]
+            .as_u64()
+            .expect("pre-deletion tick");
+        let tick_after = deleted.payload["sanitized_replay"]["tick_after"]
+            .as_u64()
+            .expect("sanitized tick");
+        assert_eq!(tick_before, 8);
+        assert_eq!(tick_after, 7);
+        drop(engine);
+
+        if tamper_completion_tick {
+            let connection =
+                Connection::open(sqlite_path(&tempdir, &namespace)).expect("tamper store opens");
+            connection
+                .execute(
+                    "UPDATE events SET created_tick = created_tick + 1
+                     WHERE kind = 'delete_by_source'",
+                    [],
+                )
+                .expect("tamper completion tick");
+            drop(connection);
+            let reopened = make_engine(&tempdir);
+            let handshake = reopened.handshake(&namespace);
+            assert_eq!(handshake.outcome, Outcome::Corrupt, "{handshake:?}");
+        } else {
+            let reopened = make_engine(&tempdir);
+            let handshake = reopened.handshake(&namespace);
+            assert_eq!(handshake.outcome, Outcome::Success, "{handshake:?}");
+            assert_eq!(inspect(&reopened, &namespace)["tick"], tick_after);
+        }
+    }
+}
+
+#[test]
+fn second_deletion_restart_accepts_prior_sanitized_tick_reset() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let namespace = namespace();
+    let engine = make_engine(&tempdir);
+    observe(&engine, &namespace, "source-b", B_TOKEN, B_TOKEN, "deleted");
+
+    let first = engine.delete_by_source(
+        &namespace,
+        &SourceId("source-b".to_owned()),
+        "first-delete",
+        DEADLINE,
+    );
+    assert_eq!(first.outcome, Outcome::Success, "{first:?}");
+    assert_eq!(first.payload["sanitized_replay"]["tick_before"], 1);
+    assert_eq!(first.payload["sanitized_replay"]["tick_after"], 0);
+
+    // Add a retained suffix after the first reset, then leave the second fence
+    // pending so startup must validate both the reset and the new fence.
+    observe(
+        &engine,
+        &namespace,
+        "source-a",
+        "retained after reset",
+        "retained after reset",
+        "retained-after-reset",
+    );
+    engine
+        .inject_fault_once(FaultPoint::AfterDeletionFenceCommit)
+        .expect("fault arms");
+    let second = engine.delete_by_source(
+        &namespace,
+        &SourceId("source-b".to_owned()),
+        "second-delete",
+        DEADLINE,
+    );
+    assert_eq!(second.outcome, Outcome::EffectUnknown, "{second:?}");
+    drop(engine);
+
+    let reopened = make_engine(&tempdir);
+    let ready = reopened.handshake(&namespace);
+    assert_eq!(ready.outcome, Outcome::Success, "{ready:?}");
+    assert_eq!(ready.payload["epoch"], 3);
+    assert_eq!(ready.state_generation, second.state_generation + 1);
+    assert_eq!(inspect(&reopened, &namespace)["tick"], 1);
+    assert_eq!(
+        reopened.revoked_sources(&namespace).expect("revocations"),
+        vec![SourceId("source-b".to_owned())]
+    );
+}
+
+#[test]
+fn corrupted_pending_rebuild_journal_fails_closed_without_publishing_recallable_state() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let namespace = namespace();
+    let engine = make_engine(&tempdir);
+    observe(
+        &engine, &namespace, "source-a", "retained", "value", "retained",
+    );
+    observe(&engine, &namespace, "source-b", B_TOKEN, B_TOKEN, "deleted");
+    engine
+        .inject_fault_once(FaultPoint::AfterDeletionFenceCommit)
+        .expect("fault arms");
+    let interrupted = engine.delete_by_source(
+        &namespace,
+        &SourceId("source-b".to_owned()),
+        "corrupt-pending-delete",
+        DEADLINE,
+    );
+    assert_eq!(interrupted.outcome, Outcome::EffectUnknown);
+    drop(engine);
+
+    let connection = Connection::open(sqlite_path(&tempdir, &namespace))
+        .expect("store opens for corruption fixture");
+    connection
+        .execute(
+            "UPDATE events SET payload_sha256 = ?1 WHERE kind = 'deletion_fence'",
+            ["00".repeat(32)],
+        )
+        .expect("fence payload corruption writes");
+    drop(connection);
+
+    let reopened = make_engine(&tempdir);
+    let handshake = reopened.handshake(&namespace);
+    assert_eq!(handshake.outcome, Outcome::Corrupt, "{handshake:?}");
+    let recalled = reopened.recall(
+        &namespace,
+        RecallRequest {
+            query_text: B_TOKEN.to_owned(),
+            top_k: 16,
+            deadline: DEADLINE,
+        },
+    );
+    assert!(!matches!(recalled.outcome, Outcome::Success));
+    assert_eq!(recalled.payload, Value::Null);
+}
+
+#[test]
+fn stale_resident_fence_reconciles_after_durable_rebuild_completes() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let namespace = namespace();
+    let first = make_engine(&tempdir);
+    observe(
+        &first,
+        &namespace,
+        "source-a",
+        "retained key",
+        "retained value",
+        "retained",
+    );
+    observe(&first, &namespace, "source-b", B_TOKEN, B_TOKEN, "deleted");
+    first
+        .inject_fault_once(FaultPoint::AfterCommitBeforePublish)
+        .expect("fault arms");
+    let interrupted = first.delete_by_source(
+        &namespace,
+        &SourceId("source-b".to_owned()),
+        "stale-resident-delete",
+        DEADLINE,
+    );
+    assert_eq!(interrupted.outcome, Outcome::EffectUnknown);
+
+    // The durable rebuild has finished, but `first` still has the stale
+    // in-memory fence bit because publication was interrupted. A normal recall
+    // must notice that the durable fence is gone and reconcile before reading.
+    let recalled = first.recall(
+        &namespace,
+        RecallRequest {
+            query_text: B_TOKEN.to_owned(),
+            top_k: 16,
+            deadline: DEADLINE,
+        },
+    );
+    assert!(matches!(
+        recalled.outcome,
+        Outcome::Success | Outcome::Empty
+    ));
+    assert!(
+        candidate_texts(&recalled.payload)
+            .iter()
+            .all(|text| !text.contains(B_TOKEN))
+    );
+    assert_eq!(
+        first.inspection(&namespace).state_generation,
+        interrupted.state_generation
+    );
+}
+
+#[test]
+fn completion_phase_keeps_the_durable_fence_until_compaction_finishes() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let namespace = namespace();
+    let engine = make_engine(&tempdir);
+    observe(&engine, &namespace, "source-b", B_TOKEN, B_TOKEN, "deleted");
+    engine
+        .inject_fault_once(FaultPoint::AfterDeletionCompletionCommit)
+        .expect("fault arms");
+    let interrupted = engine.delete_by_source(
+        &namespace,
+        &SourceId("source-b".to_owned()),
+        "completion-phase-delete",
+        DEADLINE,
+    );
+    assert_eq!(interrupted.outcome, Outcome::EffectUnknown);
+    let refused = engine.recall(
+        &namespace,
+        RecallRequest {
+            query_text: B_TOKEN.to_owned(),
+            top_k: 16,
+            deadline: DEADLINE,
+        },
+    );
+    assert!(matches!(refused.outcome, Outcome::Unavailable(_)));
+    drop(engine);
+
+    let path = sqlite_path(&tempdir, &namespace);
+    let raw_bytes = fs::read(&path).expect("phase store bytes");
+    assert!(
+        raw_bytes
+            .windows(B_TOKEN.len())
+            .any(|window| window == B_TOKEN.as_bytes())
+    );
+    let connection = Connection::open(&path).expect("phase store opens");
+    let reason: String = connection
+        .query_row("SELECT reason FROM fence WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .expect("compaction phase fence remains");
+    assert_eq!(reason, "compacting");
+    let (completion_seq, completion_epoch, event_count, completion_receipt): (
+        u64,
+        u64,
+        u64,
+        String,
+    ) = connection
+        .query_row(
+            "SELECT
+                (SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'commit_seq'),
+                (SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'epoch'),
+                (SELECT COUNT(*) FROM events),
+                (SELECT receipt FROM events WHERE idempotency_key = 'completion-phase-delete')",
+            [],
+            |row| {
+                let nonnegative = |column: usize| -> rusqlite::Result<u64> {
+                    let value = row.get::<_, i64>(column)?;
+                    Ok(u64::try_from(value)
+                        .expect("durable counts and generations must be nonnegative"))
+                };
+                Ok((
+                    nonnegative(0)?,
+                    nonnegative(1)?,
+                    nonnegative(2)?,
+                    row.get(3)?,
+                ))
+            },
+        )
+        .expect("committed completion reads");
+    assert_eq!(completion_seq, interrupted.state_generation);
+    drop(connection);
+
+    let reopened = make_engine(&tempdir);
+    let ready = reopened.handshake(&namespace);
+    assert_eq!(ready.outcome, Outcome::Success, "{ready:?}");
+    assert_eq!(ready.state_generation, completion_seq);
+    assert_eq!(
+        inspect(&reopened, &namespace)["epoch"],
+        json!(completion_epoch)
+    );
+    let replay = reopened.delete_by_source(
+        &namespace,
+        &SourceId("source-b".to_owned()),
+        "completion-phase-delete",
+        DEADLINE,
+    );
+    assert_eq!(replay.outcome, Outcome::Success, "{replay:?}");
+    assert_eq!(replay.state_generation, completion_seq);
+    assert_eq!(replay.payload["epoch"], json!(completion_epoch));
+    assert_eq!(replay.payload["replayed"], true);
+    drop(reopened);
+    let connection = Connection::open(&path).expect("completed compacted store opens");
+    let (remaining_fences, final_event_count, final_receipt): (u64, u64, String) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM fence),
+                (SELECT COUNT(*) FROM events),
+                (SELECT receipt FROM events WHERE idempotency_key = 'completion-phase-delete')",
+            [],
+            |row| {
+                let nonnegative = |column: usize| -> rusqlite::Result<u64> {
+                    let value = row.get::<_, i64>(column)?;
+                    Ok(u64::try_from(value)
+                        .expect("durable counts and generations must be nonnegative"))
+                };
+                Ok((nonnegative(0)?, nonnegative(1)?, row.get(2)?))
+            },
+        )
+        .expect("compaction completion evidence reads");
+    assert_eq!(remaining_fences, 0);
+    assert_eq!(final_event_count, event_count);
+    assert_eq!(final_receipt, completion_receipt);
+    drop(connection);
+    let bytes = fs::read(path).expect("compacted phase store bytes");
+    assert!(
+        !bytes
+            .windows(B_TOKEN.len())
+            .any(|window| window == B_TOKEN.as_bytes())
+    );
+}
+
+#[test]
+fn historical_deletion_fence_null_receipt_key_survives_recovery_and_export() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let namespace = namespace();
+    let engine = make_engine(&tempdir);
+    observe(&engine, &namespace, "source-b", B_TOKEN, B_TOKEN, "deleted");
+    engine
+        .inject_fault_once(FaultPoint::AfterDeletionFenceCommit)
+        .expect("fault arms");
+    let interrupted = engine.delete_by_source(
+        &namespace,
+        &SourceId("source-b".to_owned()),
+        "historical-null-fence",
+        DEADLINE,
+    );
+    assert_eq!(interrupted.outcome, Outcome::EffectUnknown);
+    drop(engine);
+
+    // Reconstruct the actual pre-canonical-input fence shape: HEAD used the
+    // sorted source digest as the event payload and serialized the receipt's
+    // key as explicit JSON null.
+    let path = sqlite_path(&tempdir, &namespace);
+    let connection = Connection::open(&path).expect("fence fixture opens");
+    let receipt: String = connection
+        .query_row(
+            "SELECT receipt FROM events WHERE kind = 'deletion_fence'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("fence receipt reads");
+    let mut receipt: Value = serde_json::from_str(&receipt).expect("fence receipt is JSON");
+    let source_digest = digest(
+        &serde_json::to_vec(&vec![json!(SourceId("source-b".to_owned()))])
+            .expect("source digest serializes"),
+    );
+    let operation = receipt["operation"]["deletion_fence"]
+        .as_object_mut()
+        .expect("fence operation object");
+    operation.remove("canonical_input");
+    operation.insert("payload_sha256".to_owned(), json!(source_digest));
+    receipt["idempotency_key"] = Value::Null;
+    receipt["integrity_digest"] = json!(deletion_fence_integrity_digest(&receipt));
+    connection
+        .execute(
+            "UPDATE events SET payload_sha256 = ?1, receipt = ?2
+             WHERE kind = 'deletion_fence'",
+            [
+                source_digest,
+                serde_json::to_string(&receipt).expect("fence receipt serializes"),
+            ],
+        )
+        .expect("historical fence fixture writes");
+    drop(connection);
+
+    let reopened = make_engine(&tempdir);
+    let ready = reopened.handshake(&namespace);
+    assert_eq!(ready.outcome, Outcome::Success, "{ready:?}");
+    assert_eq!(ready.state_generation, interrupted.state_generation + 1);
+    let exported = snapshot::export(&reopened, &namespace, DEADLINE)
+        .expect("historical deletion fence exports");
+    assert!(
+        std::str::from_utf8(exported.as_slice())
+            .expect("snapshot UTF-8")
+            .contains("\"idempotency_key\":null")
+    );
+}
+
+#[test]
+fn explicit_null_completion_receipt_key_is_rejected_after_restart() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let namespace = namespace();
+    let engine = make_engine(&tempdir);
+    observe(&engine, &namespace, "source-b", B_TOKEN, B_TOKEN, "deleted");
+    let completed = engine.delete_by_source(
+        &namespace,
+        &SourceId("source-b".to_owned()),
+        "null-completion-key",
+        DEADLINE,
+    );
+    assert_eq!(completed.outcome, Outcome::Success);
+    drop(engine);
+
+    let path = sqlite_path(&tempdir, &namespace);
+    let connection = Connection::open(&path).expect("completion fixture opens");
+    let receipt: String = connection
+        .query_row(
+            "SELECT receipt FROM events WHERE kind = 'delete_by_source'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("completion receipt reads");
+    let mut receipt: Value = serde_json::from_str(&receipt).expect("completion receipt is JSON");
+    receipt["idempotency_key"] = Value::Null;
+    connection
+        .execute(
+            "UPDATE events SET receipt = ?1 WHERE kind = 'delete_by_source'",
+            [serde_json::to_string(&receipt).expect("completion receipt serializes")],
+        )
+        .expect("null completion fixture writes");
+    drop(connection);
+
+    let reopened = make_engine(&tempdir);
+    assert_eq!(reopened.handshake(&namespace).outcome, Outcome::Corrupt);
+    assert_eq!(
+        snapshot::export(&reopened, &namespace, DEADLINE)
+            .unwrap_err()
+            .outcome,
+        Outcome::Corrupt
+    );
+}
+
+#[test]
+fn completed_deletion_replay_rejects_a_receipt_with_a_different_request_key() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let namespace = namespace();
+    let engine = make_engine(&tempdir);
+    observe(&engine, &namespace, "source-b", B_TOKEN, B_TOKEN, "deleted");
+    let deleted = engine.delete_by_source(
+        &namespace,
+        &SourceId("source-b".to_owned()),
+        "delete-receipt-key",
+        DEADLINE,
+    );
+    assert_eq!(deleted.outcome, Outcome::Success);
+    drop(engine);
+
+    let path = sqlite_path(&tempdir, &namespace);
+    let connection = Connection::open(&path).expect("store opens for corruption fixture");
+    let receipt: String = connection
+        .query_row(
+            "SELECT receipt FROM events
+             WHERE kind = 'delete_by_source' AND idempotency_key = ?1",
+            ["delete-receipt-key"],
+            |row| row.get(0),
+        )
+        .expect("completed deletion receipt reads");
+    let mut receipt: Value = serde_json::from_str(&receipt).expect("receipt is JSON");
+    assert_eq!(receipt["idempotency_key"], json!("delete-receipt-key"));
+    receipt["idempotency_key"] = json!("different-delete-key");
+    connection
+        .execute(
+            "UPDATE events SET receipt = ?1
+             WHERE kind = 'delete_by_source' AND idempotency_key = ?2",
+            [
+                serde_json::to_string(&receipt).expect("receipt serializes"),
+                "delete-receipt-key".to_owned(),
+            ],
+        )
+        .expect("receipt corruption writes");
+    drop(connection);
+
+    let reopened = make_engine(&tempdir);
+    let ready = reopened.handshake(&namespace);
+    assert_eq!(ready.outcome, Outcome::Corrupt, "{ready:?}");
+    let replay = reopened.delete_by_source(
+        &namespace,
+        &SourceId("source-b".to_owned()),
+        "delete-receipt-key",
+        DEADLINE,
+    );
+    assert_eq!(replay.outcome, Outcome::Corrupt);
+    assert_eq!(replay.state_generation, deleted.state_generation);
+    assert_eq!(
+        replay.payload,
+        json!({"reason": "durable receipt idempotency key mismatch"})
+    );
+    let unavailable_state = reopened.inspection(&namespace);
+    assert_eq!(unavailable_state.outcome, Outcome::Corrupt);
+    assert_eq!(unavailable_state.state_generation, deleted.state_generation);
+    assert_eq!(unavailable_state.payload, replay.payload);
+}
+
+#[test]
+fn completed_k1_replay_survives_a_later_k2_revocation_projection() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let namespace = namespace();
+    let engine = make_engine(&tempdir);
+    observe(&engine, &namespace, "source-b", B_TOKEN, B_TOKEN, "deleted");
+
+    let k1 = engine.delete_by_source(
+        &namespace,
+        &SourceId("source-b".to_owned()),
+        "delete-k1",
+        DEADLINE,
+    );
+    assert_eq!(k1.outcome, Outcome::Success, "{k1:?}");
+    let k2 = engine.delete_by_source(
+        &namespace,
+        &SourceId("source-b".to_owned()),
+        "delete-k2",
+        DEADLINE,
+    );
+    assert_eq!(k2.outcome, Outcome::Success, "{k2:?}");
+    assert!(k2.state_generation > k1.state_generation);
+
+    let replay = engine.delete_by_source(
+        &namespace,
+        &SourceId("source-b".to_owned()),
+        "delete-k1",
+        DEADLINE,
+    );
+    assert_eq!(replay.outcome, Outcome::Success, "{replay:?}");
+    assert_eq!(replay.payload["replayed"], true);
+    assert_eq!(replay.state_generation, k1.state_generation);
+    assert_eq!(replay.payload["epoch"], k1.payload["epoch"]);
+}
+
+#[test]
+fn common_deletion_replay_binds_mode_retention_and_verification_semantics() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let namespace = namespace();
+    let engine = make_engine(&tempdir);
+    observe(&engine, &namespace, "source-b", B_TOKEN, B_TOKEN, "deleted");
+    let before = engine.inspection(&namespace).state_generation;
+    let first_request = json!({
+        "action": "delete_by_source",
+        "idempotency_key": "common-delete",
+        "sources": ["source-b"],
+        "expected_generation": before,
+        "mode": "hard_delete",
+        "include_snapshots": true,
+        "retention_lock_policy_revision": 7,
+        "verification_query": "source-b:verified-absent",
+        "verification_query_digest": "verification-v1"
+    });
+    let first = engine.common_control(&namespace, first_request.clone(), DEADLINE);
+    assert_eq!(first.outcome, Outcome::Success, "{first:?}");
+
+    let committed_state = inspect(&engine, &namespace);
+    let mut changed = first_request.clone();
+    changed["mode"] = json!("anonymize");
+    let conflict = engine.common_control(&namespace, changed, DEADLINE);
+    assert_eq!(
+        conflict.outcome,
+        Outcome::Rejected(RejectReason::IdempotencyConflict),
+        "{conflict:?}"
+    );
+    assert_eq!(conflict.payload, Value::Null);
+    assert_eq!(conflict.state_generation, first.state_generation);
+    assert_eq!(inspect(&engine, &namespace), committed_state);
+    let replay = engine.common_control(&namespace, first_request, DEADLINE);
+    assert_eq!(replay.outcome, Outcome::Success, "{replay:?}");
+    assert_eq!(replay.state_generation, first.state_generation);
+    assert_eq!(replay.payload["replayed"], true);
+    assert_eq!(inspect(&engine, &namespace), committed_state);
+}
+
+#[test]
+fn deleting_an_unknown_source_is_successful_and_idempotent() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let namespace = namespace();
+    let engine = make_engine(&tempdir);
+    observe(&engine, &namespace, "source-a", "kept", "value", "kept");
+    let first = engine.delete_by_source(
+        &namespace,
+        &SourceId("unknown-source".to_owned()),
+        "delete-unknown",
+        DEADLINE,
+    );
+    assert_eq!(first.outcome, Outcome::Success);
+    assert_eq!(first.payload["deleted_records"], 0);
+    let replay = engine.delete_by_source(
+        &namespace,
+        &SourceId("unknown-source".to_owned()),
+        "delete-unknown",
+        DEADLINE,
+    );
+    assert_eq!(replay.state_generation, first.state_generation);
+    assert_eq!(replay.payload["replayed"], true);
+}
+
+#[test]
+fn multi_source_deletion_uses_one_canonical_source_order_for_fence_and_replay() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let namespace = namespace();
+    let engine = make_engine(&tempdir);
+    observe(&engine, &namespace, "source-z", "z key", "z value", "z");
+    observe(&engine, &namespace, "source-a", "a key", "a value", "a");
+    let expected_generation = inspect(&engine, &namespace)["commit_seq"]
+        .as_u64()
+        .expect("generation");
+
+    let first = engine.common_control(
+        &namespace,
+        json!({
+            "action": "delete_by_source",
+            "sources": ["source-z", "source-a"],
+            "idempotency_key": "delete-multi",
+            "expected_generation": expected_generation
+        }),
+        DEADLINE,
+    );
+    assert_eq!(first.outcome, Outcome::Success, "{first:?}");
+    assert_eq!(
+        first.payload["_retained_receipt"]["payload"]["source"],
+        "source-a"
+    );
+    assert_eq!(
+        first.payload["_retained_receipt"]["payload"]["deleted_records"],
+        2
+    );
+    assert_eq!(
+        engine.revoked_sources(&namespace).expect("revocations"),
+        vec![
+            SourceId("source-a".to_owned()),
+            SourceId("source-z".to_owned())
+        ]
+    );
+
+    let replay = engine.common_control(
+        &namespace,
+        json!({
+            "action": "delete_by_source",
+            "sources": ["source-a", "source-z"],
+            "idempotency_key": "delete-multi",
+            "expected_generation": first.state_generation
+        }),
+        DEADLINE,
+    );
+    assert_eq!(replay.outcome, Outcome::Success, "{replay:?}");
+    assert_eq!(replay.payload["replayed"], true);
+    assert_eq!(
+        replay.payload["_retained_receipt"]["payload"]["source"],
+        "source-a"
+    );
+}
+
+#[test]
+fn revoked_source_rejects_fresh_keys_and_preserves_duplicates_across_restart() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let namespace = namespace();
+    let mut engine = make_engine(&tempdir);
+    let original = observe_request(
+        "source-b",
+        &format!("{B_TOKEN} key"),
+        &format!("{B_TOKEN} value"),
+        "original-observation",
+    );
+    let observed = engine.observe(&namespace, original.clone());
+    assert_eq!(observed.outcome, Outcome::Success);
+    let kept_id = observe(
+        &engine,
+        &namespace,
+        "source-a",
+        "kept",
+        "kept value",
+        "kept",
+    );
+    let deleted = engine.delete_by_source(&namespace, &original.source, "delete-source", DEADLINE);
+    assert_eq!(deleted.outcome, Outcome::Success);
+    let after_deletion = inspect(&engine, &namespace);
+
+    for reopen in [false, true] {
+        if reopen {
+            drop(engine);
+            engine = make_engine(&tempdir);
+        }
+        let replay = engine.observe(&namespace, original.clone());
+        let mut expected_replay = observed.clone();
+        expected_replay.payload["replayed"] = json!(true);
+        assert_eq!(
+            replay, expected_replay,
+            "duplicate retains the original receipt"
+        );
+
+        let mut fresh = original.clone();
+        fresh.idempotency_key = format!("fresh-observation-{reopen}");
+        let rejected = engine.observe(&namespace, fresh);
+        assert_eq!(
+            rejected.outcome,
+            Outcome::Rejected(RejectReason::SourceRevoked)
+        );
+        assert_eq!(rejected.state_generation, deleted.state_generation);
+
+        let mut conflict = original.clone();
+        conflict.value_text = "changed payload".to_owned();
+        conflict.payload_sha256 = conflict.canonical_payload_sha256().expect("payload digest");
+        assert_eq!(
+            engine.observe(&namespace, conflict).outcome,
+            Outcome::Rejected(RejectReason::IdempotencyConflict)
+        );
+        let after_rejection = inspect(&engine, &namespace);
+        assert_eq!(
+            after_rejection["state_digest"],
+            after_deletion["state_digest"]
+        );
+        assert_eq!(after_rejection["commit_seq"], after_deletion["commit_seq"]);
+        let recalled = engine.recall(
+            &namespace,
+            RecallRequest {
+                query_text: "kept".to_owned(),
+                top_k: 16,
+                deadline: DEADLINE,
+            },
+        );
+        assert_eq!(recalled.outcome, Outcome::Success);
+        assert!(candidate_ids(&recalled.payload).contains(&kept_id));
+        assert!(
+            candidate_texts(&recalled.payload)
+                .iter()
+                .all(|text| !text.contains(B_TOKEN))
+        );
+    }
+
+    drop(engine);
+    let connection =
+        Connection::open(sqlite_path(&tempdir, &namespace)).expect("store opens for inspection");
+    let active_revoked_sources: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM capsules
+             WHERE source_id = 'source-b' AND status <> 'revoked'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("active source count");
+    assert_eq!(active_revoked_sources, 0);
+    drop(connection);
+
+    let engine = make_engine(&tempdir);
+    let accepted = engine.observe(
+        &namespace,
+        observe_request(
+            "source-a",
+            "another kept key",
+            "another kept value",
+            "kept-again",
+        ),
+    );
+    assert_eq!(accepted.outcome, Outcome::Success);
+    assert_eq!(accepted.state_generation, deleted.state_generation + 1);
+}
+
+#[test]
+fn fresh_deletion_scrubs_legacy_tombstone_provenance_without_recounting_records() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let namespace = namespace();
+    let engine = make_engine(&tempdir);
+    observe(
+        &engine,
+        &namespace,
+        "source-b",
+        "old key",
+        "old value",
+        "old",
+    );
+    let deleted = engine.delete_by_source(
+        &namespace,
+        &SourceId("source-b".to_owned()),
+        "original-delete",
+        DEADLINE,
+    );
+    assert_eq!(deleted.outcome, Outcome::Success);
+    assert_eq!(deleted.payload["deleted_records"], 1);
+    drop(engine);
+
+    // Older stores cleared text and embeddings but retained this JSON column.
+    let path = sqlite_path(&tempdir, &namespace);
+    let connection = Connection::open(&path).expect("fixture store opens");
+    let legacy_provenance = json!({"retained_input": B_TOKEN}).to_string();
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE capsules SET provenance = ?1 WHERE source_id = 'source-b'",
+                [legacy_provenance],
+            )
+            .expect("legacy tombstone fixture writes"),
+        1
+    );
+    drop(connection);
+
+    let reopened = make_engine(&tempdir);
+    let scrubbed = reopened.delete_by_source(
+        &namespace,
+        &SourceId("source-b".to_owned()),
+        "fresh-delete",
+        DEADLINE,
+    );
+    assert_eq!(scrubbed.outcome, Outcome::Success);
+    assert_eq!(scrubbed.payload["deleted_records"], 0);
+    drop(reopened);
+    let connection = Connection::open(&path).expect("scrubbed store opens");
+    let provenance: String = connection
+        .query_row("SELECT provenance FROM capsules", [], |row| row.get(0))
+        .expect("tombstone provenance reads");
+    assert_eq!(provenance, "{}");
+    drop(connection);
+    assert!(
+        !fs::read(path)
+            .expect("compacted store bytes")
+            .windows(B_TOKEN.len())
+            .any(|window| window == B_TOKEN.as_bytes())
+    );
+}
+
+struct DeleteDuringEncode {
+    engine: Mutex<Option<Weak<NcmEngine>>>,
+    encode_calls: AtomicUsize,
+}
+
+impl TextEncoder for DeleteDuringEncode {
+    fn identity(&self) -> EncoderIdentity {
+        HashEncoder::new().identity()
+    }
+
+    fn encode(&self, texts: &[&str], deadline: Deadline) -> Result<Vec<Embedding>, EncoderError> {
+        self.encode_calls.fetch_add(1, Ordering::Relaxed);
+        let engine = self.engine.lock().expect("encoder hook locks").take();
+        if let Some(engine) = engine {
+            let engine = engine.upgrade().expect("engine remains alive");
+            let deleted = engine.delete_by_source(
+                &namespace(),
+                &SourceId("source-b".to_owned()),
+                "delete-during-encode",
+                DEADLINE,
+            );
+            assert_eq!(deleted.outcome, Outcome::Success);
+        }
+        HashEncoder::new().encode(texts, deadline)
+    }
+}
+
+#[test]
+fn deletion_during_encoding_fences_the_observation_transaction() {
+    let tempdir = TempDir::new().expect("tempdir creates");
+    let namespace = namespace();
+    let encoder = Arc::new(DeleteDuringEncode {
+        engine: Mutex::new(None),
+        encode_calls: AtomicUsize::new(0),
+    });
+    let engine = Arc::new(NcmEngine::new(root(&tempdir), encoder.clone(), config()));
+    observe(
+        &engine,
+        &namespace,
+        "source-b",
+        "old key",
+        "old value",
+        "old",
+    );
+    *encoder.engine.lock().expect("encoder hook locks") = Some(Arc::downgrade(&engine));
+
+    let request = observe_request("source-b", "new key", "new value", "racing-observation");
+    let rejected = engine.observe(&namespace, request.clone());
+    assert_eq!(
+        rejected.outcome,
+        Outcome::Rejected(RejectReason::SourceRevoked)
+    );
+    assert_eq!(encoder.encode_calls.load(Ordering::Relaxed), 2);
+    let after_deletion = inspect(&engine, &namespace);
+    assert_eq!(after_deletion["records"], 0);
+    assert_eq!(after_deletion["epoch"], 2);
+
+    let retried = engine.observe(&namespace, request);
+    assert_eq!(retried, rejected);
+    assert_eq!(
+        encoder.encode_calls.load(Ordering::Relaxed),
+        2,
+        "revoked input never reaches encoding"
+    );
+    assert_eq!(inspect(&engine, &namespace), after_deletion);
+    let next_id = observe(
+        &engine,
+        &namespace,
+        "source-a",
+        "kept key",
+        "kept value",
+        "kept",
+    );
+    assert_eq!(
+        next_id,
+        RecordId(2),
+        "rejection consumes no record identity"
+    );
+}
+
+#[test]
+fn source_revocation_adds_a_wire_case_without_changing_existing_rejections() {
+    let cases = [
+        (
+            RejectReason::IdempotencyConflict,
+            json!("idempotency_conflict"),
+        ),
+        (
+            RejectReason::InvalidRequest("invalid".into()),
+            json!({"invalid_request": "invalid"}),
+        ),
+        (
+            RejectReason::UnknownRecord(RecordId(7)),
+            json!({"unknown_record": 7}),
+        ),
+        (RejectReason::SourceRevoked, json!("source_revoked")),
+    ];
+    for (reason, encoded) in cases {
+        assert_eq!(serde_json::to_value(&reason).unwrap(), encoded);
+        assert_eq!(
+            serde_json::from_value::<RejectReason>(encoded).unwrap(),
+            reason
+        );
+    }
+}

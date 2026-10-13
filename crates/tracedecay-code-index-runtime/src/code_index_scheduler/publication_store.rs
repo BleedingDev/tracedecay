@@ -580,14 +580,22 @@ impl StagedGenerationSegmentsV1 {
     /// Flush every staged segment once, then name each. Returns whether a
     /// rename happened, which the caller makes durable with one directory
     /// fsync.
-    fn publish(&mut self) -> Result<bool, CodeIndexPublicationStoreErrorV1> {
+    fn publish(
+        &mut self,
+        mut checkpoint: impl FnMut() -> Result<(), CodeIndexPublicationStoreErrorV1>,
+    ) -> Result<bool, CodeIndexPublicationStoreErrorV1> {
+        self.durable.sync_with_checkpoint(
+            &mut checkpoint,
+            DaemonCodeIndexPublicationStoreV1::unavailable,
+        )?;
         if self.pending.is_empty() {
             return Ok(false);
         }
-        self.durable
-            .sync()
-            .map_err(DaemonCodeIndexPublicationStoreV1::unavailable)?;
-        while let Some((final_path, temporary)) = self.pending.pop_first() {
+        loop {
+            checkpoint()?;
+            let Some((final_path, temporary)) = self.pending.pop_first() else {
+                break;
+            };
             if let Err(error) = std::fs::rename(&temporary, &final_path) {
                 self.pending.insert(final_path, temporary);
                 return Err(DaemonCodeIndexPublicationStoreV1::unavailable(error));
@@ -950,9 +958,10 @@ impl DaemonCodeIndexPublicationStoreV1 {
     /// generation-sized worktree spends seconds here with no other
     /// cancellation point. Daemon shutdown retires the worktree's shutdown
     /// signal and a retained rebuild's supersession retires its fence;
-    /// checking both before every segment keeps the blocking reconcile pass
-    /// joinable inside the shutdown budget instead of forcing the coordinator
-    /// to abandon it and the runtime teardown to wait for it again.
+    /// checking both before every segment and durability barrier keeps the
+    /// blocking reconcile pass joinable inside the shutdown budget instead of
+    /// forcing the coordinator to abandon it and the runtime teardown to wait
+    /// for it again.
     fn seal_checkpoint(&self) -> Result<(), CodeIndexProductionErrorV1> {
         if self
             .shutdown_signal
@@ -968,6 +977,15 @@ impl DaemonCodeIndexPublicationStoreV1 {
             ));
         }
         Ok(())
+    }
+
+    fn seal_publication_checkpoint(&self) -> Result<(), CodeIndexPublicationStoreErrorV1> {
+        self.seal_checkpoint().map_err(|error| match error {
+            CodeIndexProductionErrorV1::Interrupted(CodeIndexInterruptionV1::Cancelled) => {
+                CodeIndexPublicationStoreErrorV1::CompareAndSwap
+            }
+            error => Self::unavailable(error),
+        })
     }
 
     pub(super) fn retained_history(&self) -> Self {
@@ -3047,7 +3065,7 @@ impl CodeIndexAtomicPublicationPort for DaemonCodeIndexPublicationStoreV1 {
         let named_new_segments = {
             let _span =
                 tracing::trace_span!("code_index.generation.publish.segments_flush").entered();
-            staged_segments.publish()
+            staged_segments.publish(|| self.seal_publication_checkpoint())
         };
         let named_new_segments = match named_new_segments {
             Ok(named) => named,
@@ -3069,6 +3087,7 @@ impl CodeIndexAtomicPublicationPort for DaemonCodeIndexPublicationStoreV1 {
         }
 
         let manifest_publication = (|| {
+            self.seal_publication_checkpoint()?;
             {
                 let _span =
                     tracing::trace_span!("code_index.generation.publish.seal_fsync").entered();
@@ -3077,6 +3096,7 @@ impl CodeIndexAtomicPublicationPort for DaemonCodeIndexPublicationStoreV1 {
                     Ok::<(), CodeIndexPublicationStoreErrorV1>(())
                 }
             }?;
+            self.seal_publication_checkpoint()?;
             let generation_size = u64::try_from(manifest_bytes.len()).map_err(Self::unavailable)?;
             if generation_size > MAX_DURABLE_GENERATION_INDEX_BYTES_V1 {
                 return Err(Self::unavailable(
@@ -3094,6 +3114,7 @@ impl CodeIndexAtomicPublicationPort for DaemonCodeIndexPublicationStoreV1 {
                 sha256_hex_suffix(&state_digest).unwrap_or(&state_digest)
             );
             let generation_path = self.generations_root.join(&generation_file);
+            self.seal_publication_checkpoint()?;
             match generation_path.symlink_metadata() {
                 Ok(_) => {
                     let equal = {

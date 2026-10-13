@@ -1,0 +1,501 @@
+{
+  "generated_at": "2026-09-16T05:40:36.103985+00:00",
+  "graph_id": "v2-replacement-baseline-plus-5-plans-c02a6f179e",
+  "plan_set_hash": "81165e9810",
+  "selection_hash": "c02a6f179e",
+  "plan_count": 6,
+  "edge_count": 6,
+  "plans_root": ".codex/plans",
+  "selected_globs": [],
+  "selected_plan_paths": [
+    "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/v2-replacement-baseline.plan.md",
+    "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/v2-replacement-go-no-go.plan.md",
+    "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/v2-replacement-journeys.plan.md",
+    "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/v2-replacement-memory.plan.md",
+    "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/v2-replacement-release-cutover.plan.md",
+    "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/v2-replacement-retrieval.plan.md"
+  ],
+  "edges": [
+    {
+      "source": "v2-replacement-baseline",
+      "target": "v2-replacement-memory"
+    },
+    {
+      "source": "v2-replacement-baseline",
+      "target": "v2-replacement-retrieval"
+    },
+    {
+      "source": "v2-replacement-memory",
+      "target": "v2-replacement-journeys"
+    },
+    {
+      "source": "v2-replacement-retrieval",
+      "target": "v2-replacement-journeys"
+    },
+    {
+      "source": "v2-replacement-journeys",
+      "target": "v2-replacement-release-cutover"
+    },
+    {
+      "source": "v2-replacement-release-cutover",
+      "target": "v2-replacement-go-no-go"
+    }
+  ],
+  "plans": [
+    {
+      "path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/v2-replacement-baseline.plan.md",
+      "slug": "v2-replacement-baseline",
+      "name": "V2 replacement baseline and PR 707 reconciliation",
+      "overview": "Reconcile the single pluggable-memory branch with the exact latest reviewed PR #707 tree, preserve the Native and NCM additions that remain product requirements, remove superseded architecture, and restore a buildable V2 baseline before feature work continues.",
+      "todos": [
+        {
+          "id": "quiesce-current-writers",
+          "content": "Finish, freeze, or explicitly stop every active writer to the shared worktree, account for Cargo Hauler readers and queued tests, record exact file ownership, and refuse cleanup while any change remains unclassified or agent-owned.",
+          "status": "completed",
+          "ordinal": 1
+        },
+        {
+          "id": "checkpoint-accounted-work",
+          "content": "Create recoverable exact-path commits on feat/pluggable-memory-providers-v2 for every coherent current change, including useful superseded work before its later deletion, review each diff, and push each checkpoint so no merge or cleanup can erase the only copy.",
+          "status": "pending",
+          "ordinal": 2
+        },
+        {
+          "id": "define-replacement-contract",
+          "content": "Pin the installed V1 version, required platforms and install methods, supported user workflows, intentional removals, and the full latest-#707 product scope including hosts and feedback, dashboard and settings, Work and workflow runtime, public SDKs, memory, and code retrieval; map each item to a current owner and future direct journey.",
+          "status": "pending",
+          "ordinal": 3
+        },
+        {
+          "id": "define-data-continuity",
+          "content": "Inventory which V1 user data can be reconstructed from ordinary repositories and host transcripts and which V1-only facts, corrections, feedback, configuration, or post-cutover writes cannot cross the fresh-store boundary; make those consequences explicit before integration.",
+          "status": "pending",
+          "ordinal": 4
+        },
+        {
+          "id": "classify-current-working-tree",
+          "content": "Inventory every tracked and untracked change against HEAD 613d9d4ffd961eca0211903a684f1ba5850242ae and classify it as retain and port, already superseded, or disposable artifact using the latest V2 roadmap as authority.",
+          "status": "pending",
+          "ordinal": 5
+        },
+        {
+          "id": "checkpoint-retained-work",
+          "content": "Using the recoverable checkpoints, retain and port Native, NCM, provider-contract, persistence, privacy, and justified production-receipt slices, then deliberately delete dense code-search and PR-specific gate-runner machinery that the roadmap rejects; commit and push the resulting clean merge input.",
+          "status": "pending",
+          "ordinal": 6
+        },
+        {
+          "id": "repin-pr707-head",
+          "content": "Re-query PR #707 immediately before integration, record its exact head, merge base, draft and CI state, and redo the delta classification if it moved from 4f28d6fa95377a4ee305a7c7049c725c84c461f1.",
+          "status": "pending",
+          "ordinal": 7
+        },
+        {
+          "id": "build-ownership-map",
+          "content": "Map each retained provider capability from the old root layout to the latest owners in tracedecay-project, tracedecay-daemon-service, tracedecay-mcp, tracedecay-mcp-catalog, application, SDK, dashboard, and release packaging; identify every deletion-versus-port decision before resolving conflicts.",
+          "status": "pending",
+          "ordinal": 8
+        },
+        {
+          "id": "merge-pr707-same-branch",
+          "content": "Merge the pinned PR #707 head into feat/pluggable-memory-providers-v2 without creating another development branch or worktree, resolve conflicts in favor of the current V2 operating model, and preserve NCM only through the mapped provider boundaries.",
+          "status": "pending",
+          "ordinal": 9
+        },
+        {
+          "id": "restore-integrated-build-floor",
+          "content": "Regenerate lockfiles and generated contracts where required, remove orphaned feature and dependency references, and make default and explicit NCM configurations compile on supported targets through Cargo Hauler.",
+          "status": "pending",
+          "ordinal": 10
+        },
+        {
+          "id": "publish-reconciliation-checkpoint",
+          "content": "Review the integrated diff for accidental capability loss, run focused direct tests plus the normal build floor, then commit and push the clean reconciliation checkpoint with the exact PR #707 SHA in the commit body.",
+          "status": "pending",
+          "ordinal": 11
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/v2-replacement-go-no-go.plan.md",
+      "slug": "v2-replacement-go-no-go",
+      "name": "V2 replacement go or no-go",
+      "overview": "Make the final replacement decision from the integrated branch and tested release artifacts, with explicit blockers, independent architecture review, rollback evidence, and no unresolved Native, NCM, retrieval, host, store, or platform requirement.",
+      "todos": [
+        {
+          "id": "audit-final-architecture",
+          "content": "Review the final tree against the pinned latest PR #707 operating model and prove one daemon authority, exact final stores, one retrieval kernel, canonical Native ownership, isolated optional NCM, and exactly three code-intelligence authorities with no rejected mechanisms restored.",
+          "status": "pending",
+          "ordinal": 1
+        },
+        {
+          "id": "audit-capability-replacement",
+          "content": "Audit the early replacement contract against final direct V2 journeys and results, including facts, sessions, LCM, code search, similar and redundancy, hosts and feedback, Native, NCM, controls, dashboard and Settings, Work and workflows, SDKs, restart, indexing, status, install, update, uninstall, and recovery; reject any unapproved scope loss.",
+          "status": "pending",
+          "ordinal": 2
+        },
+        {
+          "id": "review-verification-evidence",
+          "content": "Have independent functional, security, release, and GPT-6 Astra reviewers inspect the exact final commit, direct tests, CI, package smokes, quality and resource measurements, repeated soak results, cutover runbook, and rollback drill for false passes and architectural drift.",
+          "status": "pending",
+          "ordinal": 3
+        },
+        {
+          "id": "close-all-blockers",
+          "content": "Resolve every critical or blocking finding and repeat affected direct journeys and aggregate passes until no required capability is pending, blocked, unknown, unsupported, invalid, censored, silently partial, fallback-only, or effect-unknown.",
+          "status": "pending",
+          "ordinal": 4
+        },
+        {
+          "id": "freeze-replacement-candidate",
+          "content": "Tag one exact clean commit and release artifact set only after origin matches the local branch, the worktree has no product changes, generated files and lockfiles are current, and all required CI and repeated product journeys are green.",
+          "status": "pending",
+          "ordinal": 5
+        },
+        {
+          "id": "authorize-v1-replacement",
+          "content": "Present the exact candidate, evidence, known limits, fresh-store consequences, NCM packaging choice, cutover steps, and rollback result for the user's final replacement authorization before changing the stable V1 installation.",
+          "status": "pending",
+          "ordinal": 6
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/v2-replacement-journeys.plan.md",
+      "slug": "v2-replacement-journeys",
+      "name": "V2 replacement product journeys",
+      "overview": "Prove V2 replacement through direct production journeys covering fresh-store admission, hosts, daemon restart, Native and NCM operations, code retrieval, indexing, privacy, failure recovery, and observable operator state.",
+      "todos": [
+        {
+          "id": "prove-final-store-admission",
+          "content": "Exercise each database, spool, journal, checkpoint, snapshot, receipt, and projection with exact final V2, representative V1, earlier-V2, partial, corrupt, and foreign fixtures; require ResetRequired only for incompatible shape before decode or use, preserve distinct Corruption for damaged admitted shapes, and preserve DurabilityUncertain for observable sync, close, or recovery failure.",
+          "status": "pending",
+          "ordinal": 1
+        },
+        {
+          "id": "prove-graph-publication-durability",
+          "content": "Fault-inject graph convergence to prove canonical replay input is durable before projection, recovered entities, relations, source generation, and watermark pass a full close and reopen digest before publication, failed convergence preserves the prior verified graph, and observable durability uncertainty closes the affected runtime.",
+          "status": "pending",
+          "ordinal": 2
+        },
+        {
+          "id": "prove-daemon-restart-surfaces",
+          "content": "Run physical daemon stop and restart journeys across CLI, MCP, HTTP, SDK, and dashboard for facts, sessions, LCM, Native recall, NCM recall, code search, cursors, pending projection, cancellation, and durable committed effects.",
+          "status": "pending",
+          "ordinal": 3
+        },
+        {
+          "id": "prove-host-lifecycle",
+          "content": "Run isolated install, update, ownership drift, doctor and status, disable, and uninstall journeys for every supported Codex, Claude, Cursor, Hermes, Kiro, and Cline-family integration using real checked-in host fixtures and preserving unrelated files byte-for-byte.",
+          "status": "pending",
+          "ordinal": 4
+        },
+        {
+          "id": "prove-provider-host-delivery",
+          "content": "For Native and NCM, run real host event to sanitized admission to durable source journal to observation to oracle-expected recall, feedback, and controls, then duplicate, restart, retry, cancellation, provider unavailable, deletion, and replay cases with exact source identity and typed outcomes.",
+          "status": "pending",
+          "ordinal": 5
+        },
+        {
+          "id": "prove-indexing-evolution",
+          "content": "Exercise fresh index, unchanged reopen, add, modify, rename, delete, branch and linked-worktree changes, interrupted refresh, prior-generation serving, rebuild after corruption, and shared-code updates with bounded scheduling and truthful freshness.",
+          "status": "pending",
+          "ordinal": 6
+        },
+        {
+          "id": "prove-flagship-surfaces",
+          "content": "Run direct dashboard and Settings journeys, callable Work and workflow-runtime journeys, and public SDK conformance required by the latest #707 roadmap so replacement is not declared from memory and search alone.",
+          "status": "pending",
+          "ordinal": 7
+        },
+        {
+          "id": "prove-privacy-and-authority",
+          "content": "Run direct adversarial cases for cross-project and cross-profile scope, mutable metadata, forged locators, wrong keys, stale revisions, missing grants or journals, symlink and path substitution, deleted-source resurrection, hostile provider details, logs, telemetry, errors, and persisted explain traces.",
+          "status": "pending",
+          "ordinal": 8
+        },
+        {
+          "id": "replace-gate-scaffolding",
+          "content": "Delete or archive the Native-original giant comparison matrix, gate manifests, local attestations, and proof-packet machinery as release authority; retain only production receipts needed for real atomic effects or daemon operations and replace every retained product assertion with a direct test or ordinary benchmark.",
+          "status": "pending",
+          "ordinal": 9
+        },
+        {
+          "id": "expose-truthful-operator-status",
+          "content": "Make status and read-only doctor report binary and daemon version, exact store state, source freshness and coverage, host registration state, active provider, NCM asset and worker readiness, typed unavailable or reset-required causes, and recovery guidance without performing repair.",
+          "status": "pending",
+          "ordinal": 10
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/v2-replacement-memory.plan.md",
+      "slug": "v2-replacement-memory",
+      "name": "V2 Native and NCM memory replacement",
+      "overview": "Deliver one provider-neutral memory boundary with a canonical Native implementation and an explicit optional NCM implementation, including durable restart behavior, source authority, privacy, controls, and real nonvacuous conformance.",
+      "todos": [
+        {
+          "id": "port-provider-boundary",
+          "content": "Port provider declarations, registry, configuration, lifecycle, capability negotiation, and host admission into the latest PR #707 ownership boundaries without creating a second daemon, store selector, or retrieval kernel.",
+          "status": "pending",
+          "ordinal": 1
+        },
+        {
+          "id": "define-provider-authorities",
+          "content": "Make canonical events, facts, controls, source content, authorization, final ranking, pagination, hydration, and scope daemon-owned; make NCM indexes and checkpoints derived state with exact source watermarks; prohibit the NCM worker from opening canonical writable stores; and admit provider candidates only through the one canonical retrieval kernel.",
+          "status": "pending",
+          "ordinal": 2
+        },
+        {
+          "id": "replace-staged-native-store",
+          "content": "Replace the active Native StagedObservationStore path with an adapter over the exact canonical V2 fact, session, LCM, source, journal, and control authorities so Native owns no parallel compatibility database.",
+          "status": "pending",
+          "ordinal": 3
+        },
+        {
+          "id": "close-native-authority-gaps",
+          "content": "Make controlled Native staging, recall, feedback, correction, deletion, inspection, maintenance, replay, and restore fail closed on missing host lineage; bind original source and sanitized provider-view identities; survive re-registration and restart without accepting stale authority.",
+          "status": "pending",
+          "ordinal": 4
+        },
+        {
+          "id": "harden-retained-privacy",
+          "content": "Identify each real untrusted caller or provider boundary, prefer daemon-owned identity lookup and typed opaque handles for local authority, and retain keyed binding only where that boundary requires it; finish locator re-derivation, provider and revision attribution, exact-one mutation, tombstone, source-fence, snapshot, and anti-resurrection behavior with adversarial reopen tests.",
+          "status": "pending",
+          "ordinal": 5
+        },
+        {
+          "id": "isolate-ncm-runtime",
+          "content": "Port NCM as an explicitly selected provider whose worker, model, tokenizer, projection, state, and namespaces are provider-local; keep the default V2 installation model-free and make missing NCM assets typed unavailable without Native fallback.",
+          "status": "pending",
+          "ordinal": 6
+        },
+        {
+          "id": "package-pinned-ncm-assets",
+          "content": "Define and implement an opt-in offline NCM bundle with repository-pinned worker, model, tokenizer, hashes, licenses, and platform support so NCM startup never downloads code or model data.",
+          "status": "pending",
+          "ordinal": 7
+        },
+        {
+          "id": "define-ncm-recall-oracle",
+          "content": "Freeze a compact real-input NCM oracle with independently specified positive IDs, negative and near-confusable queries, scope, temporal and exclusion behavior, ordering and coverage obligations, and the known seed regressions before further threshold or ranking changes.",
+          "status": "pending",
+          "ordinal": 8
+        },
+        {
+          "id": "verify-ncm-recall-stability",
+          "content": "Re-run the real NCM encoder after integration across the known failing seeds, a 32-seed sweep, 100 identical-seed repeats, negative and near-confusable queries, cold and warm starts, daemon and worker restart, cancellation, concurrency, and budget pressure with zero unexplained required misses or scope leaks.",
+          "status": "pending",
+          "ordinal": 9
+        },
+        {
+          "id": "implement-provider-switching",
+          "content": "Make Native-to-NCM and NCM-to-Native selection explicit and restart-safe: replay canonical events plus corrections, tombstones, exclusions, and relevant controls through a frozen watermark, catch up admitted work, atomically activate a configuration revision and provider epoch, reject stale results, and recover interruption, deletion races, missing replay material, lost replies, and restart on either side of activation.",
+          "status": "pending",
+          "ordinal": 10
+        },
+        {
+          "id": "run-common-memory-conformance",
+          "content": "Run one unchanged provider-neutral direct suite against real Native and real NCM for observe, temporal recall, exclusions, provenance, feedback, correction, deletion, inspection, maintenance, snapshot and restore, replay, cancellation, corruption, lost reply after commit, restart, project-wide facts across branches and worktrees, and scope isolation; reject unexpected empty, no-op, Unsupported, or fallback outcomes while accepting correctly empty oracle negatives.",
+          "status": "pending",
+          "ordinal": 11
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/v2-replacement-release-cutover.plan.md",
+      "slug": "v2-replacement-release-cutover",
+      "name": "V2 release and fresh-store cutover",
+      "overview": "Produce and test installable V2 release artifacts, an opt-in offline NCM bundle, repeated cross-platform stability evidence, and a safe operator procedure that replaces V1 while preserving old bytes for inspection and rollback.",
+      "todos": [
+        {
+          "id": "reconcile-release-packaging",
+          "content": "Update release manifests, archive and MCPB builders, installers, direct upgrade, cloud asset selection, licenses, notices, and package metadata for the latest #707 layout plus the explicit offline NCM bundle; remove all retired dense code-search companions.",
+          "status": "pending",
+          "ordinal": 1
+        },
+        {
+          "id": "verify-release-artifacts",
+          "content": "Build each advertised Linux, macOS, and Windows artifact from one commit and test clean extraction, version identity, daemon startup, default model-free operation, optional NCM assets, CLI and MCP launch, upgrade, and owned-only uninstall in isolated environments.",
+          "status": "pending",
+          "ordinal": 2
+        },
+        {
+          "id": "run-normal-cross-platform-ci",
+          "content": "Make normal Linux, macOS, and Windows CI pass for default features, provider-host features, generated SDK and dashboard surfaces, host installers, release packaging, and the supported NCM configurations without skipped or zero-test replacement gates.",
+          "status": "pending",
+          "ordinal": 3
+        },
+        {
+          "id": "write-fresh-store-runbook",
+          "content": "Document and test the replacement procedure: stop V1, back up and checksum the complete V1 profile, install V2, observe ResetRequired without touching incompatible bytes, explicitly reset or recreate the V2 targets, re-register hosts, replay historical transcripts and repositories as ordinary ingress, select Native or NCM, and verify restart and recall.",
+          "status": "pending",
+          "ordinal": 4
+        },
+        {
+          "id": "drill-binary-rollback",
+          "content": "Test rollback by stopping both versions, preserving the V2 profile, restoring V1 binary selection, service or launch-agent state, sockets, host registrations, owned configuration, and the untouched V1 profile, then prove hosts launch V1; never import V2-created state into V1 and document that post-cutover work does not cross the rollback boundary.",
+          "status": "pending",
+          "ordinal": 5
+        },
+        {
+          "id": "measure-quality-performance-resources",
+          "content": "Run simple reproducible Linux benchmarks and evaluations for lexical, graph, shared-code, Native, and NCM quality, latency, RSS, disk and WAL growth, worker count, backpressure, cancellation, shutdown, cold start, warm reuse, and restart; report failures separately from latency and keep cross-platform correctness in ordinary CI.",
+          "status": "pending",
+          "ordinal": 6
+        },
+        {
+          "id": "publish-beta-candidate",
+          "content": "Produce a beta candidate and run clean install, V1 binary upgrade plus fresh-store recreation, Native and NCM recall, code retrieval, host lifecycle, restart, rollback, and uninstall smoke tests before stable promotion is considered.",
+          "status": "pending",
+          "ordinal": 7
+        },
+        {
+          "id": "run-repeated-canary-soak",
+          "content": "Run the full direct product-journey set three consecutive times from the exact beta source and artifact set with fresh isolated profiles on the supported platform matrix; any unexplained failure or vacuous result resets the count.",
+          "status": "pending",
+          "ordinal": 8
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/v2-replacement-retrieval.plan.md",
+      "slug": "v2-replacement-retrieval",
+      "name": "V2 code retrieval replacement",
+      "overview": "Replace V1 semantic-search expectations with the latest V2 lexical, graph, and verified shared-code authorities, remove the retired dense stack, and prove useful deterministic search through every public surface.",
+      "todos": [
+        {
+          "id": "define-search-oracle",
+          "content": "Freeze a compact real-repository search corpus with independently specified exact and conceptual positives, negatives, scope, ordering, coverage and partial-result obligations, and allowed relevance differences from V1 before changing lexical or shared-code behavior.",
+          "status": "pending",
+          "ordinal": 1
+        },
+        {
+          "id": "delete-retired-dense-stack",
+          "content": "Remove all remaining dense code-search crates, dependencies, lifecycle state, model acquisition, vector generations, activation and rollback paths, fixtures, configuration, release handling, and public API, CLI, MCP, LSP, SDK, and dashboard surfaces after the PR #707 merge.",
+          "status": "pending",
+          "ordinal": 2
+        },
+        {
+          "id": "enforce-no-semantic-alias",
+          "content": "Remove or return a typed explicit disposition for legacy semantic-only requests and configuration; never silently route a semantic name to lexical search.",
+          "status": "pending",
+          "ordinal": 3
+        },
+        {
+          "id": "finish-lexical-query-semantics",
+          "content": "Implement and directly test all-terms-first lexical matching with graduated relaxation, exact identifier preservation, field and phrase behavior, proximity, bounded identifier and path splitting, deterministic ordering, stable cursors, and truthful truncation or partial coverage.",
+          "status": "pending",
+          "ordinal": 4
+        },
+        {
+          "id": "verify-code-graph-retrieval",
+          "content": "Exercise graph symbol, relation, caller, callee, impact, and traversal results through the canonical retrieval kernel with exact scope, generation, source anchors, cancellation, stale-state, and hydration behavior.",
+          "status": "pending",
+          "ordinal": 5
+        },
+        {
+          "id": "implement-shared-code-authority",
+          "content": "Complete source-bound shared-code detection in the parse and sealed-generation pipeline using conservative and rename-normalized body tokens, content-addressed clone payloads, occurrence bindings, exact digest postings, bounded candidate admission, and token-verified exact and renamed-copy results.",
+          "status": "pending",
+          "ordinal": 6
+        },
+        {
+          "id": "wire-similar-and-redundancy",
+          "content": "Redefine tracedecay_similar and tracedecay_redundancy over verified shared-code facts with left and right coverage, exact differences, source anchors, typed partial results, and no claims of dead code, equivalence, merge safety, or a single similarity percentage.",
+          "status": "pending",
+          "ordinal": 7
+        },
+        {
+          "id": "prove-one-retrieval-kernel",
+          "content": "Run identical representative queries through MCP, CLI, dashboard, host integrations, LSP, API, and SDK adapters and prove they delegate to one ranking, cursor, hydration, authorization, and store-selection implementation.",
+          "status": "pending",
+          "ordinal": 8
+        },
+        {
+          "id": "establish-search-quality-floor",
+          "content": "Run the versioned oracle across exact symbols, concepts, phrases, paths, relations, renamed copies, near misses, unrelated code, parse errors, deletion, stale generations, budget exhaustion, and wrong scope; require the expected positives, correctly empty negatives, stable relevance, and truthful coverage without a model runtime.",
+          "status": "pending",
+          "ordinal": 9
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    }
+  ],
+  "frontier": [
+    {
+      "plan_slug": "v2-replacement-baseline",
+      "plan_name": "V2 replacement baseline and PR 707 reconciliation",
+      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/v2-replacement-baseline.plan.md",
+      "plan_status": "pending",
+      "state": "ready",
+      "blocked_by": [],
+      "active": [
+        {
+          "id": "checkpoint-accounted-work",
+          "content": "Create recoverable exact-path commits on feat/pluggable-memory-providers-v2 for every coherent current change, including useful superseded work before its later deletion, review each diff, and push each checkpoint so no merge or cleanup can erase the only copy.",
+          "status": "pending",
+          "ordinal": 2
+        }
+      ],
+      "upcoming": [
+        {
+          "id": "define-replacement-contract",
+          "content": "Pin the installed V1 version, required platforms and install methods, supported user workflows, intentional removals, and the full latest-#707 product scope including hosts and feedback, dashboard and settings, Work and workflow runtime, public SDKs, memory, and code retrieval; map each item to a current owner and future direct journey.",
+          "status": "pending",
+          "ordinal": 3
+        }
+      ],
+      "completed": 1,
+      "total": 11
+    },
+    {
+      "plan_slug": "v2-replacement-retrieval",
+      "plan_name": "V2 code retrieval replacement",
+      "plan_path": "/Users/satan/workspace/bleedingdev/projects/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/v2-replacement-retrieval.plan.md",
+      "plan_status": "pending",
+      "state": "blocked",
+      "blocked_by": [
+        "v2-replacement-baseline"
+      ],
+      "active": [
+        {
+          "id": "define-search-oracle",
+          "content": "Freeze a compact real-repository search corpus with independently specified exact and conceptual positives, negatives, scope, ordering, coverage and partial-result obligations, and allowed relevance differences from V1 before changing lexical or shared-code behavior.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [
+        {
+          "id": "delete-retired-dense-stack",
+          "content": "Remove all remaining dense code-search crates, dependencies, lifecycle state, model acquisition, vector generations, activation and rollback paths, fixtures, configuration, release handling, and public API, CLI, MCP, LSP, SDK, and dashboard surfaces after the PR #707 merge.",
+          "status": "pending",
+          "ordinal": 2
+        }
+      ],
+      "completed": 0,
+      "total": 9
+    }
+  ],
+  "errors": [],
+  "warnings": [],
+  "graph_source": "matched-plan-set"
+}

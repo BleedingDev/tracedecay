@@ -11,7 +11,9 @@ mod process_allocator;
 use tracedecay_code_extraction::LanguageRegistry;
 use tracedecay_code_extraction::incremental::ParseDocumentIdentity;
 use tracedecay_code_index::retained_parse::{RetainedParsePoolReleaseV1, SharedRetainedParsePool};
-use tracedecay_domain::{ExtractorRevision, ProjectId, RepositoryDirtyStateV1, RepositoryId};
+use tracedecay_domain::{
+    ExtractorRevision, NodeKind, ProjectId, RepositoryDirtyStateV1, RepositoryId,
+};
 use tracedecay_runtime_core::resident_memory::{
     release_process_allocator_memory_v1, sampled_process_resident_bytes_v1,
 };
@@ -21,6 +23,7 @@ static MIMALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const MIB: u64 = 1024 * 1024;
 const DOCUMENTS: usize = 120;
+const FUNCTIONS_PER_DOCUMENT: usize = 400;
 
 fn identity(ordinal: usize) -> ParseDocumentIdentity {
     ParseDocumentIdentity::Repository {
@@ -47,10 +50,10 @@ fn retained_parses_are_charged_what_releasing_them_returns() {
     let registry = LanguageRegistry::new();
     let extractor = registry.extractor_for_file("src/lib.rs").expect("rust");
     let revision = ExtractorRevision::new("extractor.rust.retained-heap").expect("revision");
-    let source = (0..400)
-        .map(|index| {
-            format!("pub fn f{index}(v: &[u32]) -> u32 {{ v.iter().map(|x| x * {index}).sum() }}\n")
-        })
+    // Keep the retained function count large with simple bodies so each
+    // synchronous parse can coexist with compilation in CI.
+    let source = (0..FUNCTIONS_PER_DOCUMENT)
+        .map(|index| format!("pub fn f{index}(v: u32) -> u32 {{ v * {index} }}\n"))
         .collect::<String>();
 
     pool.parse_and_extract_artifact_unretained_with_control(
@@ -74,6 +77,17 @@ fn retained_parses_are_charged_what_releasing_them_returns() {
                 None,
             )
             .expect("retained parse");
+        assert_eq!(
+            extraction
+                .artifact
+                .result
+                .nodes
+                .iter()
+                .filter(|node| node.kind == NodeKind::Function)
+                .count(),
+            FUNCTIONS_PER_DOCUMENT,
+            "every retained document contains the full function tree"
+        );
         drop(extraction);
     }
     let held = pool.holding().expect("retained documents");
@@ -97,14 +111,14 @@ fn retained_parses_are_charged_what_releasing_them_returns() {
         charged * 10 >= freed * 8 && charged * 10 <= freed * 12,
         "the pool was charged {charged} bytes and releasing it returned {freed}"
     );
+    drop(pool);
+    idle_collect_returns_a_transient_ingest_heap();
 }
 
 /// Reproducible idle-after-ingest heap: a transient payload is charged at
 /// peak and the shipped allocator returns it on collect. Prints the
 /// before/peak/after numbers the PR body cites.
-#[test]
 fn idle_collect_returns_a_transient_ingest_heap() {
-    process_allocator::configure_process_allocator();
     const CHUNKS: usize = 64;
     const CHUNK_BYTES: usize = 1024 * 1024;
     let before = anon_bytes();

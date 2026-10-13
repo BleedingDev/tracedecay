@@ -10,7 +10,8 @@ use tracedecay_application::work::{
 };
 use tracedecay_contracts::{CancellationSignal, RequestContext, ResolvedScope};
 use tracedecay_domain::{
-    ComponentRevision, EphemeralSanitizedQueryViewV1, RetrievalRequest, ScoreDomainId,
+    ComponentRevision, EphemeralSanitizedQueryViewV1, RetrievalGrainV1, RetrievalRequest,
+    ScoreDomainId, TemporalModeV1,
 };
 use tracedecay_query::retrieval::evidence_lanes::TaskSessionBindingV1;
 use tracedecay_runtime_core::cancellation::CancellationToken;
@@ -19,7 +20,7 @@ use tracedecay_session_memory::context::{
 };
 use tracedecay_session_memory::session::{
     SessionDataFreshness, SessionRequestBinding, SessionRetrievalConfiguration,
-    SessionTemporalQuery, TaskSessionRetrievalOutcomeV1,
+    SessionRetrievalScope, SessionTemporalQuery, TaskSessionRetrievalOutcomeV1,
 };
 use tracedecay_session_temporal_store::execution::TaskSessionRankSelectorV1;
 use tracedecay_sessions::serving::{
@@ -265,7 +266,23 @@ impl SessionApplicationRetrievalPortV1 for DaemonSessionRetrievalService {
             if requires_refresh_worker(query.freshness_policy())
                 && let Some(unavailable) = self.refresh_not_current()
             {
-                return SessionRetrievalServiceOutcome::Unavailable(unavailable);
+                // Historical discovery is wider than this exact read. Its
+                // selected session's active generation, applied graph receipt,
+                // and source coverage still have to satisfy RequireFresh.
+                let exact_current_observation = query.direct_anchor().is_some()
+                    && query.provider().is_some()
+                    && matches!(query.retrieval_scope(), SessionRetrievalScope::Session(_))
+                    && query.temporal_mode() == TemporalModeV1::Current
+                    && query.grain() == RetrievalGrainV1::Occurrence;
+                let historical_stale = matches!(
+                    unavailable.reason,
+                    SessionRetrievalUnavailableReason::HistoricalConvergence
+                        | SessionRetrievalUnavailableReason::HistoricalRetry
+                        | SessionRetrievalUnavailableReason::HistoricalBlocked
+                );
+                if !exact_current_observation || !historical_stale {
+                    return SessionRetrievalServiceOutcome::Unavailable(unavailable);
+                }
             }
             let binding = match admitted_session_binding(&self.root, self.configuration, context) {
                 Ok(binding) => binding,

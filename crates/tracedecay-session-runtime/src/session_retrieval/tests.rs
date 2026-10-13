@@ -177,6 +177,7 @@ async fn seed_real_page_fixture_in_session(
         provider,
         session_id,
         finalize,
+        false,
     )
     .await
     .pop()
@@ -190,6 +191,7 @@ async fn seed_real_page_fixtures_in_session(
     provider: String,
     session_id: String,
     finalize: bool,
+    include_native_timestamp: bool,
 ) -> Vec<RealPageFixture> {
     // Match the host admission projector's bounded transaction window.
     const BATCH_ITEMS: usize = 32;
@@ -244,6 +246,12 @@ async fn seed_real_page_fixtures_in_session(
         };
         let relations = CanonicalObservationRelationsV1::new(session.clone())
             .with_message_id(ObservationId::new(message_id.clone()).expect("message id"));
+        let timestamp = i64::try_from(rank).expect("timestamp");
+        let mut evidence =
+            CanonicalObservationEvidenceV1::new(ObservationOrderingDomainV1::SnapshotOrder, range);
+        if include_native_timestamp {
+            evidence = evidence.with_native_timestamp(timestamp);
+        }
         let envelope = CanonicalObservationEnvelopeV1::new(
             provider_id.clone(),
             "message",
@@ -253,9 +261,9 @@ async fn seed_real_page_fixtures_in_session(
                 role: CanonicalMessageRoleV1::Assistant,
                 content: json!(text),
                 model: Some("fixture-model".to_owned()),
-                timestamp: Some(i64::try_from(rank).expect("timestamp")),
+                timestamp: Some(timestamp),
             }],
-            CanonicalObservationEvidenceV1::new(ObservationOrderingDomainV1::SnapshotOrder, range),
+            evidence,
         )
         .expect("canonical message envelope");
         let payload = serde_json::to_value(envelope).expect("canonical payload");
@@ -1360,10 +1368,6 @@ async fn advertised_minimum_session_lookup_request_passes_budget_admission() {
     );
 }
 
-/// A session browse reads a bounded cohort window of storage, so a session far
-/// larger than that window must still answer a small page and its cursor must
-/// advance the storage keyset rather than re-reading the same window: every
-/// page returns a full `LIMIT`, no message is served twice, and the walk keeps
 /// A service mounted without a refresh worker cannot know whether the
 /// projection is current. `RequireFresh` must therefore be refused with the
 /// worker-missing reason, never served as if the projection were fresh.
@@ -1375,7 +1379,7 @@ async fn require_fresh_without_a_refresh_worker_is_refused_as_worker_missing() {
     .await;
     let root = real_page_root("root.page");
     let session_id = "session.page.worker-missing".to_owned();
-    seed_real_page_fixture_in_session(
+    let fixture = seed_real_page_fixture_in_session(
         harness.registered.as_ref(),
         &root,
         0,
@@ -1393,33 +1397,21 @@ async fn require_fresh_without_a_refresh_worker_is_refused_as_worker_missing() {
         DaemonSessionRetrievalService::new_without_refresh_worker(harness.registered.clone(), root)
             .expect("registered retrieval service");
     let context = admitted_lookup_context(scope);
-    let query = SessionTemporalQuery::new(
-        SessionId::new(&session_id).expect("session identity"),
-        None,
-        "",
-        None,
-        TemporalModeV1::Current,
-        tracedecay_domain::RetrievalGrainV1::Occurrence,
-        1,
-        DiversityLimits::unbounded(),
-        ContextBudget {
-            max_bytes: APPLICATION_RETRIEVAL_MAX_BYTES,
-            max_tokens: APPLICATION_RETRIEVAL_MAX_BYTES / 4,
-            estimator_version: "words-v1".to_owned(),
-        },
-    )
-    .expect("temporal query")
-    .with_execution_limits(admitted_execution_limits(1))
-    .with_freshness_policy(SessionFreshnessPolicy::RequireFresh);
-
-    let outcome = service.retrieve_admitted(&context, query).await;
-
-    match outcome {
-        SessionRetrievalServiceOutcome::Unavailable(unavailable) => assert_eq!(
-            unavailable.reason,
-            SessionRetrievalUnavailableReason::RefreshWorkerMissing
-        ),
-        other => panic!("RequireFresh without a worker must be refused, got {other:?}"),
+    for anchor in [None, Some(fixture.anchor_id.clone())] {
+        let query = admitted_session_query(&session_id, Some("codex"))
+            .with_freshness_policy(SessionFreshnessPolicy::RequireFresh);
+        let query = match anchor {
+            Some(anchor) => query.with_direct_anchor(anchor),
+            None => query,
+        };
+        let outcome = service.retrieve_admitted(&context, query).await;
+        match outcome {
+            SessionRetrievalServiceOutcome::Unavailable(unavailable) => assert_eq!(
+                unavailable.reason,
+                SessionRetrievalUnavailableReason::RefreshWorkerMissing
+            ),
+            other => panic!("RequireFresh without a worker must be refused, got {other:?}"),
+        }
     }
 }
 
@@ -1631,6 +1623,210 @@ fn admitted_session_query(session_id: &str, provider: Option<&str>) -> SessionTe
     .with_execution_limits(admitted_execution_limits(1))
 }
 
+#[tokio::test]
+async fn exact_current_anchor_stays_fresh_during_unrelated_historical_work() {
+    let harness = tracedecay_global_db::tests::harness::RegisteredGlobalDbHarness::open(
+        "session-retrieval-exact-anchor-history",
+    )
+    .await;
+    let fixture = seed_real_page_fixtures_in_session(
+        harness.registered.as_ref(),
+        &real_page_root("root.page"),
+        0..1,
+        "codex".to_owned(),
+        "session.exact.projected".to_owned(),
+        true,
+        true,
+    )
+    .await
+    .pop()
+    .expect("one timestamped fixture");
+    let root = registered_profile_retrieval_root(&harness.registered);
+    let context = admitted_lookup_context(
+        root.identity()
+            .session_request_scope()
+            .expect("profile session scope"),
+    );
+
+    for (reason, expected_unavailable) in [
+        (
+            SessionProjectionStaleReason::HistoricalConvergence,
+            SessionRetrievalUnavailableReason::HistoricalConvergence,
+        ),
+        (
+            SessionProjectionStaleReason::HistoricalRetry {
+                reason_code: "foreign_source_discovery_partial".to_owned(),
+            },
+            SessionRetrievalUnavailableReason::HistoricalRetry,
+        ),
+        (
+            SessionProjectionStaleReason::HistoricalBlocked {
+                reason_code: "foreign_source_unavailable".to_owned(),
+            },
+            SessionRetrievalUnavailableReason::HistoricalBlocked,
+        ),
+    ] {
+        let service = DaemonSessionRetrievalService::new_admitted_profile(
+            harness.registered.clone(),
+            root.identity().clone(),
+            Some(std::sync::Arc::new(FixedRefreshServing(
+                SessionProjectionServingState::Stale { reason },
+            ))),
+        )
+        .expect("registered retrieval service");
+        let query = || {
+            admitted_session_query(&fixture.session_id, Some(&fixture.provider))
+                .with_freshness_policy(SessionFreshnessPolicy::RequireFresh)
+        };
+
+        let exact = service
+            .retrieve_admitted(
+                &context,
+                query().with_direct_anchor(fixture.anchor_id.clone()),
+            )
+            .await;
+        let page = match exact {
+            SessionRetrievalServiceOutcome::Complete {
+                page,
+                freshness: SessionDataFreshness::Fresh,
+            } => page,
+            other => panic!("the projected exact anchor must prove Fresh: {other:?}"),
+        };
+        assert_eq!(page.results.len(), 1);
+        assert_eq!(
+            page.results[0].message.message_id,
+            fixture.projected_message_id
+        );
+        assert_eq!(page.results[0].message.session_id, fixture.session_id);
+        assert_eq!(page.results[0].message.provider, fixture.provider);
+        assert_eq!(page.results[0].message.text, fixture.text);
+        assert_eq!(page.temporal.anchors, vec![fixture.anchor_id.clone()]);
+        assert_eq!(
+            page.temporal.watermarks.generation,
+            fixture.active_generation
+        );
+        assert_eq!(
+            page.temporal.watermarks.source,
+            page.temporal.watermarks.projection
+        );
+        assert!(page.temporal.omissions.is_empty());
+        assert!(page.temporal.coverage_omissions.is_empty());
+        assert_eq!(page.temporal.coverage.visible, 1);
+        assert_eq!(page.temporal.coverage.unknown, 0);
+
+        for broad in [
+            query(),
+            query()
+                .with_direct_anchor(fixture.anchor_id.clone())
+                .with_retrieval_scope(SessionRetrievalScope::AllSessionsInAuthorizedRoot),
+        ] {
+            match service.retrieve_admitted(&context, broad).await {
+                SessionRetrievalServiceOutcome::Unavailable(unavailable) => {
+                    assert_eq!(unavailable.reason, expected_unavailable);
+                }
+                other => panic!("broad RequireFresh must retain historical refusal: {other:?}"),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn exact_current_anchor_keeps_missing_projection_and_foreign_scope_refused() {
+    let harness = tracedecay_global_db::tests::harness::RegisteredGlobalDbHarness::open(
+        "session-retrieval-exact-anchor-refusals",
+    )
+    .await;
+    let fixture_root = real_page_root("root.page");
+    let projected = seed_real_page_fixture_in_session(
+        harness.registered.as_ref(),
+        &fixture_root,
+        0,
+        "codex".to_owned(),
+        "session.exact.ready".to_owned(),
+        true,
+    )
+    .await;
+    let unprojected = seed_real_page_fixture_in_session(
+        harness.registered.as_ref(),
+        &fixture_root,
+        1,
+        "codex".to_owned(),
+        "session.exact.unprojected".to_owned(),
+        false,
+    )
+    .await;
+    let root = registered_profile_retrieval_root(&harness.registered);
+    let context = admitted_lookup_context(
+        root.identity()
+            .session_request_scope()
+            .expect("profile session scope"),
+    );
+    let service = DaemonSessionRetrievalService::new_admitted_profile(
+        harness.registered.clone(),
+        root.identity().clone(),
+        Some(std::sync::Arc::new(FixedRefreshServing(
+            SessionProjectionServingState::Stale {
+                reason: SessionProjectionStaleReason::HistoricalRetry {
+                    reason_code: "foreign_source_discovery_partial".to_owned(),
+                },
+            },
+        ))),
+    )
+    .expect("registered retrieval service");
+    let query = |fixture: &RealPageFixture, anchor| {
+        admitted_session_query(&fixture.session_id, Some(&fixture.provider))
+            .with_direct_anchor(anchor)
+            .with_freshness_policy(SessionFreshnessPolicy::RequireFresh)
+    };
+    let unknown_anchor = RetrievalAnchorId::new(format!("retrieval.v2.sha256:{}", "f".repeat(64)))
+        .expect("well-formed missing anchor");
+    let missing_anchor = service
+        .retrieve_admitted(&context, query(&projected, unknown_anchor))
+        .await;
+    assert!(
+        matches!(
+            missing_anchor,
+            SessionRetrievalServiceOutcome::Stale {
+                freshness: SessionDataFreshness::Stored { generation_lag: 0 },
+                ..
+            }
+        ),
+        "historical work cannot turn an absent exact anchor into a fresh answer: {missing_anchor:?}"
+    );
+
+    let missing_projection = service
+        .retrieve_admitted(&context, query(&unprojected, unprojected.anchor_id.clone()))
+        .await;
+    match missing_projection {
+        SessionRetrievalServiceOutcome::Unavailable(unavailable) => {
+            assert_eq!(
+                unavailable.reason,
+                SessionRetrievalUnavailableReason::HistoricalRetry
+            );
+            assert!(unavailable.worker.is_some());
+        }
+        other => panic!("an anchor without an active projection must be unavailable: {other:?}"),
+    }
+
+    let foreign = tracedecay_global_db::tests::harness::RegisteredGlobalDbHarness::open(
+        "session-retrieval-exact-anchor-foreign",
+    )
+    .await;
+    let foreign_scope = registered_profile_retrieval_root(&foreign.registered)
+        .identity()
+        .session_request_scope()
+        .expect("foreign profile session scope");
+    assert!(!foreign_scope.identifies_same_checkout(context.scope()));
+    let foreign_context = admitted_lookup_context(foreign_scope);
+    let wrong_scope = service
+        .retrieve_admitted(
+            &foreign_context,
+            query(&projected, projected.anchor_id.clone()),
+        )
+        .await;
+    assert_eq!(wrong_scope, SessionRetrievalServiceOutcome::WrongScope);
+}
+
 /// #3393: one provider's retrying cursor must not hide Claude as a bare
 /// `TemporalStoreUnavailable`. Cursor is already projected; the live Claude
 /// session is catalogued but has no active generation; the worker is
@@ -1752,6 +1948,7 @@ async fn small_lookup_reads_a_session_larger_than_the_response_budget() {
         0..RECORDS - 1,
         "codex".to_owned(),
         session_id.clone(),
+        false,
         false,
     )
     .await;

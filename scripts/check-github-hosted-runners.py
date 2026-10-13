@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Require every Actions job to resolve to a standard GitHub-hosted runner."""
+"""Require every Actions job to resolve to a standard GitHub-hosted runner.
+
+The one exception is the organization's ephemeral Depot runners, selected
+through an approved repository variable whose fallback is hosted, so the
+workflows still run on GitHub's fleet wherever the variable is unset.
+"""
 
 from __future__ import annotations
 
@@ -31,6 +36,12 @@ STANDARD_GITHUB_HOSTED_RUNNERS = frozenset(
         "macos-15-intel",
         "macos-14",
     }
+)
+# Repository variables an operator sets to an approved Depot label:
+# depot-ubuntu-24.04-8 and depot-windows-2025-8 respectively.
+DEPOT_RUNNER_VARIABLES = frozenset({"DEPOT_LINUX_RUNNER", "DEPOT_WINDOWS_RUNNER"})
+DEPOT_RUNNER_EXPRESSION = re.compile(
+    r"\$\{\{\s*vars\.([A-Z_]+)\s*\|\|\s*'([^']+)'\s*\}\}"
 )
 RELEASE_MATRIX_EXPRESSION = "${{ matrix.runner }}"
 INLINE_MATRIX_EXPRESSION = "${{ fromJSON(matrix.runner) }}"
@@ -103,6 +114,13 @@ def validate_workflow(path: Path) -> None:
             )
         if "${{" not in runner:
             require_hosted_label(runner, authority)
+        elif match := DEPOT_RUNNER_EXPRESSION.fullmatch(runner):
+            variable, fallback = match.groups()
+            if variable not in DEPOT_RUNNER_VARIABLES:
+                raise PolicyViolation(
+                    f"{authority} selects its runner from unapproved variable {variable!r}"
+                )
+            require_hosted_label(fallback, f"{authority} fallback")
         elif runner == RELEASE_MATRIX_EXPRESSION and path.name in RELEASE_WORKFLOWS:
             # The shared release manifest is validated independently.
             continue
@@ -139,7 +157,7 @@ def main() -> None:
     except (OSError, json.JSONDecodeError, yaml.YAMLError, PolicyViolation) as error:
         print(f"GitHub-hosted runner policy violation: {error}", file=sys.stderr)
         raise SystemExit(1) from error
-    print("all Actions jobs use standard GitHub-hosted runners")
+    print("all Actions jobs use standard GitHub-hosted or approved Depot runners")
 
 
 if __name__ == "__main__":

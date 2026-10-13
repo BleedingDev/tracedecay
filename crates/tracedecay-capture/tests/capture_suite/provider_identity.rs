@@ -3,7 +3,10 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 use tracedecay_capture::{claude, codex, cursor, cursor_composer, vibe};
-use tracedecay_domain::ObservationSourceRangeV1;
+use tracedecay_domain::{
+    CanonicalMessageRoleV1, CanonicalObservationFactV1, CanonicalUnknownStateV1,
+    ObservationSourceRangeV1,
+};
 
 #[test]
 fn claude_native_identity_encoding_remains_byte_exact() {
@@ -36,6 +39,130 @@ fn codex_native_record_identity_uses_canonical_native_value() {
         codex::codex_native_record_id("session-42", &compact).unwrap(),
         codex::codex_native_record_id("session-43", &compact).unwrap()
     );
+}
+
+#[test]
+fn codex_completed_agent_message_preserves_visible_content_and_native_identity() {
+    for phase in ["commentary", "final_answer"] {
+        let native = json!({
+            "type": "event_msg",
+            "timestamp": "2026-10-11T19:00:00Z",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "AgentMessage", "id": "agent-message-native-42",
+                    "phase": phase,
+                    "content": [{"type": "Text", "text": "TraceDecay runs locally."}],
+                    "model": "codex-model"
+                }
+            }
+        });
+        let record_id = codex::codex_native_record_id("codex-agent-session", &native).unwrap();
+        let envelope = codex::normalize_codex_observation(
+            &native,
+            "codex-agent-session",
+            None,
+            record_id.clone(),
+            ObservationSourceRangeV1::new(0, 128).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(envelope.stable_record_id(), &record_id);
+        assert_eq!(
+            envelope.relations().message_id().unwrap().as_str(),
+            "agent-message-native-42"
+        );
+        assert!(matches!(
+            envelope.facts(),
+            [CanonicalObservationFactV1::Message {
+                role: CanonicalMessageRoleV1::Assistant,
+                content,
+                model: Some(model),
+                timestamp: Some(_),
+            }] if content == &native["payload"]["item"]["content"] && model == "codex-model"
+        ));
+    }
+}
+
+#[test]
+fn codex_completed_agent_message_refuses_private_or_malformed_shapes() {
+    let valid = json!({
+        "type": "event_msg",
+        "payload": {"type": "item_completed", "item": {
+            "type": "AgentMessage", "id": "agent-message-native-42",
+            "phase": "final_answer", "content": [{"type": "Text", "text": "Visible answer"}]
+        }}
+    });
+    let changes = [
+        ("id", json!("")),
+        ("id", Value::Null),
+        ("phase", json!("analysis")),
+        ("phase", Value::Null),
+        ("role", json!("developer")),
+        ("channel", json!("analysis")),
+        ("content", json!([])),
+        ("content", json!([{"type": "Text", "text": "  \n"}])),
+        (
+            "content",
+            json!([{"type": "Reasoning", "text": "Private reasoning"}]),
+        ),
+        (
+            "content",
+            json!([{"type": "Text", "text": "Visible", "reasoning": "Private"}]),
+        ),
+        ("content", json!("Untyped answer")),
+    ];
+    for (field, value) in changes {
+        let mut native = valid.clone();
+        native["payload"]["item"][field] = value;
+        let record_id = codex::codex_native_record_id("codex-agent-session", &native).unwrap();
+        let envelope = codex::normalize_codex_observation(
+            &native,
+            "codex-agent-session",
+            None,
+            record_id,
+            ObservationSourceRangeV1::new(0, 128).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                envelope.facts(),
+                [CanonicalObservationFactV1::Unknown {
+                    state: CanonicalUnknownStateV1::Malformed,
+                    ..
+                }]
+            ),
+            "private or malformed {field} must not become a message"
+        );
+    }
+}
+
+#[test]
+fn codex_response_item_does_not_duplicate_completed_agent_message() {
+    let native = json!({
+        "type": "response_item", "payload": {
+            "type": "message", "role": "assistant", "id": "agent-message-native-42",
+            "content": [{"type": "output_text", "text": "Visible answer"}]
+        }
+    });
+    let record_id = codex::codex_native_record_id("codex-agent-session", &native).unwrap();
+    let envelope = codex::normalize_codex_observation(
+        &native,
+        "codex-agent-session",
+        None,
+        record_id,
+        ObservationSourceRangeV1::new(0, 128).unwrap(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        envelope.facts(),
+        [CanonicalObservationFactV1::Unknown {
+            native_kind,
+            state: CanonicalUnknownStateV1::Unsupported,
+        }] if native_kind == "response_item.message.assistant"
+    ));
 }
 
 #[test]

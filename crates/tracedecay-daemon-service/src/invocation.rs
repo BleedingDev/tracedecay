@@ -301,7 +301,7 @@ fn retained_request_admission_problem(admission: RequestAdmission) -> Option<App
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
-struct ConfigurationRuntimeRegistrationPauseV1 {
+struct RetainedRuntimeRegistrationPauseV1 {
     project_root: PathBuf,
     before_registration: tokio::sync::oneshot::Sender<()>,
     allow_registration: tokio::sync::oneshot::Receiver<()>,
@@ -310,7 +310,7 @@ struct ConfigurationRuntimeRegistrationPauseV1 {
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
-pub struct DaemonConfigurationRuntimeRegistrationPauseV1 {
+pub struct DaemonRetainedRuntimeRegistrationPauseV1 {
     pub before_registration: tokio::sync::oneshot::Receiver<()>,
     pub allow_registration: tokio::sync::oneshot::Sender<()>,
     pub after_registration: tokio::sync::oneshot::Receiver<()>,
@@ -378,8 +378,7 @@ pub struct DaemonInvocationService {
         >,
     >,
     #[cfg(any(test, feature = "test-helpers"))]
-    configuration_runtime_registration_pause:
-        Arc<Mutex<Option<ConfigurationRuntimeRegistrationPauseV1>>>,
+    retained_runtime_registration_pause: Arc<Mutex<Option<RetainedRuntimeRegistrationPauseV1>>>,
     /// Home of the daemon owner's user, where daemon-run automation deploys
     /// managed skills. `None` when the owning profile has no home.
     owner_home: Option<PathBuf>,
@@ -429,7 +428,7 @@ impl DaemonInvocationService {
             session_holder_databases: Arc::new(Mutex::new(BTreeMap::new())),
             native_integration_status_broadcasts: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(any(test, feature = "test-helpers"))]
-            configuration_runtime_registration_pause: Arc::new(Mutex::new(None)),
+            retained_runtime_registration_pause: Arc::new(Mutex::new(None)),
             owner_home: None,
         }
     }
@@ -470,23 +469,23 @@ impl DaemonInvocationService {
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
-    pub async fn pause_configuration_runtime_registration(
+    pub async fn pause_retained_runtime_registration(
         &self,
         project_root: PathBuf,
-    ) -> DaemonConfigurationRuntimeRegistrationPauseV1 {
+    ) -> DaemonRetainedRuntimeRegistrationPauseV1 {
         let (before_registration, before_registration_observed) = tokio::sync::oneshot::channel();
         let (allow_registration, registration_allowed) = tokio::sync::oneshot::channel();
         let (after_registration, after_registration_observed) = tokio::sync::oneshot::channel();
         let (allow_return, return_allowed) = tokio::sync::oneshot::channel();
-        *self.configuration_runtime_registration_pause.lock().await =
-            Some(ConfigurationRuntimeRegistrationPauseV1 {
+        *self.retained_runtime_registration_pause.lock().await =
+            Some(RetainedRuntimeRegistrationPauseV1 {
                 project_root,
                 before_registration,
                 allow_registration: registration_allowed,
                 after_registration,
                 allow_return: return_allowed,
             });
-        DaemonConfigurationRuntimeRegistrationPauseV1 {
+        DaemonRetainedRuntimeRegistrationPauseV1 {
             before_registration: before_registration_observed,
             allow_registration,
             after_registration: after_registration_observed,
@@ -495,11 +494,11 @@ impl DaemonInvocationService {
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
-    async fn take_configuration_runtime_registration_pause(
+    async fn take_retained_runtime_registration_pause(
         &self,
         project_root: &Path,
-    ) -> Option<ConfigurationRuntimeRegistrationPauseV1> {
-        let mut pause = self.configuration_runtime_registration_pause.lock().await;
+    ) -> Option<RetainedRuntimeRegistrationPauseV1> {
+        let mut pause = self.retained_runtime_registration_pause.lock().await;
         if pause
             .as_ref()
             .is_some_and(|pause| pause.project_root == project_root)

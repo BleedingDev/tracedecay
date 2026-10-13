@@ -1116,6 +1116,75 @@ fn retired_fence_cancels_a_generation_seal_between_segments() {
 }
 
 #[test]
+fn shutdown_after_segment_sync_refuses_manifest_publication() {
+    let fixture = GitFixture::new(&[("src/lib.rs", "pub fn sealed() -> u32 { 1 }\n")]);
+    let source_store = TempDir::new().expect("source store root");
+    let generation = {
+        let mut scheduler = scheduler(
+            &fixture,
+            source_store.path().to_path_buf(),
+            Arc::new(SharedCodeIndexBytePoolV1::default()),
+        );
+        published(scheduler.reconcile_now().expect("build generation"));
+        Arc::clone(
+            &scheduler
+                .latest_complete_already_decoded()
+                .expect("generation remains decoded")
+                .generation,
+        )
+    };
+
+    let target_store = TempDir::new().expect("target publication store root");
+    let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observer_shutting_down = Arc::clone(&shutting_down);
+    let mut publication = super::super::DaemonCodeIndexPublicationStoreV1::new(
+        target_store.path(),
+        fixture.path(),
+        SanitizerRevision::new(tracedecay_privacy::CODE_SOURCE_SANITIZER_VERSION_V1)
+            .expect("sanitizer revision"),
+    )
+    .expect("open target publication store")
+    .with_shutdown_signal(Arc::clone(&shutting_down))
+    .with_segments_dir_sync_observer_for_test(Arc::new(move || {
+        observer_shutting_down.store(true, std::sync::atomic::Ordering::Release);
+    }));
+
+    let error = publication
+        .publish_atomically(&generation.sealed_scope(), None, &cold(&generation))
+        .expect_err("shutdown after the final segment sync must stop publication");
+    assert!(shutting_down.load(std::sync::atomic::Ordering::Acquire));
+    assert!(matches!(
+        error,
+        CodeIndexPublicationStoreErrorV1::CompareAndSwap
+    ));
+    assert!(
+        !target_store
+            .path()
+            .join("active-code-generation-v1.json")
+            .exists(),
+        "shutdown must leave the active pointer unpublished"
+    );
+    assert_eq!(
+        std::fs::read_dir(target_store.path().join("code-generations-v1"))
+            .expect("generation directory")
+            .count(),
+        0,
+        "shutdown must leave no manifest or manifest temporary"
+    );
+    let segments = std::fs::read_dir(code_generation_segments_root(target_store.path()))
+        .expect("segment directory")
+        .map(|entry| entry.expect("segment entry").file_name())
+        .collect::<Vec<_>>();
+    assert!(!segments.is_empty(), "the real segment sync completed");
+    assert!(
+        segments
+            .iter()
+            .all(|name| !name.to_string_lossy().starts_with('.')),
+        "shutdown must clean unattached evidence and staged temporary files"
+    );
+}
+
+#[test]
 fn publishing_many_new_segments_syncs_the_segments_directory_once() {
     // Eight distinct files seal to eight distinct new segment files. POSIX
     // durability only requires the containing directory to be fsynced once

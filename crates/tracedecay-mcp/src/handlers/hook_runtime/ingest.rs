@@ -1,6 +1,5 @@
 use serde_json::{Value, json};
 use std::path::Path;
-use std::time::Duration;
 use tracedecay_automation_runtime::automation::config_error;
 use tracedecay_contracts::retrieval::{
     HookCompactionResultV1, HookIngestAdmissionV1, HookIngestTranscriptRequestV1,
@@ -194,6 +193,67 @@ async fn drain_host_observation_projections(
     Ok(stats.transcript.messages_upserted)
 }
 
+/// Admit one bounded window for the hook's session. Historical discovery,
+/// projection repair, and summarization retain their daemon background owners.
+async fn admit_codex_session_for_compaction(
+    admission: &HostAdmissionFacade<'_>,
+    source: tracedecay_sessions::runtime::hosts::codex::CodexSource,
+    project_root: &Path,
+    project_id: ProjectId,
+    session_id: &str,
+    cancellation: &ObservationCancellation,
+) -> Result<CodexRolloutAdmission> {
+    let requested_session = session_id.to_owned();
+    let lookup = tokio::task::spawn_blocking(move || {
+        source.find_session_transcript_paths_bounded(&requested_session)
+    })
+    .await
+    .map_err(|_| config_error("Codex exact-session discovery task failed"))?
+    .map_err(|error| map_transcript_ingest_error(&error))?;
+    let mut remaining = tracedecay_sessions::runtime::hosts::codex::CODEX_HOOK_MAX_NEW_BYTES;
+    let mut deferred = lookup.source_deferred || lookup.paths.is_empty();
+    let mut observations_committed = 0_u64;
+    let mut scanned = 0_u64;
+    let mut replayed = 0_u64;
+    let mut paths = lookup.paths.into_iter().peekable();
+    while let Some(path) = paths.next() {
+        if remaining == 0 {
+            deferred = true;
+            break;
+        }
+        let progress = tracedecay_sessions::runtime::hosts::codex::try_admit_codex_jsonl_observations_for_project_session_window(
+            &path,
+            project_root,
+            project_id.clone(),
+            session_id,
+            admission,
+            remaining,
+            cancellation,
+        )
+        .await
+        .map_err(|error| map_transcript_ingest_error(&error))?;
+        remaining = remaining.saturating_sub(progress.bytes_consumed);
+        deferred |= progress.source_deferred;
+        observations_committed = observations_committed.saturating_add(progress.frames_persisted);
+        scanned = scanned.saturating_add(1);
+        if progress.resumed && progress.frames_persisted == 0 {
+            replayed = replayed.saturating_add(1);
+        }
+        // Duplicate paths can be checked cheaply, but one callback owns only
+        // one new canonical window. Other rollouts for this session retain
+        // their cursors for the background intake owner.
+        if progress.source_deferred || progress.bytes_consumed > 0 {
+            deferred |= paths.peek().is_some();
+            break;
+        }
+    }
+    Ok(CodexRolloutAdmission {
+        deferred,
+        exact_duplicate: scanned > 0 && scanned == replayed,
+        observations_committed,
+    })
+}
+
 #[tracing::instrument(name = "mcp.hook_runtime.compact", level = "trace", skip_all)]
 pub(super) async fn codex_compact(
     cg: &TraceDecay,
@@ -201,14 +261,15 @@ pub(super) async fn codex_compact(
     session_authorities: SessionAuthorities<'_>,
 ) -> Result<HookCompactionResultV1> {
     let event_json = required_field(Some(event_json), "event_json")?;
-    let Some(authority) = session_authorities.project_lcm else {
+    if session_authorities.project_lcm.is_none() {
         return Ok(compaction_authority_unavailable());
-    };
+    }
     let parsed = serde_json::from_str::<Value>(event_json).ok();
     let session_id = parsed.as_ref().and_then(|value| {
         ["session_id", "conversation_id", "thread_id"]
             .iter()
             .find_map(|key| value.get(*key).and_then(Value::as_str))
+            .filter(|session_id| !session_id.trim().is_empty())
             .map(str::to_string)
     });
     let Some(session_id) = session_id else {
@@ -218,124 +279,69 @@ pub(super) async fn codex_compact(
             messages_upserted: 0,
         });
     };
-    // The daemon compaction compresses the session's durable history, so the
-    // rollout must land in the owning store through the canonical ingest
-    // route before pressure evidence is evaluated; compacting an unfilled
-    // store would report an empty success.
-    let ingested = tracing::Instrument::instrument(
-        admit_codex_rollouts_for_compaction(cg, session_authorities),
+    // PostCompact has a short host deadline. It admits the current session's
+    // native evidence but never waits for corpus catch-up or a model summary.
+    // Canonical raw writes seed the restart-safe summary convergence queue;
+    // projection and summary work continue through the existing daemon owner.
+    let intake = tracing::Instrument::instrument(
+        admit_codex_session_window_for_compaction(cg, &session_id, session_authorities),
         tracing::trace_span!("mcp.hook_runtime.compact_ingest"),
     )
-    .await?;
-    let current_tokens = parsed
-        .as_ref()
-        .and_then(|event| event_i64(event, &["context_tokens", "current_tokens", "tokens"]));
-    let context_length = parsed
-        .as_ref()
-        .and_then(|event| event_i64(event, &["context_window_size", "context_length"]));
-    let Some(response) = tracing::Instrument::instrument(
-        authority.execute(pressure_only_command(
-            "codex",
-            &session_id,
-            current_tokens,
-            context_length,
-            None,
-            None,
-            LcmHostProtocol::CodexContextCompacted {
-                protocol_revision: "codex.context-compacted.v1".to_owned(),
-                event_digest: tracedecay_domain::canonical_sha256(&event_json)
-                    .map_err(|error| config_error(format!("digest Codex event failed: {error}")))?,
-            },
-        )),
-        tracing::trace_span!("mcp.hook_runtime.compact_execute"),
-    )
-    .await
-    else {
-        return Ok(compaction_authority_unavailable());
+    .await;
+    codex_compaction_intake_result(intake)
+}
+
+fn codex_compaction_intake_result(
+    intake: Result<CodexRolloutAdmission>,
+) -> Result<HookCompactionResultV1> {
+    let ingested = match intake {
+        Ok(ingested) => ingested,
+        Err(error)
+            if error
+                .hook_runtime_context()
+                .is_some_and(|(reason, retryable, _)| reason == "cursor_conflict" && retryable) =>
+        {
+            return Ok(codex_compaction_pending(true));
+        }
+        Err(error) => return Err(error),
     };
-    let mut result = compaction_response(&response)?;
-    if let HookCompactionResultV1::Settled {
-        messages_upserted, ..
-    }
-    | HookCompactionResultV1::Refused {
-        messages_upserted, ..
-    } = &mut result
-    {
-        *messages_upserted = ingested;
-    }
-    Ok(result)
+    tracing::debug!(
+        observations_committed = ingested.observations_committed,
+        source_deferred = ingested.deferred,
+        exact_duplicate = ingested.exact_duplicate,
+        "Codex PostCompact canonical intake completed; summary execution deferred"
+    );
+    Ok(codex_compaction_pending(ingested.deferred))
 }
 
-/// The project-open catch-up scans the same Codex sources concurrently, so a
-/// compaction-time pass tolerates a bounded window of cursor CAS losses and
-/// still-mounting write authorities before treating the ingest as failed.
-const COMPACTION_INGEST_ATTEMPTS: usize = 10;
-const COMPACTION_INGEST_RETRY_DELAY: Duration = Duration::from_millis(400);
-
-/// Typed reasons that mean a peer ingestor or the project-open sequence is
-/// advancing the same durable state: the source cursor CAS rejected this
-/// pass, the shared writer was saturated, or a write authority was still
-/// mounting. Each converges once the peer pass settles, so the bounded retry
-/// re-reads rather than surfacing a terminal failure.
-///
-/// `project_authority_unbound` is listed explicitly because the authority
-/// itself reports it as non-retryable: it means the project's write authority
-/// has not been bound *yet*, which the project-open sequence resolves. A
-/// mismatched authority is deliberately absent, that never converges by
-/// waiting.
-const COMPACTION_INGEST_CONVERGING_REASONS: &[&str] = &[
-    "cursor_conflict",
-    "authority_write_failed",
-    "authority_unavailable",
-    "project_authority_unbound",
-    "external_source_runtime_unavailable",
-    "external_source_commit_failed",
-    "batch_worker_stopped",
-];
-
-/// Lands the project's Codex rollouts in the owning store through the
-/// canonical ingest route ahead of a compaction, reporting the exact upserted
-/// message count. Admission failures stay typed instead of letting the
-/// compaction run against missing history.
-///
-/// Retries are bounded to typed retryable classifications: the project-open
-/// codex catch-up advances the same source cursors, so a CAS conflict (or the
-/// open sequence still mounting its write authorities) is peer progress this
-/// pass re-reads on the next attempt, never a terminal state.
-async fn admit_codex_rollouts_for_compaction(
-    cg: &TraceDecay,
-    session_authorities: SessionAuthorities<'_>,
-) -> Result<u64> {
-    let mut last_retryable = None;
-    for attempt in 0..COMPACTION_INGEST_ATTEMPTS {
-        if attempt > 0 {
-            tokio::time::sleep(COMPACTION_INGEST_RETRY_DELAY).await;
+fn codex_compaction_pending(source_deferred: bool) -> HookCompactionResultV1 {
+    HookCompactionResultV1::NotRun {
+        status: if source_deferred {
+            "pending"
+        } else {
+            "deferred"
         }
-        match admit_codex_rollouts_once(cg, session_authorities.clone()).await {
-            Ok(messages_upserted) => return Ok(messages_upserted),
-            Err(error) => {
-                let converging =
-                    error
-                        .hook_runtime_context()
-                        .is_some_and(|(reason, retryable, _)| {
-                            retryable || COMPACTION_INGEST_CONVERGING_REASONS.contains(&reason)
-                        });
-                if !converging {
-                    return Err(error);
-                }
-                last_retryable = Some(error);
-            }
+        .to_owned(),
+        reason: if source_deferred {
+            "canonical_transcript_pending"
+        } else {
+            "postcompact_summary_deferred"
         }
+        .to_owned(),
+        summary_nodes_created: 0,
+        summary_node_ids: Vec::new(),
+        relation_projection_status: None,
     }
-    Err(last_retryable.unwrap_or_else(|| {
-        config_error("codex compaction ingest kept racing past its retry budget")
-    }))
 }
 
-async fn admit_codex_rollouts_once(
+/// Admission failures retain their exact classification. A cursor race or
+/// unavailable writer belongs to the existing background recovery policy,
+/// rather than ten synchronous rescans inside the host callback.
+async fn admit_codex_session_window_for_compaction(
     cg: &TraceDecay,
+    session_id: &str,
     session_authorities: SessionAuthorities<'_>,
-) -> Result<u64> {
+) -> Result<CodexRolloutAdmission> {
     let facade = host_admission_facade(Some(cg), HostAdmissionScope::Project, session_authorities)?;
     let admission = facade.accept_replay("codex", HostAdmissionScope::Project);
     if let Some(rejection) = reject_unadmitted(
@@ -348,20 +354,16 @@ async fn admit_codex_rollouts_once(
     let source = tracedecay_sessions::runtime::hosts::codex::CodexSource::new()
         .ok_or_else(|| config_error("Codex transcript source is unavailable"))?;
     let project_id = project_observation_id(cg)?;
-    let scope = ObservationScopeV1::Project {
-        project_id: project_id.clone(),
-    };
     let cancellation = ObservationCancellation::default();
-    admit_codex_project_rollouts(
+    admit_codex_session_for_compaction(
         &facade,
-        &source,
+        source,
         cg.project_root(),
         project_id,
-        None,
+        session_id,
         &cancellation,
     )
-    .await?;
-    drain_host_observation_projections(&facade, &scope, &cancellation).await
+    .await
 }
 
 /// Claude's `PostCompact` summaries carry no machine provenance, so the

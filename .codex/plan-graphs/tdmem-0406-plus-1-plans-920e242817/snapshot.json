@@ -1,0 +1,97 @@
+{
+  "generated_at": "2026-08-31T22:04:53.416316+00:00",
+  "graph_id": "tdmem-0406-plus-1-plans-920e242817",
+  "plan_set_hash": "74e7606663",
+  "selection_hash": "920e242817",
+  "plan_count": 2,
+  "edge_count": 0,
+  "plans_root": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans",
+  "selected_globs": [],
+  "selected_plan_paths": [
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0406.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1208.plan.md"
+  ],
+  "edges": [],
+  "plans": [
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0406.plan.md",
+      "slug": "tdmem-0406",
+      "name": "tdmem-0406",
+      "overview": "Exercise an actual supported host path through observe, recall, context injection, outcome, and later recall.",
+      "todos": [
+        {
+          "id": "tdmem-0406-deliver",
+          "content": "Deliver Bead tdmem-0406: Run a real Native-provider coding-agent journey; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1208.plan.md",
+      "slug": "tdmem-1208",
+      "name": "tdmem-1208",
+      "overview": "Advance from the initial PR #707 floor to a later approved Zack checkpoint using only the documented workflow.",
+      "todos": [
+        {
+          "id": "tdmem-1208-deliver",
+          "content": "Deliver Bead tdmem-1208: Rehearse the first full Zack convergence train; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    }
+  ],
+  "frontier": [
+    {
+      "plan_slug": "tdmem-0406",
+      "plan_name": "tdmem-0406",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-0406.plan.md",
+      "plan_status": "pending",
+      "state": "ready",
+      "blocked_by": [],
+      "active": [
+        {
+          "id": "tdmem-0406-deliver",
+          "content": "Deliver Bead tdmem-0406: Run a real Native-provider coding-agent journey; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    },
+    {
+      "plan_slug": "tdmem-1208",
+      "plan_name": "tdmem-1208",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/beads-runnable/tdmem-1208.plan.md",
+      "plan_status": "pending",
+      "state": "ready",
+      "blocked_by": [],
+      "active": [
+        {
+          "id": "tdmem-1208-deliver",
+          "content": "Deliver Bead tdmem-1208: Rehearse the first full Zack convergence train; satisfy every recorded acceptance criterion, run the smallest behavioral dependency cone, then commit and push the green slice.",
+          "status": "pending",
+          "ordinal": 1
+        }
+      ],
+      "upcoming": [],
+      "completed": 0,
+      "total": 1
+    }
+  ],
+  "errors": [
+    "tdmem-0406: selected plan is orphaned (no upstream or downstream edges); link it explicitly or exclude it from the graph selection",
+    "tdmem-1208: selected plan is orphaned (no upstream or downstream edges); link it explicitly or exclude it from the graph selection"
+  ],
+  "warnings": [],
+  "graph_source": "matched-plan-set"
+}

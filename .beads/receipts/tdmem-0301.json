@@ -1,0 +1,319 @@
+{
+  "actor": "assistant",
+  "beads_commands": [
+    {
+      "argv": [
+        "br",
+        "sync",
+        "--import-only",
+        "--rebuild"
+      ],
+      "duration_ms": 818,
+      "exit_code": 0,
+      "name": "rebuild Beads database",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 92,
+      "stdout_sha256": "d3d3117c0f627602d1b76be654a70c2b97973d9e383edc798a39c32b477cd010",
+      "stdout_tail": "Imported from JSONL (via automatic recovery):\n  Created: 131 issues\n  Rebuilt blocked cache\n"
+    },
+    {
+      "argv": [
+        "br",
+        "show",
+        "tdmem-0301",
+        "--json"
+      ],
+      "duration_ms": 40,
+      "exit_code": 0,
+      "name": "show issue",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 5094,
+      "stdout_sha256": "f271eb059cdbbaab39bcb12ea507e3187f23693978220025e424cb54081b5dea",
+      "stdout_tail": "m-0300\",\"title\":\"M2 \u2014 Create isolated monorepo crates and composition mounts\",\"status\":\"open\",\"priority\":0,\"dependency_type\":\"parent-child\"}],\"dependents\":[{\"id\":\"tdmem-0302\",\"title\":\"Create the tracedecay-memory-fabric crate\",\"status\":\"open\",\"priority\":0,\"dependency_type\":\"blocks\"},{\"id\":\"tdmem-0303\",\"title\":\"Create the TraceDecay Native provider adapter crate\",\"status\":\"open\",\"priority\":0,\"dependency_type\":\"blocks\"},{\"id\":\"tdmem-0304\",\"title\":\"Create the NCM provider adapter crate\",\"status\":\"open\",\"priority\":1,\"dependency_type\":\"blocks\"},{\"id\":\"tdmem-0305\",\"title\":\"Create the memory evaluation and conformance crate\",\"status\":\"open\",\"priority\":1,\"dependency_type\":\"blocks\"}],\"parent\":\"tdmem-0300\",\"inherited_context\":[{\"source_id\":\"tdmem-0000\",\"source_role\":\"epic\",\"source_title\":\"Program: Pluggable Cognitive Memory Providers for TraceDecay V2\",\"field_used\":\"agent_context\",\"content\":\"{\\\"constraints\\\":[\\\"Scope is coding agents only. Do not introduce game, NPC, OntOS, or general-purpose product surfaces in this program.\\\",\\\"Use TraceDecay V2 PR #707 head 08fbe33a7c7f403191fd5d6e356c7b6681b96403 as the initial upstream floor.\\\",\\\"Preserve TraceDecay as authority for current code, repository/worktree identity, sessions, tools, approvals, and host integration.\\\",\\\"Memory-provider output is advisory context. It cannot silently mutate canonical code truth or TraceDecay Native facts.\\\",\\\"Keep all work in this monorepo, but isolate product-owned code in dedicated crates and narrow composition-root mounts.\\\",\\\"TraceDecay Native, NCM, and future OCEAN must sit behind one capability-based provider boundary; never branch on provider names outside registry/adapters.\\\",\\\"No silent fallback, fake readiness, placeholder success, swallowed error, unbounded queue, or undocumented authority.\\\",\\\"Every production path must propagate deadlines and cancellation, return typed terminal outcomes, preserve provenance, and enforce exact project/worktree scope.\\\",\\\"All writes must be idempotent and crash-recoverable. Observer providers must never affect prompts, canonical facts, or externally visible actions.\\\",\\\"Do not close a bead without its acceptance checklist, focused tests, and at least one real product journey where applicable.\\\",\\\"Track every intentional edit to Zack-owned files in the upstream convergence map with rationale and semantic invariants.\\\",\\\"Use Beads Rust JSONL as the versioned planning authority; keep the SQLite database local and rebuildable.\\\"],\\\"deliverables\\\":[\\\"Provider API and capability registry\\\",\\\"TraceDecay Native adapter with parity\\\",\\\"NCM adapter and guarded observer/active modes\\\",\\\"Observation dispatch, recall integration, feedback, maintenance, inspection, and conformance\\\",\\\"Coding-agent journeys for Claude Code, Codex, Cursor, multi-worktree, restart, stale correction, and provider failure\\\",\\\"Repeatable upstream convergence workflow for Zack and structured lesson intake from Jeffrey\\\"],\\\"objective\\\":\\\"Deliver a pluggable cognitive-memory layer inside the TraceDecay V2 monorepo for coding agents.\\\",\\\"references\\\":[\\\"https://github.com/ScriptedAlchemy/tracedecay/pull/707\\\",\\\"https://github.com/BleedingDev/tracedecay/tree/feat/pluggable-memory-providers-v2\\\",\\\"https://github.com/bleedingDev/biomem\\\",\\\"https://github.com/Dicklesworthstone/beads_rust\\\"]}\"},{\"source_id\":\"tdmem-0300\",\"source_role\":\"parent\",\"source_title\":\"M2 \u2014 Create isolated monorepo crates and composition mounts\",\"field_used\":\"agent_context\",\"content\":\"{\\\"constraints\\\":[\\\"Follow the root program constraints inherited from tdmem-0000.\\\",\\\"Keep product-owned implementation isolated from Zack-owned crates unless the seam cannot be mounted otherwise.\\\",\\\"Every upstream-owned file touched must be recorded in the convergence map before the bead closes.\\\"],\\\"deliverables\\\":[\\\"Crate layout\\\",\\\"Dependency guards\\\",\\\"Feature/composition mounts\\\",\\\"Upstream map\\\"],\\\"objective\\\":\\\"M2 \u2014 Create isolated monorepo crates and composition mounts\\\",\\\"references\\\":[]}\"}]}]\n"
+    },
+    {
+      "argv": [
+        "br",
+        "update",
+        "--actor",
+        "assistant",
+        "tdmem-0301",
+        "--status",
+        "in_progress",
+        "--transition-comment",
+        "Creating the first product-owned workspace crate as the only provider-neutral Rust runtime boundary over the generated M1 authority, with no TraceDecay internal or concrete-provider dependency."
+      ],
+      "duration_ms": 304,
+      "exit_code": 0,
+      "name": "claim issue",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 3468,
+      "stdout_sha256": "b0d9d032a46bb8fa6c6742f5328c15b0da0b8b1111585d9525bad20ff8e8b0f3",
+      "stdout_tail": "Updated tdmem-0301: Create the tracedecay-memory-provider-api crate\n  status: open \u2192 in_progress\n\n--- Inherited context (from epic tdmem-0000: \"Program: Pluggable Cognitive Memory Providers for TraceDecay V2\") ---\n{\n  \"constraints\": [\n    \"Scope is coding agents only. Do not introduce game, NPC, OntOS, or general-purpose product surfaces in this program.\",\n    \"Use TraceDecay V2 PR #707 head 08fbe33a7c7f403191fd5d6e356c7b6681b96403 as the initial upstream floor.\",\n    \"Preserve TraceDecay as authority for current code, repository/worktree identity, sessions, tools, approvals, and host integration.\",\n    \"Memory-provider output is advisory context. It cannot silently mutate canonical code truth or TraceDecay Native facts.\",\n    \"Keep all work in this monorepo, but isolate product-owned code in dedicated crates and narrow composition-root mounts.\",\n    \"TraceDecay Native, NCM, and future OCEAN must sit behind one capability-based provider boundary; never branch on provider names outside registry/adapters.\",\n    \"No silent fallback, fake readiness, placeholder success, swallowed error, unbounded queue, or undocumented authority.\",\n    \"Every production path must propagate deadlines and cancellation, return typed terminal outcomes, preserve provenance, and enforce exact project/worktree scope.\",\n    \"All writes must be idempotent and crash-recoverable. Observer providers must never affect prompts, canonical facts, or externally visible actions.\",\n    \"Do not close a bead without its acceptance checklist, focused tests, and at least one real product journey where applicable.\",\n    \"Track every intentional edit to Zack-owned files in the upstream convergence map with rationale and semantic invariants.\",\n    \"Use Beads Rust JSONL as the versioned planning authority; keep the SQLite database local and rebuildable.\"\n  ],\n  \"deliverables\": [\n    \"Provider API and capability registry\",\n    \"TraceDecay Native adapter with parity\",\n    \"NCM adapter and guarded observer/active modes\",\n    \"Observation dispatch, recall integration, feedback, maintenance, inspection, and conformance\",\n    \"Coding-agent journeys for Claude Code, Codex, Cursor, multi-worktree, restart, stale correction, and provider failure\",\n    \"Repeatable upstream convergence workflow for Zack and structured lesson intake from Jeffrey\"\n  ],\n  \"objective\": \"Deliver a pluggable cognitive-memory layer inside the TraceDecay V2 monorepo for coding agents.\",\n  \"references\": [\n    \"https://github.com/ScriptedAlchemy/tracedecay/pull/707\",\n    \"https://github.com/BleedingDev/tracedecay/tree/feat/pluggable-memory-providers-v2\",\n    \"https://github.com/bleedingDev/biomem\",\n    \"https://github.com/Dicklesworthstone/beads_rust\"\n  ]\n}\n--- End inherited context (tdmem-0000) ---\n--- Inherited context (from parent tdmem-0300: \"M2 \u2014 Create isolated monorepo crates and composition mounts\") ---\n{\n  \"constraints\": [\n    \"Follow the root program constraints inherited from tdmem-0000.\",\n    \"Keep product-owned implementation isolated from Zack-owned crates unless the seam cannot be mounted otherwise.\",\n    \"Every upstream-owned file touched must be recorded in the convergence map before the bead closes.\"\n  ],\n  \"deliverables\": [\n    \"Crate layout\",\n    \"Dependency guards\",\n    \"Feature/composition mounts\",\n    \"Upstream map\"\n  ],\n  \"objective\": \"M2 \u2014 Create isolated monorepo crates and composition mounts\",\n  \"references\": []\n}\n--- End inherited context (tdmem-0300) ---\n"
+    },
+    {
+      "argv": [
+        "br",
+        "update",
+        "--actor",
+        "assistant",
+        "tdmem-0301",
+        "--acceptance-criteria",
+        "- [x] The tracedecay-memory-provider-api crate compiles and tests independently inside the existing Rust workspace under the pinned toolchain and strict lint policy.\n- [x] The public API reuses the generated M1 contract values and adds only owned runtime identity, exact scope, live cancellation, bounded call/terminal types, handshake values, and the object-safe MemoryProvider trait; no second wire schema exists.\n- [x] Cargo metadata and the patch-policy dependency audit prove the crate has no TraceDecay storage, code-index, daemon, dashboard, host, transport, Native-adapter, NCM, or OCEAN dependency.\n- [x] Root Cargo.toml and generated Cargo.lock changes are minimal, reproducible, convergence-mapped path-package wiring and leave all existing dependency versions, default features, and upstream behavior unchanged."
+      ],
+      "duration_ms": 242,
+      "exit_code": 0,
+      "name": "complete acceptance criteria",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 68,
+      "stdout_sha256": "1fb07750ce4f4716c083f71ff81408a152ffb1ef3802602f32ac21e1be218a6f",
+      "stdout_tail": "Updated tdmem-0301: Create the tracedecay-memory-provider-api crate\n"
+    },
+    {
+      "argv": [
+        "br",
+        "close",
+        "--actor",
+        "assistant",
+        "tdmem-0301",
+        "--reason",
+        "Added the independently compiling provider-neutral Rust API crate over the canonical generated M1 contract authority, with strict validation, live request control, typed provider traits, no forbidden upstream internals, and mapped workspace wiring.",
+        "--transition-comment",
+        "Evidence: crates/tracedecay-memory-provider-api reuses product/contracts/memory-provider-v1/generated/rust/memory_provider_v1.rs directly and defines validated owned provider/capability IDs, complete TraceDecay-owned coding scope, cooperative cancellation, finite operation control, capability-routed operations, negotiated provider limits, real descriptors, canonical payload/extension wrappers, validated calls, typed terminal replies, HandshakeRequestParts and handshake values, and the object-safe MemoryProvider trait. The crate has no dependencies. Its strict-lint-clean behavioral tests cover generated identifier validation, exact scope, cancellation versus deadline, mandatory and duplicate capabilities, mutation idempotency, operation-capability admission, trait-object handshake/invocation, and deterministic capability ordering without unwrap, expect, panic, todo, unimplemented, or constant-false assertions. Root Cargo.toml and generated Cargo.lock contain only additive path-package wiring tracked in the convergence map, whose counters are derived from the actual immutable-floor diff. Cargo metadata, fmt, strict Clippy, tests, generated-binding drift, patch budget, and metadata dependency audit all pass."
+      ],
+      "duration_ms": 251,
+      "exit_code": 0,
+      "name": "close issue",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 322,
+      "stdout_sha256": "0c43da9bd65430ea1fa6cd178eda926ff51bc64512f2dcefee3bbaff0a01587d",
+      "stdout_tail": "\u2713 Closed tdmem-0301: Create the tracedecay-memory-provider-api crate (Added the independently compiling provider-neutral Rust API crate over the canonical generated M1 contract authority, with strict validation, live request control, typed provider traits, no forbidden upstream internals, and mapped workspace wiring.)\n"
+    },
+    {
+      "argv": [
+        "br",
+        "sync",
+        "--flush-only"
+      ],
+      "duration_ms": 93,
+      "exit_code": 0,
+      "name": "flush Beads JSONL",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 36,
+      "stdout_sha256": "3729c3a3978f7481160ebb0a2d0d702f0484310f76e0219a5c5bcbb40d5126d0",
+      "stdout_tail": "Nothing to export (no dirty issues)\n"
+    },
+    {
+      "argv": [
+        "br",
+        "dep",
+        "cycles",
+        "--json"
+      ],
+      "duration_ms": 24,
+      "exit_code": 0,
+      "name": "check dependency cycles",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 145,
+      "stdout_sha256": "33e568c4decf5b3081ac0ef00cc4ed65a1dc13c5350edd609f2ea2a1a5ae9897",
+      "stdout_tail": "{\"cycles\":[],\"count\":0,\"active_count\":0,\"archived_closed_count\":0,\"total_count\":0,\"blocking_only\":false,\"include_closed\":false,\"scope\":\"active\"}\n"
+    },
+    {
+      "argv": [
+        "br",
+        "doctor"
+      ],
+      "duration_ms": 234,
+      "exit_code": 1,
+      "name": "run Beads doctor",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 2534,
+      "stdout_sha256": "bc0d0849de31d64f9f579dad24884561ed815554f3adb3d195a2d275e5921584",
+      "stdout_tail": "br doctor\nHEALTH workspace: healthy\nOK jsonl.merge_artifacts\nOK base_jsonl\nOK doctor.runs_dir\nOK doctor.runs_creatable\nOK permissions.recovery_dir\nOK permissions.write_lock\nOK permissions.root_gitignore\nOK permissions.db_sidecars\nOK permissions.config_yaml_secrets\nOK br_path_dupes\nOK gitignore.beads_inner_present\nOK tmp_files_orphan\nOK br_history.size\nOK gitignore.beads_inner\nOK routes_jsonl: No routes.jsonl present (cross-project routing is optional)\nOK rust_log: RUST_LOG unset; release default is quiet enough for --json\nOK permissions.beads_dir: `.beads/` and critical children are user-writable\nOK config.yaml: config.yaml parses cleanly (220 bytes)\nOK metadata.json: metadata.json parses cleanly (63 bytes); declared targets exist on disk\nOK binary_version: Running br 0.5.7; no beads_rust Cargo.toml reachable from .beads/ \u2014 not flagging\nOK write_lock: .beads/.write.lock is 3s old (within 300s threshold); not stale\nOK routes.targets: No local or town routes.jsonl present (route targets are optional)\nOK startup_cache.health\nOK sync.merge_pending: No pending sync merge requires artifact reconciliation\nOK permissions.jsonl_world_writable\nOK jsonl_crlf\nOK jsonl_bom\nOK jsonl_eof_newline\nOK jsonl_size\nOK jsonl.duplicate_ids\nOK sync_jsonl_path: JSONL path is within sync allowlist\nOK sync_conflict_markers: No merge conflict markers found\nOK jsonl.parse: Parsed 131 records\nOK dep.dead_closed_blocking_edges: 26 open issue(s) have blocking edges whose blockers are closed (satisfied dependencies \u2014 the normal result of completing work)\nOK dep.fully_unblocked_open: 8 open issue(s) have all blockers completed (8 ready to work, 0 deliberately excluded from ready)\nOK db_bloat\nOK wal_size\nWARN db.recovery_artifacts: Preserved recovery artifacts remain for this database family (7 item(s))\nOK db.recovery_artifacts.aged\nOK db.foreign_recovery_debris\nOK db.sidecars: SHM sidecar at /home/runner/work/tracedecay/tracedecay/.beads/beads.db-shm is inert beside the WAL (a WAL-only family is expected for frankensqlite; the WAL index lives in process memory)\nOK schema.tables\nOK schema.columns\nOK db.recoverable_anomalies\nOK db.null_defaults\nOK sqlite.integrity_check\nOK db.export_hash_cache\nOK base_jsonl.missing_post_flush\nOK dirty_bitmap\nOK comments.orphans\nOK labels.orphans\nOK dependencies.orphans\nOK audit.suspect_close_reasons\nOK counts.db_vs_jsonl: Both have 131 records\nOK sync.metadata: Database and JSONL are in sync\nOK db.write_probe: Rollback-only issue write succeeded for tdmem-0000\nOK sqlite3.integrity_check\n"
+    },
+    {
+      "argv": [
+        "br",
+        "show",
+        "tdmem-0301",
+        "--json"
+      ],
+      "duration_ms": 51,
+      "exit_code": 0,
+      "name": "show issue",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 7672,
+      "stdout_sha256": "7a93abd89acd1518af92f5cb7d59ad56a3ea4e3d3fae4e25953cdbb22475dc89",
+      "stdout_tail": "avioral tests cover generated identifier validation, exact scope, cancellation versus deadline, mandatory and duplicate capabilities, mutation idempotency, operation-capability admission, trait-object handshake/invocation, and deterministic capability ordering without unwrap, expect, panic, todo, unimplemented, or constant-false assertions. Root Cargo.toml and generated Cargo.lock contain only additive path-package wiring tracked in the convergence map, whose counters are derived from the actual immutable-floor diff. Cargo metadata, fmt, strict Clippy, tests, generated-binding drift, patch budget, and metadata dependency audit all pass.\",\"created_at\":\"2026-08-30T19:10:11Z\"}],\"parent\":\"tdmem-0300\",\"inherited_context\":[{\"source_id\":\"tdmem-0000\",\"source_role\":\"epic\",\"source_title\":\"Program: Pluggable Cognitive Memory Providers for TraceDecay V2\",\"field_used\":\"agent_context\",\"content\":\"{\\\"constraints\\\":[\\\"Scope is coding agents only. Do not introduce game, NPC, OntOS, or general-purpose product surfaces in this program.\\\",\\\"Use TraceDecay V2 PR #707 head 08fbe33a7c7f403191fd5d6e356c7b6681b96403 as the initial upstream floor.\\\",\\\"Preserve TraceDecay as authority for current code, repository/worktree identity, sessions, tools, approvals, and host integration.\\\",\\\"Memory-provider output is advisory context. It cannot silently mutate canonical code truth or TraceDecay Native facts.\\\",\\\"Keep all work in this monorepo, but isolate product-owned code in dedicated crates and narrow composition-root mounts.\\\",\\\"TraceDecay Native, NCM, and future OCEAN must sit behind one capability-based provider boundary; never branch on provider names outside registry/adapters.\\\",\\\"No silent fallback, fake readiness, placeholder success, swallowed error, unbounded queue, or undocumented authority.\\\",\\\"Every production path must propagate deadlines and cancellation, return typed terminal outcomes, preserve provenance, and enforce exact project/worktree scope.\\\",\\\"All writes must be idempotent and crash-recoverable. Observer providers must never affect prompts, canonical facts, or externally visible actions.\\\",\\\"Do not close a bead without its acceptance checklist, focused tests, and at least one real product journey where applicable.\\\",\\\"Track every intentional edit to Zack-owned files in the upstream convergence map with rationale and semantic invariants.\\\",\\\"Use Beads Rust JSONL as the versioned planning authority; keep the SQLite database local and rebuildable.\\\"],\\\"deliverables\\\":[\\\"Provider API and capability registry\\\",\\\"TraceDecay Native adapter with parity\\\",\\\"NCM adapter and guarded observer/active modes\\\",\\\"Observation dispatch, recall integration, feedback, maintenance, inspection, and conformance\\\",\\\"Coding-agent journeys for Claude Code, Codex, Cursor, multi-worktree, restart, stale correction, and provider failure\\\",\\\"Repeatable upstream convergence workflow for Zack and structured lesson intake from Jeffrey\\\"],\\\"objective\\\":\\\"Deliver a pluggable cognitive-memory layer inside the TraceDecay V2 monorepo for coding agents.\\\",\\\"references\\\":[\\\"https://github.com/ScriptedAlchemy/tracedecay/pull/707\\\",\\\"https://github.com/BleedingDev/tracedecay/tree/feat/pluggable-memory-providers-v2\\\",\\\"https://github.com/bleedingDev/biomem\\\",\\\"https://github.com/Dicklesworthstone/beads_rust\\\"]}\"},{\"source_id\":\"tdmem-0300\",\"source_role\":\"parent\",\"source_title\":\"M2 \u2014 Create isolated monorepo crates and composition mounts\",\"field_used\":\"agent_context\",\"content\":\"{\\\"constraints\\\":[\\\"Follow the root program constraints inherited from tdmem-0000.\\\",\\\"Keep product-owned implementation isolated from Zack-owned crates unless the seam cannot be mounted otherwise.\\\",\\\"Every upstream-owned file touched must be recorded in the convergence map before the bead closes.\\\"],\\\"deliverables\\\":[\\\"Crate layout\\\",\\\"Dependency guards\\\",\\\"Feature/composition mounts\\\",\\\"Upstream map\\\"],\\\"objective\\\":\\\"M2 \u2014 Create isolated monorepo crates and composition mounts\\\",\\\"references\\\":[]}\"}]}]\n"
+    }
+  ],
+  "checks": [
+    {
+      "argv": [
+        "cargo",
+        "metadata",
+        "--locked",
+        "--format-version",
+        "1",
+        "--no-deps"
+      ],
+      "duration_ms": 55,
+      "exit_code": 0,
+      "name": "provider API workspace metadata",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 370556,
+      "stdout_sha256": "0927dcd68ff2a303f8d4c6208169248ddec30ad129350bcab5cd319e5f1a6acc",
+      "stdout_tail": "ay/crates/tracedecay-sdk#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-cli#0.1.0-beta.37\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-memory-provider-api#0.1.0-beta.37\"],\"workspace_default_members\":[\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay#0.1.0-beta.37\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-agent-hosts#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-application#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-domain#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-policy#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-tool-catalog#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-automation#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-automation-runtime#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-global-db#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-capture#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-store#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-temporal-query#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-graph-db#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-private-fs#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-runtime-core#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-code-extraction#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-rusqlite-runtime#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-query#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-code-index#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-semantic#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-session-temporal-store#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-sessions#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-hooks#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-usecases#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-host-integration#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-lsp#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-search-eval#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-api#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-code-index-retention#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-code-index-runtime#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-dashboard-api#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-daemon-protocol#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-mcp#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-host-admission#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-maintenance#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-source-edit#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-sdk#0.1.0\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-cli#0.1.0-beta.37\",\"path+file:///home/runner/work/tracedecay/tracedecay/crates/tracedecay-memory-provider-api#0.1.0-beta.37\"],\"resolve\":null,\"target_directory\":\"/home/runner/work/tracedecay/tracedecay/target\",\"build_directory\":\"/home/runner/work/tracedecay/tracedecay/target\",\"version\":1,\"workspace_root\":\"/home/runner/work/tracedecay/tracedecay\",\"metadata\":null}\n"
+    },
+    {
+      "argv": [
+        "cargo",
+        "fmt",
+        "--package",
+        "tracedecay-memory-provider-api",
+        "--",
+        "--check"
+      ],
+      "duration_ms": 86,
+      "exit_code": 0,
+      "name": "provider API formatting",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_tail": ""
+    },
+    {
+      "argv": [
+        "cargo",
+        "clippy",
+        "--package",
+        "tracedecay-memory-provider-api",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "duration_ms": 577,
+      "exit_code": 0,
+      "name": "provider API strict Clippy",
+      "stderr_bytes": 209,
+      "stderr_sha256": "0c62db10f9282c2d048d0ac91cac46c89d266d697f5419e0725e4e4968101f11",
+      "stderr_tail": "    Checking tracedecay-memory-provider-api v0.1.0-beta.37 (/home/runner/work/tracedecay/tracedecay/crates/tracedecay-memory-provider-api)\n    Finished `dev` profile [optimized + debuginfo] target(s) in 0.51s\n",
+      "stdout_bytes": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_tail": ""
+    },
+    {
+      "argv": [
+        "cargo",
+        "test",
+        "--package",
+        "tracedecay-memory-provider-api",
+        "--locked"
+      ],
+      "duration_ms": 1162,
+      "exit_code": 0,
+      "name": "provider API tests",
+      "stderr_bytes": 423,
+      "stderr_sha256": "d826324851ab06e4768f4428ce057cf1fdfc406324ebf26c24cb0341c3bb743a",
+      "stderr_tail": "   Compiling tracedecay-memory-provider-api v0.1.0-beta.37 (/home/runner/work/tracedecay/tracedecay/crates/tracedecay-memory-provider-api)\n    Finished `test` profile [optimized + debuginfo] target(s) in 1.08s\n     Running unittests src/lib.rs (target/debug/deps/tracedecay_memory_provider_api-8f7728964ddefc39)\n     Running tests/api.rs (target/debug/deps/api-a4ed96d14eeae1a0)\n   Doc-tests tracedecay_memory_provider_api\n",
+      "stdout_bytes": 813,
+      "stdout_sha256": "86246a6fb1484945157abc9576f9bc878554a7662f455faa82c70ad80fb7ed0c",
+      "stdout_tail": "\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 8 tests\ntest capability_set_is_deterministic ... ok\ntest descriptor_requires_all_mandatory_capabilities ... ok\ntest duplicate_capabilities_are_rejected ... ok\ntest exact_scope_is_complete_and_borrowable ... ok\ntest mutating_calls_require_idempotency_and_operation_capability ... ok\ntest provider_and_capability_identifiers_use_generated_validation ... ok\ntest trait_object_executes_typed_handshake_and_call ... ok\ntest request_control_distinguishes_cancellation_and_deadline ... ok\n\ntest result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
+    },
+    {
+      "argv": [
+        "python3",
+        "scripts/product/generate-memory-provider-rust.py",
+        "--repo",
+        ".",
+        "--check"
+      ],
+      "duration_ms": 51,
+      "exit_code": 0,
+      "name": "canonical M1 Rust binding drift",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 212,
+      "stdout_sha256": "cc9d5983c2f36a577a7c85baca1e7e116accc4c2decedebf44c8fef0e91a4c83",
+      "stdout_tail": "{\n  \"manifest_sha256\": \"db0f628399b44231652dd724946cb02117de9f6298ab909c647238a7e55bed8f\",\n  \"mode\": \"check\",\n  \"ok\": true,\n  \"output_sha256\": \"5b5a1f957339eb09bbac13c9443405ee6848caa597d21fef0ede2ba152d0cef6\"\n}\n"
+    },
+    {
+      "argv": [
+        "python3",
+        "scripts/product/check-patch-footprint-policy.py",
+        "--repo",
+        ".",
+        "--policy",
+        "product/upstream/patch-footprint-policy.json",
+        "--map",
+        "product/upstream/convergence-map.json"
+      ],
+      "duration_ms": 107,
+      "exit_code": 0,
+      "name": "upstream patch footprint and dependency directions",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 644,
+      "stdout_sha256": "ee17707204a0ce25fe7628257ef4b36d7a15673b12cf430a70b8d4805ef48324",
+      "stdout_tail": "{\n  \"allowed_touch_points\": 7,\n  \"bead_id\": \"tdmem-0105\",\n  \"convergence_map\": \"product/upstream/convergence-map.json\",\n  \"dependency_direction_rules\": 6,\n  \"exception_zones\": 5,\n  \"footprint\": {\n    \"composition_root_files\": 0,\n    \"exception_zone_files\": 0,\n    \"total_upstream_changed_lines\": 5,\n    \"upstream_existing_production_files\": 2,\n    \"upstream_existing_test_or_fixture_files\": 0\n  },\n  \"ok\": true,\n  \"policy\": \"product/upstream/patch-footprint-policy.json\",\n  \"policy_revision\": \"patch-footprint.v1\",\n  \"schema_version\": 1,\n  \"upstream_floor_sha\": \"08fbe33a7c7f403191fd5d6e356c7b6681b96403\",\n  \"workspace_manifests_checked\": 39\n}\n"
+    },
+    {
+      "argv": [
+        "python3",
+        "-c",
+        "import json,subprocess; data=json.loads(subprocess.check_output(['cargo','metadata','--locked','--format-version','1','--no-deps'], text=True)); pkg=next(p for p in data['packages'] if p['name']=='tracedecay-memory-provider-api'); deps={d['name'] for d in pkg['dependencies']}; forbidden={d for d in deps if d.startswith('tracedecay-')}; assert not forbidden, forbidden"
+      ],
+      "duration_ms": 86,
+      "exit_code": 0,
+      "name": "provider API contains no forbidden direct dependency",
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_tail": "",
+      "stdout_bytes": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_tail": ""
+    }
+  ],
+  "completed_at": "2026-08-30T19:10:12.494643Z",
+  "final_status": "closed",
+  "implementation_head": "c2df000795132c25753e93a6ed2fa820dae7a624",
+  "issue_id": "tdmem-0301",
+  "mode": "complete",
+  "operation_sha256": "cd7ad0d7e41980191db452b02494d5c2916df8fc5b63ceb36bade2ff19f8c0d3",
+  "plan": {
+    "encoded_bytes": 42100,
+    "issues": 131,
+    "jsonl_sha256": "d366442412d68710465317bc361db2c864dcde1edefe321a560f610345927c0a",
+    "materializer_contract": "source-and-output-sha256",
+    "part_size": 4000,
+    "parts": 11
+  },
+  "schema_version": 1,
+  "started_at": "2026-08-30T19:10:08.229005Z"
+}

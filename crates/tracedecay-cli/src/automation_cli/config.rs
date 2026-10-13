@@ -194,9 +194,12 @@ pub(crate) async fn apply_project_automation_patch(
         Some(&patch),
     )?;
     if effective != current {
-        let expected_revision =
-            crate::commands::current_configuration_revision(profile, &resolved.project_path)
-                .await?;
+        let expected_revision = crate::commands::current_configuration_revision(
+            profile,
+            &resolved.project_path,
+            tracedecay_domain::configuration::AUTOMATION_SETTINGS_SETTING_KEY,
+        )
+        .await?;
         let mutation = crate::commands::project_configuration_set(
             &resolved.project_id,
             tracedecay_domain::configuration::AUTOMATION_SETTINGS_SETTING_KEY,

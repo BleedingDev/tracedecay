@@ -67,6 +67,11 @@ async fn retired_source_cursor_neither_gates_nor_narrows_canonical_admission() {
     std::fs::create_dir_all(&project).unwrap();
     let path = write_rollout(tmp.path(), &project);
     let project_id = ProjectId::new("project.retired-codex-source").unwrap();
+    tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+        &project,
+        project_id.as_str(),
+    )
+    .unwrap();
     let scope = ObservationScopeV1::Project {
         project_id: project_id.clone(),
     };

@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "worker": "tracedecay-ncm-worker",
+  "protocol_version": 1,
+  "protocol_identity": "tracedecay.ncm.worker.v1",
+  "targets": []
+}

@@ -18,6 +18,7 @@ import { factStoreCurateReceiptMatches } from "../src/automation-receipt";
 import {
   decodeCanonicalSchema,
   decodeHttpSuccessEnvelope,
+  type EffectResult,
   type HttpSuccessEnvelope,
   type PageState,
 } from "../src/types";
@@ -148,6 +149,66 @@ function factStoreEnvelope(
   envelope.value.binding_id = `binding.http.${operation}.v1`;
   envelope.value.contract.schema_id =
     `schema.application.retained.${operation.replaceAll("_", "-")}.result`;
+  return envelope;
+}
+
+/** Provider reads use evidence; mutations carry the durable effect receipt. */
+function providerEnvelope(
+  operation: "provider_feedback" | "provider_health" | "provider_delete_by_source",
+  payload: unknown,
+  termination: "completed" | "unavailable" = "completed",
+) {
+  const base = successEnvelope(payload);
+  const envelope = {
+    ...base,
+    value: {
+      ...base.value,
+      scope: {
+        project_id: "project.sdk",
+        repository_id: "repo-1",
+        worktree_id: "worktree-1",
+        reference: "refs/heads/main",
+        scope_digest: "sha256:" + "1".repeat(64),
+      },
+    },
+  };
+  envelope.value.binding_id = `binding.http.${operation}.v1`;
+  envelope.value.contract.schema_id =
+    `schema.application.retained.${operation.replaceAll("_", "-")}.result`;
+  envelope.value.request_id = "request.sdk.provider";
+  envelope.value.outcome.value.execution.termination = termination;
+  if (operation !== "provider_health") {
+    envelope.value.outcome = {
+      outcome: "effect",
+      value: {
+        effect_id: "effect.provider-control.018f22c2-77cd-7000-8000-000000000001",
+        effect_class: "administrative",
+        idempotency_key: "d".repeat(64),
+        authority: {},
+        expected_state: "sha256:" + "0".repeat(64),
+        reconciliation: "reconciled",
+        receipt: {
+          operation: `use-case.application.retained.${operation.replaceAll("_", "-")}`,
+          request_id: "request.sdk.provider",
+          actor: "actor.sdk.provider",
+          scope: structuredClone(envelope.value.scope),
+          effect_class: "administrative",
+          idempotency_key: "d".repeat(64),
+          input_digest: "sha256:" + "a".repeat(64),
+          expected_state: "sha256:" + "0".repeat(64),
+          policy_digest: "sha256:" + "a".repeat(64),
+          configuration_digest: "sha256:" + "a".repeat(64),
+          catalog_digest: "sha256:" + "a".repeat(64),
+          privacy_digest: "sha256:" + "a".repeat(64),
+          outcome: "completed",
+          committed_state: "sha256:" + "b".repeat(64),
+          external_proof: null,
+        },
+        payload,
+        execution: { ...structuredClone(RECEIPT), termination },
+      },
+    } as unknown as typeof envelope.value.outcome;
+  }
   return envelope;
 }
 
@@ -1261,6 +1322,361 @@ describe("TraceDecayClient generated operation bindings", () => {
     );
   });
 
+});
+
+describe("TraceDecayClient provider results", () => {
+  const source = {
+    trace_ref: "trace.retained.1",
+    item_ref: "item.1",
+    observation_id: "observation.1",
+  };
+  const noneEffect = {
+    state: "none",
+    committed_boundary: null,
+    state_generation_before: null,
+    state_generation_after: null,
+    committed_item_refs: [],
+    uncommitted_item_refs: [],
+    provider_receipt_digest: null,
+    reconciliation_action: null,
+    verification_digest: null,
+    duplicate_of_idempotency_key: null,
+    duplicate_of_operation_id: null,
+  };
+  const identity = {
+    provider_id: "native",
+    registration_revision: 7,
+    scope: {
+      profile_id: "profile-1",
+      project_id: "project-1",
+      repository_identity: "repo-1",
+      worktree_identity: "worktree-1",
+      branch_identity: "refs/heads/main",
+      agent_session_id: "tdmem-agent-session.v1.dd9c4ff540d92ea028a959d6ac0a2233a935dc1938ee9b34b8980e5112ddbca6",
+      resolved_scope_digest: `sha256:${"1".repeat(64)}`,
+    },
+    operation_id: "018f22c2-77cd-7000-8000-000000000001",
+    diagnostic_id: null,
+    domain_detail: null,
+    warnings: [],
+  };
+
+  it("binds provider feedback to the selected operation, source, and committed receipt", async () => {
+    const result = {
+      ...identity,
+      idempotency_key: "d".repeat(64),
+      terminal: "success",
+      effect: {
+        ...noneEffect,
+        state: "committed",
+        state_generation_before: 3,
+        state_generation_after: 4,
+        provider_receipt_digest: "b".repeat(64),
+        verification_digest: "c".repeat(64),
+      },
+      result: {
+        operation: "feedback",
+        data: {
+          source,
+          target: {
+            stable_memory_ref: "provider.memory.1",
+            source: {
+              canonical_provider_id: "native",
+              canonical_session_id: "session-1",
+              source_key: "source.1",
+              stable_record_id: null,
+              observation_id: "observation.1",
+              source_revision: "revision.1",
+              content_sha256: "a".repeat(64),
+            },
+          },
+          target_digest: "a".repeat(64),
+          signal: "helpful",
+          applied_effect: "recorded",
+          receipt: {
+            state_generation_before: 3,
+            state_generation_after: 4,
+            provider_receipt_digest: "b".repeat(64),
+          },
+        },
+      },
+    };
+    let payload: unknown = result;
+    let outer: ReturnType<typeof providerEnvelope> | undefined;
+    const request = {
+      source,
+      signal: "helpful" as const,
+      weight: "1",
+      evidence_refs: [],
+      occurred_at: 1,
+    };
+    const client = createClient({
+      baseUrl: "http://127.0.0.1:43123",
+      projectId: "project.sdk",
+      token: "sdk-secret",
+      fetch: async (input, init) => {
+        expect(String(input)).toBe(
+          "http://127.0.0.1:43123/projects/project.sdk/application/retained/provider_feedback",
+        );
+        expect(init?.method).toBe("POST");
+        expect(JSON.parse(String(init?.body))).toEqual(request);
+        expect(new Headers(init?.headers).get("x-tracedecay-request-id"))
+          .toBe("request.sdk.provider");
+        return new Response(JSON.stringify(outer ?? providerEnvelope("provider_feedback", payload)), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    const execute = () => client.operations.application_provider_feedback(
+      request,
+      { requestId: "request.sdk.provider" },
+    );
+    expect(await execute()).toEqual(
+      providerEnvelope("provider_feedback", result).value,
+    );
+
+    payload = {
+      ...result,
+      terminal: "provider_unavailable",
+      idempotency_key: null,
+      effect: noneEffect,
+      result: { operation: "health", data: null },
+    };
+    await expect(execute()).rejects.toBeInstanceOf(TraceDecayMalformedResponseError);
+
+    const foreignSource = structuredClone(result);
+    foreignSource.result.data.source = { ...source, observation_id: "observation.other" };
+    foreignSource.result.data.target.source.observation_id = "observation.other";
+    payload = foreignSource;
+    await expect(execute()).rejects.toBeInstanceOf(TraceDecayMalformedResponseError);
+
+    const foreignSignal = structuredClone(result);
+    foreignSignal.result.data.signal = "harmful";
+    payload = foreignSignal;
+    await expect(execute()).rejects.toBeInstanceOf(TraceDecayMalformedResponseError);
+
+    const malformedSourceIdentity = structuredClone(result);
+    malformedSourceIdentity.result.data.target.source.canonical_session_id = " ";
+    payload = malformedSourceIdentity;
+    await expect(execute()).rejects.toBeInstanceOf(TraceDecayMalformedResponseError);
+
+    payload = { ...result, terminal: "provider_unavailable" };
+    await expect(execute()).rejects.toBeInstanceOf(TraceDecayMalformedResponseError);
+
+    const foreignReceipt = structuredClone(result);
+    foreignReceipt.result.data.receipt.provider_receipt_digest = "e".repeat(64);
+    payload = foreignReceipt;
+    await expect(execute()).rejects.toBeInstanceOf(TraceDecayMalformedResponseError);
+
+    const foreignGeneration = structuredClone(result);
+    foreignGeneration.effect.state_generation_after = 5;
+    payload = foreignGeneration;
+    await expect(execute()).rejects.toBeInstanceOf(TraceDecayMalformedResponseError);
+
+    outer = providerEnvelope("provider_feedback", result);
+    outer.value.outcome.value.execution.termination = "unavailable";
+    await expect(execute()).rejects.toBeInstanceOf(TraceDecayMalformedResponseError);
+    outer = providerEnvelope("provider_feedback", result);
+    const effect = outer.value.outcome.value as unknown as EffectResult<unknown>;
+    effect.receipt.request_id = "request.foreign";
+    await expect(execute()).rejects.toBeInstanceOf(TraceDecayMalformedResponseError);
+    effect.receipt.request_id = "request.sdk.provider";
+    effect.effect_id = "effect.provider-control.foreign";
+    await expect(execute()).rejects.toBeInstanceOf(TraceDecayMalformedResponseError);
+  });
+
+  it("preserves provider and HTTP denials and rejects a foreign canonical session selection", async () => {
+    const result = {
+      ...identity,
+      idempotency_key: null,
+      terminal: "provider_unavailable",
+      effect: noneEffect,
+      result: { operation: "health", data: null },
+    };
+    let payload: unknown = result;
+    let outer: ReturnType<typeof providerEnvelope> | undefined;
+    let termination: "completed" | "unavailable" = "unavailable";
+    let problem: ReturnType<typeof problemEnvelope> | undefined;
+    const request = {
+      state: {
+        kind: "canonical_session" as const,
+        provider_id: "native",
+        registration_revision: 7,
+        canonical_provider_id: "codex",
+        session_id: "session-1",
+      },
+      requested_checks: ["state" as const],
+    };
+    const client = createClient({
+      baseUrl: "http://127.0.0.1:43123",
+      projectId: "project.sdk",
+      token: "sdk-secret",
+      fetch: async (input, init) => {
+        expect(String(input)).toBe(
+          "http://127.0.0.1:43123/projects/project.sdk/application/retained/provider_health",
+        );
+        expect(init?.method).toBe("POST");
+        expect(JSON.parse(String(init?.body))).toEqual(request);
+        expect(new Headers(init?.headers).has("x-tracedecay-request-id")).toBe(false);
+        return new Response(JSON.stringify(
+          problem ?? outer ?? providerEnvelope("provider_health", payload, termination),
+        ), {
+          status: problem === undefined ? 200 : 503,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    const execute = () => client.operations.application_provider_health(request);
+    expect(await execute()).toEqual(
+      providerEnvelope("provider_health", result, termination).value,
+    );
+    payload = { ...result, provider_id: "ncm" };
+    await expect(execute()).rejects.toBeInstanceOf(TraceDecayMalformedResponseError);
+    payload = { ...result, registration_revision: 8 };
+    await expect(execute()).rejects.toBeInstanceOf(TraceDecayMalformedResponseError);
+    payload = {
+      ...result,
+      scope: {
+        ...result.scope,
+        agent_session_id: "tdmem-agent-session.v1.f71adc8a24958910a7d5232ddbf507050f88fe4bce4f0f62dc78c24c59f7de4e",
+      },
+    };
+    await expect(execute()).rejects.toBeInstanceOf(TraceDecayMalformedResponseError);
+
+    const unicodeSession = {
+      ...result,
+      scope: {
+        ...result.scope,
+        agent_session_id: "tdmem-agent-session.v1.d1f95c6758f9dc2b1f788447bcecfd51dca614b6db606c3f21f3a9540f5b98d3",
+      },
+    };
+    request.state.session_id = "session.Žluťoučký🧠";
+    payload = unicodeSession;
+    expect(await execute()).toEqual(
+      providerEnvelope("provider_health", unicodeSession, termination).value,
+    );
+    request.state.session_id = "session-1";
+    await expect(execute()).rejects.toBeInstanceOf(TraceDecayMalformedResponseError);
+
+    const healthy = {
+      ...result,
+      terminal: "success",
+      result: {
+        operation: "health",
+        data: {
+          provider_instance_id: "instance.1",
+          implementation_identity_digest: "a".repeat(64),
+          state_identity_digest: "b".repeat(64),
+          state_generation: 4,
+          scope_digest: "ef6ac8fde32e685111577fe6576c907e473861bf9653c76822c6def002795cc8",
+          readiness: "ready",
+          capability_states: [{ capability_id: "provider.health.v1", state: "available" }],
+          effective_limits_digest: "c".repeat(64),
+          backlog: 0,
+          recovery_state: "ready",
+        },
+      },
+    };
+    payload = healthy;
+    termination = "completed";
+    expect(await execute()).toEqual(providerEnvelope("provider_health", healthy).value);
+
+    outer = providerEnvelope("provider_health", healthy, "unavailable");
+    await expect(execute()).rejects.toBeInstanceOf(TraceDecayMalformedResponseError);
+    outer = undefined;
+
+    payload = { ...healthy, scope: { ...healthy.scope, profile_id: "profile.foreign" } };
+    await expect(execute()).rejects.toBeInstanceOf(TraceDecayMalformedResponseError);
+
+    const malformedHealthIdentity = structuredClone(healthy);
+    malformedHealthIdentity.result.data.state_identity_digest = "wrong-digest";
+    payload = malformedHealthIdentity;
+    await expect(execute()).rejects.toBeInstanceOf(TraceDecayMalformedResponseError);
+
+    problem = problemEnvelope("unavailable", "application.retained.authority-unavailable", {
+      bindingId: "binding.http.provider_health.v1",
+    });
+    await expect(execute()).rejects.toBeInstanceOf(TraceDecayUnavailableError);
+    problem.value.binding_id = "binding.http.provider_inspection.v1";
+    await expect(execute()).rejects.toBeInstanceOf(TraceDecayMalformedResponseError);
+  });
+
+  it("binds deletion to the completed host fence receipt while provider erasure is unavailable", async () => {
+    const request = {
+      source,
+      mode: "remove_influence" as const,
+      expected_fence_revision: 0,
+      include_snapshots: false,
+    };
+    const envelope = providerEnvelope("provider_delete_by_source", null);
+    const effect = envelope.value.outcome.value as unknown as EffectResult<unknown>;
+    const result = {
+      ...identity,
+      idempotency_key: "d".repeat(64),
+      terminal: "provider_unavailable",
+      effect: noneEffect,
+      result: {
+        operation: "delete_by_source",
+        data: {
+          source,
+          target: {
+            stable_memory_ref: "provider.memory.1",
+            source: {
+              canonical_provider_id: "native",
+              canonical_session_id: "session-1",
+              source_key: "source.1",
+              stable_record_id: null,
+              observation_id: "observation.1",
+              source_revision: "revision.1",
+              content_sha256: "a".repeat(64),
+            },
+          },
+          mode: request.mode,
+          include_snapshots: false,
+          intent: {
+            fence_revision_before: 0,
+            fence_revision_after: 1,
+            host_receipt: structuredClone(effect.receipt),
+          },
+          host_snapshot_cleanup: {
+            state: "not_requested",
+            removed_snapshot_refs: [],
+            matched_count: 0,
+            unverifiable_count: 0,
+          },
+          erasure: { state: "pending", reason_code: "provider_unavailable" },
+        },
+      },
+    };
+    effect.payload = result;
+    const client = createClient({
+      baseUrl: "http://127.0.0.1:43123",
+      projectId: "project.sdk",
+      token: "sdk-secret",
+      fetch: async (input, init) => {
+        expect(String(input)).toBe(
+          "http://127.0.0.1:43123/projects/project.sdk/application/retained/provider_delete_by_source",
+        );
+        expect(init?.method).toBe("POST");
+        expect(JSON.parse(String(init?.body))).toEqual(request);
+        return new Response(JSON.stringify(envelope), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    const execute = () => client.operations.application_provider_delete_by_source(
+      request,
+      { requestId: "request.sdk.provider" },
+    );
+    expect(await execute()).toEqual(envelope.value);
+    effect.receipt.input_digest = "sha256:" + "c".repeat(64);
+    await expect(execute()).rejects.toBeInstanceOf(TraceDecayMalformedResponseError);
+    effect.receipt = structuredClone(result.result.data.intent.host_receipt);
+    effect.execution.termination = "unavailable";
+    await expect(execute()).rejects.toBeInstanceOf(TraceDecayMalformedResponseError);
+  });
 });
 
 describe("TraceDecayClient transport envelopes", () => {

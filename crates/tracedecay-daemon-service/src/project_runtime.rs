@@ -1366,8 +1366,10 @@ impl ProjectRuntimeRegistryV1 {
         {
             return false;
         }
+        if state != ProjectRuntimePublicationStateV1::Ready {
+            runtime.publication_attempt = None;
+        }
         runtime.publication = state;
-        runtime.publication_attempt = None;
         drop(runtimes);
         self.signal_published_changed();
         true
@@ -1418,6 +1420,8 @@ impl ProjectRuntimeRegistryV1 {
     }
 
     /// Record successful mandatory owner publication for the current attempt.
+    /// Keep its identity so a subsequent durable activation failure can settle
+    /// this accepted publication without changing a newer attempt.
     pub fn mark_publication_ready(&self, attempt: &ProjectRuntimePublicationAttemptV1) -> bool {
         self.finish_publication(attempt, ProjectRuntimePublicationStateV1::Ready)
     }

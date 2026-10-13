@@ -1124,6 +1124,42 @@ async fn failed_publication_can_reopen_and_reach_ready() {
 }
 
 #[tokio::test]
+async fn ready_publication_activation_failure_uses_the_current_attempt() {
+    let registry = ProjectRuntimeRegistryV1::default();
+    let project = root("publication-activation-failure");
+    registry
+        .publish(project.clone(), TestFirst(1))
+        .await
+        .unwrap();
+    let accepted = registry
+        .begin_publication(&project)
+        .expect("owner publication attempt");
+    assert!(registry.mark_publication_ready(&accepted));
+    assert!(registry.mark_publication_failed(&accepted));
+    assert_eq!(
+        registry.publication_state(&project),
+        Some(ProjectRuntimePublicationStateV1::Failed),
+        "a durable activation failure must remain terminal after owner publication"
+    );
+
+    let superseded = registry
+        .begin_publication(&project)
+        .expect("retry publication attempt");
+    assert!(registry.mark_publication_ready(&superseded));
+    let current = registry
+        .begin_publication(&project)
+        .expect("newer publication attempt");
+    assert!(registry.mark_publication_ready(&current));
+    assert!(!registry.mark_publication_failed(&superseded));
+    assert!(!registry.mark_publication_failed(&accepted));
+    assert_eq!(
+        registry.publication_state(&project),
+        Some(ProjectRuntimePublicationStateV1::Ready),
+        "an earlier activation failure cannot poison the newer ready owner"
+    );
+}
+
+#[tokio::test]
 async fn get_does_not_treat_a_different_project_as_an_equivalent_root() {
     let registry = ProjectRuntimeRegistryV1::default();
     registry.publish(root("alpha"), TestFirst(1)).await.unwrap();

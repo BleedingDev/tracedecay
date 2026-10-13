@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       run_os:
-        description: "Also run the macOS matrix"
+        description: "Also run full macOS and Windows tests"
         type: boolean
         default: false
       run_hosts:
@@ -35,8 +35,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Drafts run cheap gates. Ready PRs and pushes run the Bazel Linux authority;
-  # dispatch can request additional OS and stock-host journeys.
+  # Drafts run cheap gates. Ready PRs and pushes run Bazel Linux validation
+  # and Windows compilation; dispatch can request full OS and host journeys.
   scope-gate:
     name: Scope gate
     permissions:
@@ -182,7 +182,7 @@ jobs:
           python3 scripts/test-build-mcpb.py
           python3 scripts/test-resolve-installed-binary.py
           python3 scripts/test-check-packaged-mcp-stdio.py
-          python3 scripts/test-check-distribution-feature-wiring.py
+          bazel test --config=ci //scripts:distribution_feature_wiring_test --test_output=errors
           python3 scripts/test-resolve-release-source-profile.py
           python3 scripts/test-package-release-archive.py
           python3 scripts/test-plan-release-recovery.py
@@ -302,8 +302,8 @@ jobs:
           path: ${{ steps.bazel.outputs.disk-cache-path }}
           key: ${{ steps.bazel.outputs.disk-cache-key }}
 
-  # Root suites and the full-daemon memory journey reserve HOST_CPUS.
-  # Workspace suites reserve one CPU each so they can overlap jobs=4 rustc.
+  # Every Rust suite inherits the HOST_CPUS reservation from .bazelrc to
+  # account for its libtest worker pool.
   # Warm v2 cache (run 38071732620) still left workspace-a at 65m because
   # cli + code-index share one critical path; split that group into
   # workspace-a (light a–capture) and workspace-code (cli + code-*). One
@@ -314,7 +314,7 @@ jobs:
     name: Test Linux (${{ matrix.shard }})
     needs: [scope-gate, gates]
     if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 240
     env:
       CARGO_BAZEL_TIMEOUT: "3600"
@@ -323,7 +323,6 @@ jobs:
       matrix:
         include:
           - shard: root-a
-            test_resources: ""
             targets: >-
               //crates/tracedecay:mcp_suite
               //crates/tracedecay:dashboard_api_test
@@ -331,7 +330,6 @@ jobs:
               //crates/tracedecay:storage_suite
               //crates/tracedecay-cli:refresh_memory_journey
           - shard: root-b
-            test_resources: ""
             targets: >-
               --
               //crates/tracedecay/...
@@ -342,7 +340,6 @@ jobs:
           # Four package groups. New crates land in workspace-c via the
           # catch-all until listed here for balance.
           - shard: workspace-a
-            test_resources: --default_test_resources=cpu=1
             targets: >-
               //crates/tracedecay-agent-hosts/...
               //crates/tracedecay-api/...
@@ -351,7 +348,6 @@ jobs:
               //crates/tracedecay-automation-runtime/...
               //crates/tracedecay-capture/...
           - shard: workspace-code
-            test_resources: --default_test_resources=cpu=1
             targets: >-
               --
               //crates/tracedecay-cli/...
@@ -361,7 +357,6 @@ jobs:
               //crates/tracedecay-code-index-runtime/...
               -//crates/tracedecay-cli:refresh_memory_journey
           - shard: workspace-b
-            test_resources: --default_test_resources=cpu=1
             targets: >-
               //crates/tracedecay-configuration/...
               //crates/tracedecay-contracts/...
@@ -384,7 +379,6 @@ jobs:
               //crates/tracedecay-mcp/...
               //crates/tracedecay-mcp-catalog/...
           - shard: workspace-c
-            test_resources: --default_test_resources=cpu=1
             targets: >-
               --
               //...
@@ -454,15 +448,16 @@ jobs:
           # Prefer v2; keep legacy prefixes as restore fallbacks if still present.
           extra-restore-keys: ci-linux-test,ci-linux-workspace-test
           test-tools: "true"
+          save-download-caches: ${{ matrix.shard == 'root-b' }}
 
       # Root suites exercise latency-sensitive daemon journeys. Finish their
       # compilation before testing so compiler work cannot consume that budget.
       - name: Build root suite binaries
-        if: ${{ matrix.test_resources == '' }}
+        if: ${{ startsWith(matrix.shard, 'root-') }}
         run: bazel build --config=ci ${{ matrix.targets }}
 
       - name: Build and test this shard
-        run: bazel test --config=ci ${{ matrix.test_resources }} ${{ matrix.targets }}
+        run: bazel test --config=ci ${{ matrix.targets }}
 
       - name: Upload failed test diagnostics
         if: failure()
@@ -476,8 +471,9 @@ jobs:
       # Matrix shards share github.job, so they would race the same save key.
       # One writer keeps the 10 GiB Actions cache from holding several copies
       # that would evict this prefix (observed: 6.9 GiB workspace-only save).
+      # PR merge-ref caches let later pushes to the same PR reuse this build.
       - name: Save compiled Bazel actions
-        if: always() && !cancelled() && github.ref == 'refs/heads/master' && matrix.shard == 'root-b' && steps.bazel.outputs.disk-cache-key != ''
+        if: always() && !cancelled() && (github.ref == 'refs/heads/master' || github.event_name == 'pull_request') && matrix.shard == 'root-b' && steps.bazel.outputs.disk-cache-key != ''
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.bazel.outputs.disk-cache-path }}
@@ -495,10 +491,10 @@ jobs:
         run: test "${{ needs.linux-test.result }}" = "success"
 
   windows-test:
-    name: Test Windows
-    needs: scope-gate
-    if: ${{ needs.scope-gate.outputs.run-os == 'true' }}
-    runs-on: windows-latest
+    name: Windows checks
+    needs: [scope-gate, gates]
+    if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
+    runs-on: ${{ vars.DEPOT_WINDOWS_RUNNER || 'windows-latest' }}
     timeout-minutes: 330
     steps:
       # Full history: the search-quality workload fixture pins a
@@ -517,11 +513,25 @@ jobs:
         id: bazel
         with:
           cache-key: ci-windows-test
-          test-tools: "true"
+          test-tools: ${{ needs.scope-gate.outputs.run-os }}
+          save-download-caches: "true"
+
+      # Check the shipped MSVC target without linking test executables or
+      # applying Linux's Clippy warning policy to this compiler-only check.
+      - name: Compile the Windows workspace
+        if: ${{ needs.scope-gate.outputs.run-os != 'true' }}
+        shell: bash
+        run: >-
+          bazel build --config=ci
+          --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
+          --output_groups=clippy_checks
+          --@rules_rust//rust/settings:clippy_flag=-Aclippy::all
+          //...
 
       # `bazel test` builds every target in the pattern, so tests start
       # while the rest of the workspace still links.
       - name: Build and test the workspace
+        if: ${{ needs.scope-gate.outputs.run-os == 'true' }}
         shell: bash
         run: bazel test --config=ci //...
 
@@ -534,8 +544,9 @@ jobs:
             bazel-testlogs/**/test.log
             bazel-testlogs/**/test.xml
 
+      # This single Windows job retains outputs for later pushes to the same PR.
       - name: Save compiled Bazel actions
-        if: always() && !cancelled() && github.ref == 'refs/heads/master' && steps.bazel.outputs.disk-cache-key != ''
+        if: always() && !cancelled() && (github.ref == 'refs/heads/master' || github.event_name == 'pull_request') && steps.bazel.outputs.disk-cache-key != ''
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.bazel.outputs.disk-cache-path }}
@@ -551,7 +562,7 @@ jobs:
     # disk cache (proc-macros, build scripts, grammar cc, matching rlibs)
     # when this job's own prefix misses. ARM isolated Clippy from that
     # cache and paid a cold 55–61m `//...` on recent PRs.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -564,30 +575,6 @@ jobs:
 
       - name: Run blocking Clippy policy
         run: bazel build --config=ci --config=clippy //...
-
-      # Master pushes run no Windows lane, so `cfg(windows)` code otherwise
-      # first compiles in the release build. Bazel has no MSVC toolchain on
-      # Linux, so this cross-target type check stays on Cargo: `cargo check`
-      # needs no linker, and mingw supplies the C compiler the native build
-      # scripts run. macOS has no equivalent: its build scripts need the Apple
-      # SDK headers.
-      - name: Install pinned toolchain and Windows check target
-        run: |
-          rustup toolchain install
-          rustup target add x86_64-pc-windows-gnu
-
-      - uses: ./.github/actions/setup-pnpm
-
-      - name: Install the Windows C cross-compiler
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
-
-      - name: Check the Windows target
-        run: >-
-          cargo check --workspace --all-targets --locked
-          --target x86_64-pc-windows-gnu
-          --features tracedecay/test-transport,tracedecay/test-helpers,tracedecay-cli/test-transport
 
       - name: Save compiled Bazel actions
         if: always() && !cancelled() && github.ref == 'refs/heads/master' && steps.bazel.outputs.disk-cache-key != ''
@@ -630,7 +617,7 @@ jobs:
     name: Shipped CLI build (x86_64-linux)
     needs: [scope-gate, gates]
     if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

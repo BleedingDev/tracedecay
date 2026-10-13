@@ -7,6 +7,8 @@
 //! it mutates process environment variables in-process.
 
 mod host_lifecycle_cli_acceptance;
+mod ncm_lifecycle_cli_acceptance;
+
 #[path = "../../../../tests/support/isolated_profile.rs"]
 mod isolated_profile;
 

@@ -362,6 +362,16 @@ impl McpServer {
         _deadline: tokio::time::Instant,
     ) -> Vec<String> {
         let mut failures = Vec::new();
+        #[cfg(feature = "memory-provider-host")]
+        for outcome in futures_util::future::join_all(
+            self._observation_journey_mount
+                .iter()
+                .map(|journey| journey.shutdown(_deadline)),
+        )
+        .await
+        {
+            failures.extend(outcome);
+        }
         // The hosted dashboard is daemon-process state (`DASHBOARD_MANAGER`),
         // not project-server state. `tracedecay_dashboard` starts against the
         // Core server; the later Core→Full remount retires that server. Tearing

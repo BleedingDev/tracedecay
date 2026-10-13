@@ -11,6 +11,11 @@ pub mod scope_control;
 pub mod topology;
 pub mod work_executable_binding;
 
+pub use tracedecay_domain::configuration::{
+    MemoryProviderNcmObserverV1, MemoryProviderRecallDegradationCauseV1,
+    MemoryProviderRecallDegradationV1, MemoryProviderRecallFallbackV1,
+    MemoryProviderRecallRoutingV1,
+};
 pub use tracedecay_global_db::configuration::{registry, resolver};
 
 use std::path::{Path, PathBuf};
@@ -22,15 +27,17 @@ use tracedecay_domain::configuration::{
     INDEX_EXCLUDE_SETTING_KEY, INDEX_EXTRACT_DOCSTRINGS_SETTING_KEY, INDEX_INCLUDE_SETTING_KEY,
     INDEX_MAX_FILE_SIZE_SETTING_KEY, INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
     INDEX_TRACK_CALL_SITES_SETTING_KEY, LCM_SUMMARIZER_EXECUTABLES_SETTING_KEY,
-    LcmSummarizerExecutablesV1, SYNC_AUTO_INIT_SETTING_KEY,
-    SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY, SYNC_AUTO_TRACK_PR_POLL_SECS_SETTING_KEY,
-    SYNC_AUTO_WATCH_SETTING_KEY, SYNC_BACKSTOP_INTERVAL_MINS_SETTING_KEY,
-    SYNC_BRANCH_GC_DAYS_SETTING_KEY, SYNC_FULL_SYNC_ESCALATION_FILES_SETTING_KEY,
-    SYNC_MAX_CONCURRENT_SYNCS_SETTING_KEY, SYNC_READ_COOLDOWN_SECS_SETTING_KEY,
-    SYNC_READ_REFRESH_SETTING_KEY, SYNC_SESSION_START_STALE_THRESHOLD_SECS_SETTING_KEY,
-    SYNC_SESSION_START_SYNC_SETTING_KEY, SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY,
-    SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY, SYNC_WATCH_MAX_DELAY_MS_SETTING_KEY,
-    SYNC_WATCH_MAX_PROJECTS_SETTING_KEY, SettingKey, TELEMETRY_TIMINGS_SETTING_KEY,
+    LcmSummarizerExecutablesV1, MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+    MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+    SYNC_AUTO_INIT_SETTING_KEY, SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY,
+    SYNC_AUTO_TRACK_PR_POLL_SECS_SETTING_KEY, SYNC_AUTO_WATCH_SETTING_KEY,
+    SYNC_BACKSTOP_INTERVAL_MINS_SETTING_KEY, SYNC_BRANCH_GC_DAYS_SETTING_KEY,
+    SYNC_FULL_SYNC_ESCALATION_FILES_SETTING_KEY, SYNC_MAX_CONCURRENT_SYNCS_SETTING_KEY,
+    SYNC_READ_COOLDOWN_SECS_SETTING_KEY, SYNC_READ_REFRESH_SETTING_KEY,
+    SYNC_SESSION_START_STALE_THRESHOLD_SECS_SETTING_KEY, SYNC_SESSION_START_SYNC_SETTING_KEY,
+    SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY, SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY,
+    SYNC_WATCH_MAX_DELAY_MS_SETTING_KEY, SYNC_WATCH_MAX_PROJECTS_SETTING_KEY, SettingKey,
+    TELEMETRY_TIMINGS_SETTING_KEY,
 };
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{IndexPathPolicyV1, ProjectId, validate_index_path_patterns};
@@ -56,6 +63,9 @@ pub struct RuntimeTraceDecayConfig {
     /// is unconfigured until an operator names its executable; the daemon
     /// never resolves one from `PATH` or its environment.
     pub lcm_summarizers: LcmSummarizerExecutablesV1,
+    pub memory_provider_native_enabled: bool,
+    pub memory_provider_ncm_observer: MemoryProviderNcmObserverV1,
+    pub memory_provider_recall_routing: MemoryProviderRecallRoutingV1,
     pub sync: SyncConfig,
     pub telemetry: TelemetryConfig,
 }
@@ -264,6 +274,12 @@ fn runtime_config_from_snapshot(
             INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
         )?,
         lcm_summarizers: required_lcm_summarizer_executables(snapshot)?,
+        memory_provider_native_enabled: required_bool(
+            snapshot,
+            MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+        )?,
+        memory_provider_ncm_observer: memory_provider_ncm_observer_from_snapshot(snapshot)?,
+        memory_provider_recall_routing: memory_provider_recall_routing_from_snapshot(snapshot)?,
         sync: SyncConfig {
             auto_watch: required_bool(snapshot, SYNC_AUTO_WATCH_SETTING_KEY)?,
             watch_linked_worktrees: required_bool(
@@ -348,6 +364,54 @@ pub fn required_unsigned(snapshot: &ConfigurationSnapshotV1, key_name: &str) -> 
             value.kind()
         ))),
     }
+}
+
+fn memory_provider_ncm_observer_from_snapshot(
+    snapshot: &ConfigurationSnapshotV1,
+) -> Result<MemoryProviderNcmObserverV1> {
+    let routing: MemoryProviderNcmObserverV1 =
+        match required_setting(snapshot, MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY)? {
+            ConfigurationValueV1::Text(value) => serde_json::from_str(value).map_err(|error| {
+                config_error(format!(
+                    "resolved configuration setting '{MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY}' is not a NCM observer document: {error}"
+                ))
+            })?,
+            _ => {
+                return Err(config_error(format!(
+                    "resolved configuration setting '{MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY}' is not text"
+                )));
+            }
+        };
+    routing.validate().map_err(|error| {
+        config_error(format!(
+            "resolved configuration setting '{MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY}' is invalid: {error}"
+        ))
+    })?;
+    Ok(routing)
+}
+
+fn memory_provider_recall_routing_from_snapshot(
+    snapshot: &ConfigurationSnapshotV1,
+) -> Result<MemoryProviderRecallRoutingV1> {
+    let routing: MemoryProviderRecallRoutingV1 =
+        match required_setting(snapshot, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY)? {
+            ConfigurationValueV1::Text(value) => serde_json::from_str(value).map_err(|error| {
+                config_error(format!(
+                    "resolved configuration setting '{MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY}' is not a recall routing document: {error}"
+                ))
+            })?,
+            _ => {
+                return Err(config_error(format!(
+                    "resolved configuration setting '{MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY}' is not text"
+                )));
+            }
+        };
+    routing.validate().map_err(|error| {
+        config_error(format!(
+            "resolved configuration setting '{MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY}' is invalid: {error}"
+        ))
+    })?;
+    Ok(routing)
 }
 
 pub fn required_usize(snapshot: &ConfigurationSnapshotV1, key_name: &str) -> Result<usize> {
@@ -441,6 +505,325 @@ fn required_lcm_summarizer_executables(
 fn config_error(message: impl Into<String>) -> TraceDecayError {
     TraceDecayError::Config {
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod memory_provider_snapshot_tests {
+    use std::collections::BTreeMap;
+
+    use tracedecay_domain::configuration::SettingKey;
+    use tracedecay_global_db::configuration::registry::ConfigurationRegistry;
+    use tracedecay_global_db::configuration::resolver::resolve_configuration;
+
+    use super::*;
+
+    fn setting_key(raw: &str) -> SettingKey {
+        SettingKey::new(raw).expect("fixture setting key is canonical")
+    }
+
+    /// The snapshot the production resolver publishes with no operator layers.
+    fn default_snapshot() -> ConfigurationSnapshotV1 {
+        let registry = ConfigurationRegistry::core().expect("core registry");
+        resolve_configuration(&registry, &[])
+            .expect("default resolution")
+            .snapshot
+    }
+
+    /// Rebuild the default snapshot with one setting replaced (`Some`) or
+    /// removed from both the value and provenance maps (`None`).
+    fn snapshot_with(
+        raw_key: &str,
+        value: Option<ConfigurationValueV1>,
+    ) -> ConfigurationSnapshotV1 {
+        let base = default_snapshot();
+        let mut effective_values: BTreeMap<_, _> = base.effective_values.clone();
+        let mut provenance: BTreeMap<_, _> = base.provenance.clone();
+        let key = setting_key(raw_key);
+        match value {
+            Some(value) => {
+                effective_values.insert(key, value);
+            }
+            None => {
+                effective_values.remove(&key);
+                provenance.remove(&key);
+            }
+        }
+        ConfigurationSnapshotV1::new(effective_values, provenance).expect("fixture snapshot")
+    }
+
+    fn routing_text(routing: &MemoryProviderRecallRoutingV1) -> ConfigurationValueV1 {
+        ConfigurationValueV1::Text(serde_json::to_string(routing).expect("routing encodes"))
+    }
+
+    #[test]
+    fn ncm_observer_snapshot_defaults_off_and_validates_admitted_paths() {
+        let stock = runtime_config_from_snapshot(&default_snapshot()).unwrap();
+        assert_eq!(
+            stock.memory_provider_ncm_observer,
+            MemoryProviderNcmObserverV1::Disabled {}
+        );
+        assert_eq!(
+            serde_json::to_string(&stock.memory_provider_ncm_observer).unwrap(),
+            r#"{"mode":"disabled"}"#
+        );
+        let disabled = runtime_config_from_snapshot(&snapshot_with(
+            MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+            Some(ConfigurationValueV1::Text(
+                r#"{"mode":"disabled"}"#.to_owned(),
+            )),
+        ))
+        .unwrap();
+        assert_eq!(
+            disabled.memory_provider_ncm_observer,
+            MemoryProviderNcmObserverV1::default()
+        );
+        let observer = MemoryProviderNcmObserverV1::Enabled {
+            worker_binary: PathBuf::from("/opt/tracedecay/tracedecay-ncm-worker"),
+            state_root: PathBuf::from("/var/lib/tracedecay/ncm"),
+        };
+        let value = ConfigurationValueV1::Text(serde_json::to_string(&observer).unwrap());
+        let selected = runtime_config_from_snapshot(&snapshot_with(
+            MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+            Some(value),
+        ))
+        .unwrap();
+        assert_eq!(selected.memory_provider_ncm_observer, observer);
+        for document in [
+            r#"{"mode":"enabled","worker_binary":"relative-worker","state_root":"/state"}"#,
+            r#"{"mode":"enabled","worker_binary":"/worker","state_root":"/state/../other"}"#,
+            r#"{"mode":"enabled","worker_binary":"/worker"}"#,
+            r#"{"mode":"disabled","active":true}"#,
+            r#"{"mode":"enabled","worker_binary":"/worker","state_root":"/state","active":true}"#,
+        ] {
+            assert!(
+                runtime_config_from_snapshot(&snapshot_with(
+                    MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+                    Some(ConfigurationValueV1::Text(document.to_owned()))
+                ))
+                .is_err(),
+                "{document}"
+            );
+        }
+        assert!(
+            runtime_config_from_snapshot(&snapshot_with(
+                MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+                None
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_participation_snapshot_selects_ncm_without_enabling_native() {
+        use tracedecay_domain::configuration::{
+            MemoryProviderKindV1, MemoryProviderParticipationV1, MemoryProviderSelectionV1,
+        };
+        let base = default_snapshot();
+        let mut values = base.effective_values.clone();
+        let root = if cfg!(windows) {
+            PathBuf::from("C:\\ncm")
+        } else {
+            PathBuf::from("/ncm")
+        };
+        let ncm = MemoryProviderNcmObserverV1::Enabled {
+            worker_binary: root.join("worker"),
+            state_root: root.join("state"),
+        };
+        values.insert(
+            setting_key(MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY),
+            ConfigurationValueV1::Boolean(false),
+        );
+        values.insert(
+            setting_key(MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY),
+            ConfigurationValueV1::Text(serde_json::to_string(&ncm).unwrap()),
+        );
+        values.insert(
+            setting_key(MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY),
+            ConfigurationValueV1::Text(r#"{"active_provider":"ncm"}"#.to_owned()),
+        );
+        let snapshot = ConfigurationSnapshotV1::new(values, base.provenance).unwrap();
+        let config = runtime_config_from_snapshot(&snapshot).unwrap();
+        assert!(!config.memory_provider_native_enabled);
+        assert_eq!(config.memory_provider_ncm_observer, ncm);
+        let selection = MemoryProviderSelectionV1::resolve(
+            config.memory_provider_native_enabled,
+            &config.memory_provider_ncm_observer,
+            &config.memory_provider_recall_routing,
+        )
+        .unwrap();
+        assert_eq!(selection.active_provider(), Some(MemoryProviderKindV1::Ncm));
+        assert_eq!(selection.native, MemoryProviderParticipationV1::Disabled);
+        assert_eq!(selection.ncm, MemoryProviderParticipationV1::Active);
+    }
+
+    #[test]
+    fn both_memory_provider_settings_extract_from_the_resolved_snapshot() {
+        // New projects route recall through Native without an NCM worker.
+        let stock = runtime_config_from_snapshot(&default_snapshot())
+            .expect("default snapshot yields a runtime configuration");
+        assert!(stock.memory_provider_native_enabled);
+        assert_eq!(
+            stock.memory_provider_recall_routing,
+            MemoryProviderRecallRoutingV1 {
+                active_provider: Some("tracedecay.native".to_owned()),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            stock.memory_provider_ncm_observer,
+            MemoryProviderNcmObserverV1::Disabled {}
+        );
+
+        // An operator-pinned boolean reaches the runtime configuration.
+        let native_off = runtime_config_from_snapshot(&snapshot_with(
+            MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+            Some(ConfigurationValueV1::Boolean(false)),
+        ))
+        .expect("native-disabled setting reaches the runtime configuration");
+        assert!(!native_off.memory_provider_native_enabled);
+
+        // A complete, valid routing document reaches it verbatim.
+        let routing = MemoryProviderRecallRoutingV1 {
+            active_provider: Some("native".to_owned()),
+            fallback: Some(MemoryProviderRecallFallbackV1 {
+                policy_id: "policy.recall.fallback".to_owned(),
+                policy_revision: 3,
+                target_provider: "ncm".to_owned(),
+            }),
+            degradation: Some(MemoryProviderRecallDegradationV1 {
+                policy_id: "policy.recall.degradation".to_owned(),
+                policy_revision: 4,
+                allowed_causes: vec![
+                    MemoryProviderRecallDegradationCauseV1::Unavailable,
+                    MemoryProviderRecallDegradationCauseV1::TimedOut,
+                ],
+            }),
+        };
+        let routed = runtime_config_from_snapshot(&snapshot_with(
+            MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+            Some(routing_text(&routing)),
+        ))
+        .expect("routed snapshot yields a runtime configuration");
+        assert_eq!(routed.memory_provider_recall_routing, routing);
+    }
+
+    #[test]
+    fn missing_memory_provider_settings_fail_the_snapshot_read() {
+        for key in [
+            MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+            MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+        ] {
+            let snapshot = snapshot_with(key, None);
+            assert!(
+                matches!(
+                    runtime_config_from_snapshot(&snapshot),
+                    Err(TraceDecayError::Config { .. })
+                ),
+                "missing {key} must fail project open"
+            );
+        }
+    }
+
+    #[test]
+    fn wrong_typed_memory_provider_settings_fail_the_snapshot_read() {
+        let mistyped_host = snapshot_with(
+            MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+            Some(ConfigurationValueV1::Text("true".to_owned())),
+        );
+        assert!(matches!(
+            runtime_config_from_snapshot(&mistyped_host),
+            Err(TraceDecayError::Config { .. })
+        ));
+
+        let mistyped_routing = snapshot_with(
+            MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+            Some(ConfigurationValueV1::Boolean(true)),
+        );
+        assert!(matches!(
+            runtime_config_from_snapshot(&mistyped_routing),
+            Err(TraceDecayError::Config { .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_recall_routing_documents_fail_the_snapshot_read() {
+        for document in [
+            "{",
+            "\"native\"",
+            "{\"active_provider\": \"native\", \"unknown\": true}",
+            "{\"active_provider\": 7}",
+        ] {
+            let snapshot = snapshot_with(
+                MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+                Some(ConfigurationValueV1::Text(document.to_owned())),
+            );
+            assert!(
+                matches!(
+                    runtime_config_from_snapshot(&snapshot),
+                    Err(TraceDecayError::Config { .. })
+                ),
+                "malformed routing document {document} must fail project open"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_recall_routing_gates_fail_the_snapshot_read() {
+        // A well-formed document that the routing gate itself rejects: a
+        // fallback without an active provider, a zero fallback revision, a
+        // fallback that targets the active provider, and a blank identity.
+        let fallback_without_active = MemoryProviderRecallRoutingV1 {
+            active_provider: None,
+            fallback: Some(MemoryProviderRecallFallbackV1 {
+                policy_id: "policy.recall.fallback".to_owned(),
+                policy_revision: 1,
+                target_provider: "ncm".to_owned(),
+            }),
+            degradation: None,
+        };
+        let zero_revision = MemoryProviderRecallRoutingV1 {
+            active_provider: Some("native".to_owned()),
+            fallback: Some(MemoryProviderRecallFallbackV1 {
+                policy_id: "policy.recall.fallback".to_owned(),
+                policy_revision: 0,
+                target_provider: "ncm".to_owned(),
+            }),
+            degradation: None,
+        };
+        let fallback_targets_active = MemoryProviderRecallRoutingV1 {
+            active_provider: Some("native".to_owned()),
+            fallback: Some(MemoryProviderRecallFallbackV1 {
+                policy_id: "policy.recall.fallback".to_owned(),
+                policy_revision: 2,
+                target_provider: "native".to_owned(),
+            }),
+            degradation: None,
+        };
+        let blank_active = MemoryProviderRecallRoutingV1 {
+            active_provider: Some(" ".to_owned()),
+            fallback: None,
+            degradation: None,
+        };
+
+        for routing in [
+            fallback_without_active,
+            zero_revision,
+            fallback_targets_active,
+            blank_active,
+        ] {
+            let snapshot = snapshot_with(
+                MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+                Some(routing_text(&routing)),
+            );
+            assert!(
+                matches!(
+                    runtime_config_from_snapshot(&snapshot),
+                    Err(TraceDecayError::Config { .. })
+                ),
+                "invalid routing gate {routing:?} must fail project open"
+            );
+        }
     }
 }
 

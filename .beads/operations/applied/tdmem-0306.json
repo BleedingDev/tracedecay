@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "attempt": 1,
+  "issue_id": "tdmem-0306",
+  "mode": "complete",
+  "actor": "assistant",
+  "claim_comment": "Closing dependency-direction enforcement only after a dedicated CI lane validates the real locked Cargo graph, focused negative fixtures prove forbidden edges fail closed, the provider API remains the inward root, NCM remains isolated from TraceDecay storage and code-index crates, and every exceptional edge requires one exact ADR-backed allowlist record with rationale, owner, verification, and review date.",
+  "checks": [
+    {
+      "name": "focused dependency-policy fixtures",
+      "argv": ["python3", "tests/product_memory_dependency_direction_test.py"],
+      "timeout_seconds": 120
+    },
+    {
+      "name": "real locked Cargo dependency graph",
+      "argv": ["python3", "scripts/product/check-memory-dependency-direction.py", "--repo", ".", "--policy", "product/architecture/memory-dependency-policy.json"],
+      "timeout_seconds": 300
+    },
+    {
+      "name": "workspace metadata remains locked",
+      "argv": ["cargo", "metadata", "--locked", "--format-version", "1", "--no-deps"],
+      "timeout_seconds": 300
+    },
+    {
+      "name": "provider API remains green",
+      "argv": ["cargo", "test", "-p", "tracedecay-memory-provider-api", "--locked"],
+      "timeout_seconds": 600
+    },
+    {
+      "name": "fabric remains green",
+      "argv": ["cargo", "test", "-p", "tracedecay-memory-fabric", "--locked"],
+      "timeout_seconds": 600
+    },
+    {
+      "name": "Native adapter remains green",
+      "argv": ["cargo", "test", "-p", "tracedecay-memory-provider-native", "--locked"],
+      "timeout_seconds": 600
+    },
+    {
+      "name": "NCM boundary remains green",
+      "argv": ["cargo", "test", "-p", "tracedecay-memory-provider-ncm", "--locked"],
+      "timeout_seconds": 600
+    },
+    {
+      "name": "conformance harness remains green",
+      "argv": ["cargo", "test", "-p", "tracedecay-memory-conformance", "--locked"],
+      "timeout_seconds": 600
+    },
+    {
+      "name": "upstream patch footprint remains valid",
+      "argv": ["python3", "scripts/product/check-patch-footprint-policy.py", "--repo", ".", "--policy", "product/upstream/patch-footprint-policy.json", "--map", "product/upstream/convergence-map.json"],
+      "timeout_seconds": 300
+    },
+    {
+      "name": "working tree has no whitespace damage",
+      "argv": ["git", "diff", "--check"],
+      "timeout_seconds": 60
+    }
+  ],
+  "acceptance_criteria": [
+    "CI fails on forbidden crate edges.",
+    "Provider API is below adapters and fabric, never above them.",
+    "NCM adapter cannot import TraceDecay DB or code-index crates.",
+    "Exceptions require explicit allowlist entries and rationale."
+  ],
+  "close_reason": "Added a dedicated machine-checked memory dependency policy, fail-closed Cargo metadata verifier, negative fixtures, exact ADR-backed exception contract, and product CI lane.",
+  "close_comment": "Evidence: product/architecture/memory-dependency-policy.json declares exact direct-dependency allowlists for provider API, fabric, Native, NCM, and conformance plus adapter-blind public transport rules. scripts/product/check-memory-dependency-direction.py validates the real locked cargo metadata graph, required edges, forbidden wildcard edges, provider API inward direction, and exact exceptions. Exceptions authorize only one rule/from/to tuple and fail when malformed, duplicate, wildcard-like, missing an ADR/rationale/owner/verification/review date, or unused. tests/product_memory_dependency_direction_test.py proves the current graph passes, NCM-to-store and API-to-fabric edges fail, incomplete exceptions fail, exact complete exceptions can authorize only their reviewed violations, and stale exceptions fail. .github/workflows/product-memory-architecture.yml runs both the negative fixtures and real graph on every relevant push and pull request; workflow run 33335705059 passed both lanes."
+}
