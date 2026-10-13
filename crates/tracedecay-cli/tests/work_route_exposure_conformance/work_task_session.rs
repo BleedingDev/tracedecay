@@ -974,13 +974,25 @@ fn pin_executable_binding(
     executable_path: &Path,
     artifact_digest: &ManifestDigest,
 ) -> PinnedConfiguration {
-    let observed = payload(
-        agent,
-        fixture,
-        "configuration observed state",
-        "/application/configuration/configuration_observed_state",
-        &json!({}),
-    );
+    // The daemon records the project runtime's configuration activation only
+    // after full capability admission, which may trail the first served
+    // request; wait for that record instead of racing it.
+    let deadline = Instant::now() + POLL_BUDGET;
+    let observed = loop {
+        let observed = payload(
+            agent,
+            fixture,
+            "configuration observed state",
+            "/application/configuration/configuration_observed_state",
+            &json!({}),
+        );
+        if observed.as_array().is_some_and(|components| !components.is_empty())
+            || Instant::now() >= deadline
+        {
+            break observed;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
     let base_revision = observed
         .as_array()
         .and_then(|components| components.first())

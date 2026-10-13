@@ -2755,6 +2755,9 @@ fn assert_native_search_hits(
     assert_eq!(hits.len(), expected.len());
     assert!(hits.len() <= 5);
     hits.sort_by(|left, right| left.message.message_id.cmp(&right.message.message_id));
+    // Native location metadata keeps the path the host reported verbatim;
+    // only the registered root is canonical (macOS `/var` -> `/private/var`).
+    let native_project = project.to_string_lossy().into_owned();
     let project = fs::canonicalize(project).expect("canonical project root");
     let project_id = journey.project_id();
     for (hit, expected) in hits.iter().zip(expected) {
@@ -2774,13 +2777,10 @@ fn assert_native_search_hits(
                     .expect("Claude native location metadata"),
             )
             .expect("canonical Claude location metadata");
-            assert_eq!(
-                metadata["claude_session_cwd"],
-                project.to_string_lossy().as_ref()
-            );
+            assert_eq!(metadata["claude_session_cwd"], native_project.as_str());
             assert_eq!(
                 metadata["claude_session_worktree"],
-                project.to_string_lossy().as_ref()
+                native_project.as_str()
             );
         }
         assert_eq!(hit.message.provider, provider);
