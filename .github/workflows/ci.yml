@@ -273,7 +273,33 @@ jobs:
       # HOME nor the passwd entry yields one.
       - name: Build and test the workspace
         shell: bash
-        run: bazel test --config=ci --action_env=ORT_CACHE_DIR=/tmp/ort.pyke.io //...
+        run: |
+          # TEMPORARY: sample open descriptors of mcp_suite, whose spawns fail
+          # with EBADF once descriptors pass macOS OPEN_MAX (10240).
+          samples="$RUNNER_TEMP/fd-samples"
+          mkdir -p "$samples"
+          echo "ulimit -n: $(ulimit -n)" > "$samples/mcp_suite.txt"
+          (
+            while sleep 30; do
+              for pid in $(pgrep -f '/mcp_suite( |$)' || true); do
+                lsof -p "$pid" 2>/dev/null > "$samples/lsof.tmp" || continue
+                {
+                  echo "== $(date -u +%T) pid=$pid open=$(($(wc -l < "$samples/lsof.tmp") - 1))"
+                  awk 'NR>1 {print $5}' "$samples/lsof.tmp" | sort | uniq -c | sort -rn | head -8
+                  awk 'NR>1 && $5=="REG" {print $9}' "$samples/lsof.tmp" \
+                    | sed -E 's/\.tmp[A-Za-z0-9]+/.tmpX/g' | sort | uniq -c | sort -rn | head -15
+                } >> "$samples/mcp_suite.txt"
+              done
+            done
+          ) &
+          bazel test --config=ci --action_env=ORT_CACHE_DIR=/tmp/ort.pyke.io //...
+
+      - name: Upload descriptor samples
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fd-samples-macOS
+          path: ${{ runner.temp }}/fd-samples/mcp_suite.txt
 
       - name: Upload failed test diagnostics
         if: failure()
