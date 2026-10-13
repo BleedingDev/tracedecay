@@ -5820,6 +5820,7 @@ mod tests {
     use tracedecay_host_admission::{HostAdmissionAuthorities, HostAdmissionFacade};
     use tracedecay_memory_observation::{
         AppendOutcomeV1, DeliveryStateV1, JournalInspectionFilterV1, ObservationJournalReaderV1,
+        RecoveryTimeBudgetV1,
     };
     use tracedecay_memory_provider_registry::{
         CommittedEffectEvidence, FabricConfig, FallbackDirective, HandshakeResponse,
@@ -11977,7 +11978,7 @@ mod tests {
         let port = Arc::new(JourneyObservationProvider::new());
         let journal_root = temp.path().join("journey");
         std::fs::create_dir_all(&journal_root).unwrap();
-        let journey = mount_and_replay(
+        let journey = mount_observer_dormant(
             ObservationJourneyMountInputsV1 {
                 composition: composition(Arc::clone(&port) as Arc<dyn MemoryProviderV1>),
                 profile_id: UserProfileId::new("profile.shutdown-off-worker").unwrap(),
@@ -11988,7 +11989,6 @@ mod tests {
                 store_data_root: journal_root.clone(),
                 policy: ObservationJourneyPolicyV1::project_default(),
             },
-            store.clone(),
             &HostCancellationToken::new(),
         )
         .await
@@ -12001,6 +12001,7 @@ mod tests {
         struct HeldWriter {
             release: Option<std::sync::mpsc::Sender<()>>,
             thread: Option<std::thread::JoinHandle<()>>,
+            reaper: Option<std::thread::JoinHandle<Result<u32, ObservationJournalError>>>,
         }
         impl Drop for HeldWriter {
             fn drop(&mut self) {
@@ -12008,12 +12009,16 @@ mod tests {
                 if let Some(thread) = self.thread.take() {
                     let _ = thread.join();
                 }
+                if let Some(reaper) = self.reaper.take() {
+                    let _ = reaper.join();
+                }
             }
         }
         let (release, released) = std::sync::mpsc::channel::<()>();
         let (ready, holding) = tokio::sync::oneshot::channel();
         let mut holder = HeldWriter {
             release: Some(release),
+            reaper: None,
             thread: Some(std::thread::spawn(move || {
                 let mut connection = rusqlite::Connection::open(&journal_path).unwrap();
                 let transaction = connection
@@ -12025,6 +12030,70 @@ mod tests {
             })),
         };
         holding.await.expect("writer holds the transaction");
+
+        let source_sha256 = hex::encode(Sha256::digest(journey.source_stream.as_str().as_bytes()));
+        let fence_probe = || {
+            let journal = Arc::clone(&journey.journal);
+            let provider_id = journey.provider_id.clone();
+            let source_sha256 = source_sha256.clone();
+            tokio::task::spawn_blocking(move || {
+                journal.read_provider_source_fence_bounded(
+                    &provider_id,
+                    &source_sha256,
+                    RecoveryTimeBudgetV1 {
+                        remaining_micros: 50_000,
+                    },
+                    &CancellationToken::new(),
+                )
+            })
+        };
+        // An external WAL writer alone does not block these committed reads.
+        // Establish that before creating contention on the journal connection.
+        let backlog = tokio::time::timeout(Duration::from_millis(500), async {
+            assert!(
+                fence_probe()
+                    .await
+                    .expect("baseline fence reader")
+                    .expect("the WAL fence read does not reserve the writer")
+                    .is_none()
+            );
+            journey
+                .refresh_backlog()
+                .await
+                .expect("the WAL backlog read does not reserve the writer")
+        })
+        .await
+        .expect("baseline reads must finish while the external writer is held");
+        assert_eq!(backlog.queue_items, 0);
+        assert_eq!(backlog.queue_bytes, 0);
+
+        journey
+            .start_observer_with_live_replay(store.clone())
+            .expect("activate the delivery and replay workers after the WAL read baseline");
+        holder.reaper = Some(std::thread::spawn({
+            let journal = Arc::clone(&journey.journal);
+            move || journal.reap_expired_leases(tracedecay_contracts::now_micros().0, 1)
+        }));
+        // Observe same-connection contention through the bounded reader that
+        // succeeded against the external writer, rather than assuming that a
+        // newly spawned reap has already acquired the mutex.
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                match fence_probe().await.expect("journal contention reader") {
+                    Err(ObservationJournalError::BudgetExhausted {
+                        operation: "read_provider_source_fence",
+                    }) => break,
+                    Ok(None) => tokio::task::yield_now().await,
+                    outcome => panic!("unexpected journal contention measurement: {outcome:?}"),
+                }
+            }
+        })
+        .await
+        .expect("journal connection contention must be observable before shutdown");
+        assert!(
+            !holder.reaper.as_ref().unwrap().is_finished(),
+            "the real reap finished before shutdown began"
+        );
         let result = tokio::time::timeout(
             Duration::from_millis(500),
             journey.shutdown(tokio::time::Instant::now() + Duration::from_millis(50)),
@@ -12034,6 +12103,16 @@ mod tests {
         // Cleanup before asserting even when the scheduling guard expired.
         drop(holder.release.take());
         holder.thread.take().unwrap().join().unwrap();
+        assert_eq!(
+            holder
+                .reaper
+                .take()
+                .unwrap()
+                .join()
+                .expect("contended reap thread")
+                .expect("the reap completes after the external writer is released"),
+            0
+        );
         let failures = result.expect("shutdown must return while the writer remains held");
         assert!(
             writer_still_held,
