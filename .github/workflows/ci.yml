@@ -8,35 +8,25 @@ on:
   push:
     branches: [master, feature/holographic-memory]
   workflow_dispatch:
-    inputs:
-      run_os:
-        description: "Also run full macOS and Windows tests"
-        type: boolean
-        default: false
-      run_hosts:
-        description: "Also run stock host integrations"
-        type: boolean
-        default: false
 
 permissions:
   contents: read
 
-# Explicit OS/host coverage must not be replaced by a default-coverage push
-# while queued (separate group suffixes). Non-master refs cancel superseded
+# Non-master refs cancel superseded
 # runs for tip-fast feedback. Master finishes the in-progress snapshot so a
 # green/red signal still lands when merges outpace the long pole; GitHub
 # keeps only the newest pending tip. Shorter shards cut how long that tip
 # may wait for first job — shard layout is owned elsewhere.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'workflow_dispatch' && format('os-{0}-hosts-{1}', inputs.run_os, inputs.run_hosts) || 'default' }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Drafts run cheap gates. Ready PRs and pushes run Bazel Linux validation
-  # and Windows compilation; dispatch can request full OS and host journeys.
+  # Drafts run cheap gates. Ready PRs, pushes and dispatches run everything:
+  # Linux, macOS and Windows tests and the stock host journeys.
   scope-gate:
     name: Scope gate
     permissions:
@@ -44,7 +34,7 @@ jobs:
       pull-requests: read
       checks: read
       actions: read
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 15
     outputs:
       run-heavy: ${{ steps.decide.outputs.run-heavy }}
@@ -56,19 +46,13 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           DRAFT: ${{ github.event.pull_request.draft || false }}
-          RUN_OS: ${{ inputs.run_os || false }}
-          RUN_HOSTS: ${{ inputs.run_hosts || false }}
         run: |
           heavy=true
           if [[ $EVENT == pull_request && $DRAFT == true ]]; then
             heavy=false
           fi
-          os=false
-          hosts=false
-          if [[ $EVENT == workflow_dispatch ]]; then
-            [[ $RUN_OS == true ]] && os=true
-            [[ $RUN_HOSTS == true ]] && hosts=true
-          fi
+          os=$heavy
+          hosts=$heavy
           {
             echo "run-heavy=$heavy"
             echo "run-os=$os"
@@ -76,15 +60,18 @@ jobs:
           } >>"$GITHUB_OUTPUT"
           echo "run-heavy=$heavy run-os=$os run-hosts=$hosts (event=$EVENT)"
 
-  # One dev-profile `tracedecay` binary for the explicitly requested stock
-  # host integrations. Ordinary Linux validation needs no CLI artifact, so
-  # this build is absent unless `run_hosts=true`.
+  # One dev-profile `tracedecay` binary for the stock host integrations.
   debug-cli:
     name: Build debug CLI
     needs: scope-gate
     if: ${{ needs.scope-gate.outputs.run-hosts == 'true' }}
-    runs-on: ubuntu-26.04-arm
+    runs-on: ${{ vars.DEPOT_LINUX_ARM_RUNNER || 'ubuntu-26.04-arm' }}
     timeout-minutes: 90
+    env:
+      # Bazel's C++ autoconfig picks ld.gold on Ubuntu 24.04 images, and gold
+      # cannot place aarch64 branch stubs in this debug binary ("Stub is too
+      # far away"). These options follow the detected -fuse-ld, so bfd wins.
+      BAZEL_LINKOPTS: -fuse-ld=bfd
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -105,7 +92,7 @@ jobs:
 
   benchmark-harness:
     name: Benchmark harness self-tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -125,7 +112,7 @@ jobs:
   # queue entries per push doing what one does.
   gates:
     name: Repository gates
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -233,13 +220,13 @@ jobs:
         run: scripts/lint-ci-commits.sh
 
   # The macOS and Windows lanes run the same Bazel workspace the Linux
-  # authority does, on demand: they exercise target-specific behavior the
+  # authority does: they exercise target-specific behavior the
   # Linux lane cannot prove.
   macos-test:
     name: Test macOS
     needs: scope-gate
     if: ${{ needs.scope-gate.outputs.run-os == 'true' }}
-    runs-on: macos-26
+    runs-on: ${{ vars.DEPOT_MACOS_RUNNER || 'macos-26' }}
     timeout-minutes: 330
     steps:
       # Full history: the search-quality workload fixture pins a
@@ -281,10 +268,12 @@ jobs:
           test-tools: "true"
 
       # `bazel test` builds every target in the pattern, so tests start
-      # while the rest of the workspace still links.
+      # while the rest of the workspace still links. ort-sys's build script
+      # panics without a cache directory: in Depot's macOS sandbox neither
+      # HOME nor the passwd entry yields one.
       - name: Build and test the workspace
         shell: bash
-        run: bazel test --config=ci //...
+        run: bazel test --config=ci --action_env=ORT_CACHE_DIR=/tmp/ort.pyke.io //...
 
       - name: Upload failed test diagnostics
         if: failure()
@@ -484,7 +473,7 @@ jobs:
     name: Test Linux
     needs: [scope-gate, linux-test]
     if: ${{ always() && !cancelled() && needs.scope-gate.outputs.run-heavy == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Require every Linux test shard
@@ -594,7 +583,7 @@ jobs:
     # x86 shares the pnpm store Repository gates and Dashboard already warm.
     # ubuntu-26.04-arm missed that cache on run 37707017494 and spent 325s
     # in `pnpm install` for an 8s `cargo tree`.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -642,7 +631,7 @@ jobs:
     name: Dashboard
     needs: [scope-gate, gates]
     if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -696,7 +685,7 @@ jobs:
     name: Hermes integration (stock)
     needs: [scope-gate, debug-cli]
     if: ${{ needs.scope-gate.outputs.run-hosts == 'true' }}
-    runs-on: ubuntu-26.04-arm
+    runs-on: ${{ vars.DEPOT_LINUX_ARM_RUNNER || 'ubuntu-26.04-arm' }}
     timeout-minutes: 30
     env:
       # Stock (upstream) Hermes pin. The generated plugin must keep working
@@ -716,6 +705,8 @@ jobs:
         run: chmod +x target/debug/tracedecay
 
       - name: Run generated-plugin unit checks (no Hermes required)
+        env:
+          TRACEDECAY_BIN: ${{ github.workspace }}/target/debug/tracedecay
         run: python3 scripts/hermes_plugin_unit_check.py
 
       - name: Clone stock Hermes at pinned ref
@@ -746,7 +737,7 @@ jobs:
     name: Claude Code + OpenCode integration (stock)
     needs: [scope-gate, debug-cli]
     if: ${{ needs.scope-gate.outputs.run-hosts == 'true' }}
-    runs-on: ubuntu-26.04-arm
+    runs-on: ${{ vars.DEPOT_LINUX_ARM_RUNNER || 'ubuntu-26.04-arm' }}
     timeout-minutes: 30
     env:
       # Stock host pins. The installed bundle must keep working against these
@@ -754,7 +745,9 @@ jobs:
       # scripts/claude_stock_integration.sh and
       # scripts/opencode_stock_integration.sh against the new versions locally.
       CLAUDE_CODE_VERSION: 2.1.224
-      OPENCODE_VERSION: 1.18.4
+      # OpenCode 2 (@opencode/cli), the release the host-event fixtures
+      # were captured from.
+      OPENCODE_VERSION: 2.0.19
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -768,7 +761,7 @@ jobs:
 
       - name: Install stock Claude Code and OpenCode at pinned versions
         run: |
-          npm install --global "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "opencode-ai@${OPENCODE_VERSION}"
+          npm install --global "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "@opencode/cli@${OPENCODE_VERSION}"
           claude --version
           opencode --version
 

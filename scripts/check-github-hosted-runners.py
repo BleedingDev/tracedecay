@@ -38,8 +38,16 @@ STANDARD_GITHUB_HOSTED_RUNNERS = frozenset(
     }
 )
 # Repository variables an operator sets to an approved Depot label:
-# depot-ubuntu-24.04-8 and depot-windows-2025-8 respectively.
-DEPOT_RUNNER_VARIABLES = frozenset({"DEPOT_LINUX_RUNNER", "DEPOT_WINDOWS_RUNNER"})
+# depot-ubuntu-24.04-8, depot-ubuntu-24.04-arm-8, depot-macos-26 and
+# depot-windows-2025-8 respectively.
+DEPOT_RUNNER_VARIABLES = frozenset(
+    {
+        "DEPOT_LINUX_RUNNER",
+        "DEPOT_LINUX_ARM_RUNNER",
+        "DEPOT_MACOS_RUNNER",
+        "DEPOT_WINDOWS_RUNNER",
+    }
+)
 DEPOT_RUNNER_EXPRESSION = re.compile(
     r"\$\{\{\s*vars\.([A-Z_]+)\s*\|\|\s*'([^']+)'\s*\}\}"
 )

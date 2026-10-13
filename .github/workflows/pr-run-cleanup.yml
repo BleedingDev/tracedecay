@@ -16,7 +16,7 @@ concurrency:
 jobs:
   cache-cleanup:
     name: Cancel closed PR runs and delete their caches
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
       actions: write

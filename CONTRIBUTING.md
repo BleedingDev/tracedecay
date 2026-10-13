@@ -290,28 +290,25 @@ behavior.
 - Do not hand-edit `CHANGELOG.md`; release automation generates it from
   conventional commit messages.
 
-### What CI spends on a pull request
+### What CI runs on a pull request
 
-CI runs on GitHub's free hosted runners: 20 concurrent jobs for the whole
-account, 5 of them macOS. Every job a pull request queues is a job the
-integration branch waits behind, so a run spends only what its state earns:
+CI runs on Depot runners (Linux x86 and arm64, macOS and Windows) with a
+shared remote Bazel cache, so unchanged build and test actions are reused
+across runs and branches. Each job falls back to its GitHub-hosted runner
+where the `DEPOT_*_RUNNER` repository variables are unset.
 
 | State | Runs |
 |---|---|
 | Draft pull request | Repository gates and benchmark-harness self-tests. |
-| Ready pull request, push to `master`, or `CI` dispatch | Repository gates, benchmark-harness self-tests, Linux and Windows Bazel build and test, Clippy, feature gates, the shipped CLI, and the dashboard. |
-| `CI` with `run_os=true` | Adds the macOS Bazel build and test lane. |
-| `CI` with `run_hosts=true` | Adds stock host integrations. |
+| Ready pull request, push to `master`, or `CI` dispatch | Everything: repository gates, benchmark-harness self-tests, Linux, macOS and Windows Bazel build and test, Clippy, feature gates, the shipped CLI, the dashboard, and the stock host integrations. |
 
-Use `gh workflow run ci.yml --ref <branch>` to request an additional run; add
-`-f run_os=true` or `-f run_hosts=true` for the optional lanes. A newer PR
-head replaces its prior run. Master finishes its current snapshot and retains
-only the newest pending tip, so merges faster than the long pole still produce
-a complete green/red signal. Explicit `run_os` / `run_hosts` dispatches keep
-separate concurrency groups so a default push cannot cancel them while they
-are queued or running. Closing or merging a PR cancels its remaining runs and
-drops its Actions caches. Nothing runs on a timer: the packaged-crate
-distribution battery and the Hawk lint are `workflow_dispatch` only.
+Use `gh workflow run ci.yml --ref <branch>` to request an additional run. A
+newer PR head replaces its prior run. Master finishes its current snapshot and
+retains only the newest pending tip, so merges faster than the long pole still
+produce a complete green/red signal. Closing or merging a PR cancels its
+remaining runs and drops its Actions caches. Nothing runs on a timer: the
+packaged-crate distribution battery and the Hawk lint are `workflow_dispatch`
+only.
 
 ## Reporting Issues
 

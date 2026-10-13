@@ -139,6 +139,8 @@ class GitHubHostedRunnerPolicyTests(unittest.TestCase):
     def test_accepts_approved_depot_runner_variables(self) -> None:
         for runner in (
             "${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}",
+            "${{ vars.DEPOT_LINUX_ARM_RUNNER || 'ubuntu-26.04-arm' }}",
+            "${{ vars.DEPOT_MACOS_RUNNER || 'macos-26' }}",
             "${{ vars.DEPOT_WINDOWS_RUNNER || 'windows-latest' }}",
         ):
             with self.subTest(runner=runner), tempfile.TemporaryDirectory() as directory:
@@ -152,6 +154,7 @@ class GitHubHostedRunnerPolicyTests(unittest.TestCase):
             "${{ vars.RUNNER || 'ubuntu-latest' }}",
             "${{ vars.DEPOT_LINUX_RUNNER || 'tracedecay-linux-64core' }}",
             "${{ vars.DEPOT_LINUX_RUNNER || inputs.runner }}",
+            "${{ vars.DEPOT_MACOS_RUNNER || 'depot-macos-26' }}",
         ):
             with self.subTest(runner=runner):
                 self.assert_rejected(f'jobs:\n  test:\n    runs-on: "{runner}"\n')
