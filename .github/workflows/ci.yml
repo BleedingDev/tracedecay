@@ -67,6 +67,11 @@ jobs:
     if: ${{ needs.scope-gate.outputs.run-hosts == 'true' }}
     runs-on: ${{ vars.DEPOT_LINUX_ARM_RUNNER || 'ubuntu-26.04-arm' }}
     timeout-minutes: 90
+    env:
+      # Bazel's C++ autoconfig picks ld.gold on Ubuntu 24.04 images, and gold
+      # cannot place aarch64 branch stubs in this debug binary ("Stub is too
+      # far away"). These options follow the detected -fuse-ld, so bfd wins.
+      BAZEL_LINKOPTS: -fuse-ld=bfd
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
