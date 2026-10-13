@@ -8,35 +8,25 @@ on:
   push:
     branches: [master, feature/holographic-memory]
   workflow_dispatch:
-    inputs:
-      run_os:
-        description: "Also run full macOS and Windows tests"
-        type: boolean
-        default: false
-      run_hosts:
-        description: "Also run stock host integrations"
-        type: boolean
-        default: false
 
 permissions:
   contents: read
 
-# Explicit OS/host coverage must not be replaced by a default-coverage push
-# while queued (separate group suffixes). Non-master refs cancel superseded
+# Non-master refs cancel superseded
 # runs for tip-fast feedback. Master finishes the in-progress snapshot so a
 # green/red signal still lands when merges outpace the long pole; GitHub
 # keeps only the newest pending tip. Shorter shards cut how long that tip
 # may wait for first job — shard layout is owned elsewhere.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'workflow_dispatch' && format('os-{0}-hosts-{1}', inputs.run_os, inputs.run_hosts) || 'default' }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Drafts run cheap gates. Ready PRs and pushes run Bazel Linux validation
-  # and Windows compilation; dispatch can request full OS and host journeys.
+  # Drafts run cheap gates. Ready PRs, pushes and dispatches run everything:
+  # Linux, macOS and Windows tests and the stock host journeys.
   scope-gate:
     name: Scope gate
     permissions:
@@ -56,19 +46,13 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           DRAFT: ${{ github.event.pull_request.draft || false }}
-          RUN_OS: ${{ inputs.run_os || false }}
-          RUN_HOSTS: ${{ inputs.run_hosts || false }}
         run: |
           heavy=true
           if [[ $EVENT == pull_request && $DRAFT == true ]]; then
             heavy=false
           fi
-          os=false
-          hosts=false
-          if [[ $EVENT == workflow_dispatch ]]; then
-            [[ $RUN_OS == true ]] && os=true
-            [[ $RUN_HOSTS == true ]] && hosts=true
-          fi
+          os=$heavy
+          hosts=$heavy
           {
             echo "run-heavy=$heavy"
             echo "run-os=$os"
@@ -76,9 +60,7 @@ jobs:
           } >>"$GITHUB_OUTPUT"
           echo "run-heavy=$heavy run-os=$os run-hosts=$hosts (event=$EVENT)"
 
-  # One dev-profile `tracedecay` binary for the explicitly requested stock
-  # host integrations. Ordinary Linux validation needs no CLI artifact, so
-  # this build is absent unless `run_hosts=true`.
+  # One dev-profile `tracedecay` binary for the stock host integrations.
   debug-cli:
     name: Build debug CLI
     needs: scope-gate
@@ -233,7 +215,7 @@ jobs:
         run: scripts/lint-ci-commits.sh
 
   # The macOS and Windows lanes run the same Bazel workspace the Linux
-  # authority does, on demand: they exercise target-specific behavior the
+  # authority does: they exercise target-specific behavior the
   # Linux lane cannot prove.
   macos-test:
     name: Test macOS
