@@ -986,7 +986,9 @@ fn pin_executable_binding(
             "/application/configuration/configuration_observed_state",
             &json!({}),
         );
-        if observed.as_array().is_some_and(|components| !components.is_empty())
+        if observed
+            .as_array()
+            .is_some_and(|components| !components.is_empty())
             || Instant::now() >= deadline
         {
             break observed;

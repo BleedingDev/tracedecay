@@ -2793,10 +2793,7 @@ fn assert_native_search_hits(
             )
             .expect("canonical Claude location metadata");
             assert_eq!(metadata["claude_session_cwd"], native_project.as_str());
-            assert_eq!(
-                metadata["claude_session_worktree"],
-                native_project.as_str()
-            );
+            assert_eq!(metadata["claude_session_worktree"], native_project.as_str());
         }
         assert_eq!(hit.message.provider, provider);
         assert_eq!(hit.message.session_id, journey.session_id());
