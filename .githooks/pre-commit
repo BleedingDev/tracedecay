@@ -13,10 +13,19 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
+if ! git diff --cached --check; then
+    echo "pre-commit: whitespace errors above in staged changes; fix them and re-stage" >&2
+    exit 1
+fi
+
 mapfile -d '' staged < <(git diff --cached --name-only --diff-filter=ACMR -z -- '*.rs')
 if [[ ${#staged[@]} -eq 0 ]]; then
     exit 0
 fi
+
+# Fails with an install hint when no working rustfmt exists; never skips.
+rustfmt_bin="$(scripts/local-gates.sh resolve-rustfmt)"
+rustfmt() { RUSTUP_AUTO_INSTALL=0 "$rustfmt_bin" --config-path rustfmt.toml "$@"; }
 
 mapfile -d '' partial < <(git diff --name-only -z -- "${staged[@]}")
 if [[ ${#partial[@]} -gt 0 ]]; then
@@ -31,7 +40,7 @@ if [[ ${#partial[@]} -gt 0 ]]; then
     if [[ ${#unformatted[@]} -gt 0 ]]; then
         echo "pre-commit: these files are partially staged and their staged content is not rustfmt-clean:" >&2
         printf '  %s\n' "${unformatted[@]}" >&2
-        echo "stage the whole file or run \`cargo fmt --all\` first" >&2
+        echo "stage the whole file, or format it with: $rustfmt_bin --edition 2024 --config-path rustfmt.toml ${unformatted[*]}" >&2
         exit 1
     fi
 fi
