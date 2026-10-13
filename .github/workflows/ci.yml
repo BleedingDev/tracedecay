@@ -268,10 +268,12 @@ jobs:
           test-tools: "true"
 
       # `bazel test` builds every target in the pattern, so tests start
-      # while the rest of the workspace still links.
+      # while the rest of the workspace still links. ort-sys's build script
+      # panics without a cache directory: in Depot's macOS sandbox neither
+      # HOME nor the passwd entry yields one.
       - name: Build and test the workspace
         shell: bash
-        run: bazel test --config=ci //...
+        run: bazel test --config=ci --action_env=ORT_CACHE_DIR=/tmp/ort.pyke.io //...
 
       - name: Upload failed test diagnostics
         if: failure()
