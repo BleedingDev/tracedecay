@@ -44,7 +44,7 @@ jobs:
       pull-requests: read
       checks: read
       actions: read
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 15
     outputs:
       run-heavy: ${{ steps.decide.outputs.run-heavy }}
@@ -83,7 +83,7 @@ jobs:
     name: Build debug CLI
     needs: scope-gate
     if: ${{ needs.scope-gate.outputs.run-hosts == 'true' }}
-    runs-on: ubuntu-26.04-arm
+    runs-on: ${{ vars.DEPOT_LINUX_ARM_RUNNER || 'ubuntu-26.04-arm' }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -105,7 +105,7 @@ jobs:
 
   benchmark-harness:
     name: Benchmark harness self-tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -125,7 +125,7 @@ jobs:
   # queue entries per push doing what one does.
   gates:
     name: Repository gates
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -239,7 +239,7 @@ jobs:
     name: Test macOS
     needs: scope-gate
     if: ${{ needs.scope-gate.outputs.run-os == 'true' }}
-    runs-on: macos-26
+    runs-on: ${{ vars.DEPOT_MACOS_RUNNER || 'macos-26' }}
     timeout-minutes: 330
     steps:
       # Full history: the search-quality workload fixture pins a
@@ -484,7 +484,7 @@ jobs:
     name: Test Linux
     needs: [scope-gate, linux-test]
     if: ${{ always() && !cancelled() && needs.scope-gate.outputs.run-heavy == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Require every Linux test shard
@@ -594,7 +594,7 @@ jobs:
     # x86 shares the pnpm store Repository gates and Dashboard already warm.
     # ubuntu-26.04-arm missed that cache on run 37707017494 and spent 325s
     # in `pnpm install` for an 8s `cargo tree`.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -642,7 +642,7 @@ jobs:
     name: Dashboard
     needs: [scope-gate, gates]
     if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -696,7 +696,7 @@ jobs:
     name: Hermes integration (stock)
     needs: [scope-gate, debug-cli]
     if: ${{ needs.scope-gate.outputs.run-hosts == 'true' }}
-    runs-on: ubuntu-26.04-arm
+    runs-on: ${{ vars.DEPOT_LINUX_ARM_RUNNER || 'ubuntu-26.04-arm' }}
     timeout-minutes: 30
     env:
       # Stock (upstream) Hermes pin. The generated plugin must keep working
@@ -746,7 +746,7 @@ jobs:
     name: Claude Code + OpenCode integration (stock)
     needs: [scope-gate, debug-cli]
     if: ${{ needs.scope-gate.outputs.run-hosts == 'true' }}
-    runs-on: ubuntu-26.04-arm
+    runs-on: ${{ vars.DEPOT_LINUX_ARM_RUNNER || 'ubuntu-26.04-arm' }}
     timeout-minutes: 30
     env:
       # Stock host pins. The installed bundle must keep working against these

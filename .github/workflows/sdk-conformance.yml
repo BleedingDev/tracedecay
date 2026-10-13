@@ -38,7 +38,7 @@ concurrency:
 
 jobs:
   publish-workflow-policy:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -73,7 +73,7 @@ jobs:
           .github/workflows/release-please.yml
           .github/workflows/release-pr-integrity.yml
   packages:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -102,7 +102,7 @@ jobs:
           key: ${{ steps.bazel.outputs.disk-cache-key }}
 
   production-router:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
