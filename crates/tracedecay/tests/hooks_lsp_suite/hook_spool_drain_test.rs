@@ -309,6 +309,13 @@ fn a_failed_receipt_drain_is_reported_on_status_and_clears_when_the_spool_drains
         await_hook_replay_status(&home, &project, &drained, PROMPT_DRAIN),
         drained
     );
+    // `drained` is the last pass's outcome; a pass that ran just before this
+    // publication landed reports it while the new receipt is still queued for
+    // the next pass, so wait for the spool itself within the same budget.
+    let started = Instant::now();
+    while !published_receipts(&receipts).is_empty() && started.elapsed() < PROMPT_DRAIN {
+        std::thread::sleep(Duration::from_millis(200));
+    }
     assert_eq!(published_receipts(&receipts), Vec::<PathBuf>::new());
 }
 

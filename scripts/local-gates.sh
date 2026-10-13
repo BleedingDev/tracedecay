@@ -13,6 +13,13 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
+# Git exports repository-scoped variables (GIT_DIR, GIT_INDEX_FILE, ...) to
+# hooks. Tests that build their own fixture repositories would otherwise
+# operate on this checkout instead, so drop them once the root is known.
+while IFS= read -r variable; do
+    unset "$variable"
+done < <(git rev-parse --local-env-vars)
+
 fail() {
     echo "local-gates: $*" >&2
     exit 1

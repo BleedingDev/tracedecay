@@ -2070,12 +2070,23 @@ fn configuration_tool_cli_persists_effects_and_fails_on_stale_cas() {
         "configuration_set",
         mutation.clone(),
     );
-    let advanced = configuration_tool_success(
-        &home_path,
-        &project_path,
-        "configuration_observed_state",
-        json!({}),
-    );
+    // The runtime records its configuration activation asynchronously, so
+    // the observed state can briefly list no components after the set.
+    let deadline = Instant::now() + CLI_ROUNDTRIP_TIMEOUT;
+    let advanced = loop {
+        let advanced = configuration_tool_success(
+            &home_path,
+            &project_path,
+            "configuration_observed_state",
+            json!({}),
+        );
+        if advanced["outcome"]["value"]["payload"][0]["desired_revision_id"].is_string()
+            || Instant::now() >= deadline
+        {
+            break advanced;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
     let advanced_revision = advanced["outcome"]["value"]["payload"][0]["desired_revision_id"]
         .as_str()
         .expect("advanced configuration revision")

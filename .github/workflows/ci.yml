@@ -294,13 +294,17 @@ jobs:
           echo "ulimit -n: $(ulimit -n)" > "$samples/mcp_suite.txt"
           (
             while sleep 30; do
-              for pid in $(pgrep -f '/mcp_suite( |$)' || true); do
+              # Bazel names the Rust test executable `mcp_suite__binary`.
+              for pid in $(pgrep -f 'mcp_suite' || true); do
                 lsof -p "$pid" 2>/dev/null > "$samples/lsof.tmp" || continue
                 {
                   echo "== $(date -u +%T) pid=$pid open=$(($(wc -l < "$samples/lsof.tmp") - 1))"
                   awk 'NR>1 {print $5}' "$samples/lsof.tmp" | sort | uniq -c | sort -rn | head -8
                   awk 'NR>1 && $5=="REG" {print $9}' "$samples/lsof.tmp" \
                     | sed -E 's/\.tmp[A-Za-z0-9]+/.tmpX/g' | sort | uniq -c | sort -rn | head -15
+                  awk 'NR>1 && $5!="REG" {print $5, $NF}' "$samples/lsof.tmp" \
+                    | sed -E 's/0x[0-9a-f]+/0xX/g; s/\.tmp[A-Za-z0-9]+/.tmpX/g' \
+                    | sort | uniq -c | sort -rn | head -10
                 } >> "$samples/mcp_suite.txt"
               done
             done
