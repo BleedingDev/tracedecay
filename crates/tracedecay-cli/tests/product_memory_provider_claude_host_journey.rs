@@ -2713,6 +2713,17 @@ fn native_message_search(
     .expect("typed canonical message search")
 }
 
+/// Path spelling for comparison: Windows paths are case-insensitive and take
+/// either separator, so `c:/repo` and `C:\repo` name the same root there.
+fn host_path_key(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) {
+        tracedecay_domain::forward_slash_text(&text).to_lowercase()
+    } else {
+        text.into_owned()
+    }
+}
+
 fn assert_native_search_hits(
     journey: &ClaudeHostJourney,
     project: &Path,
@@ -2758,14 +2769,18 @@ fn assert_native_search_hits(
     // Native location metadata keeps the path the host reported verbatim;
     // only the registered root is canonical (macOS `/var` -> `/private/var`).
     let native_project = project.to_string_lossy().into_owned();
-    let project = fs::canonicalize(project).expect("canonical project root");
+    let project = tracedecay_runtime_core::path_safety::canonical_existing_identity(project)
+        .expect("canonical project root");
     let project_id = journey.project_id();
     for (hit, expected) in hits.iter().zip(expected) {
         assert_eq!(hit.session.provider, provider);
         assert_eq!(hit.session.session_id, journey.session_id());
         assert_eq!(hit.session.project_key, project_id);
         if journey.codex {
-            assert_eq!(Path::new(&hit.session.project_path), project);
+            assert_eq!(
+                host_path_key(Path::new(&hit.session.project_path)),
+                host_path_key(&project)
+            );
         } else {
             // Claude's canonical projection stores its registered project ID
             // in both identity fields and keeps native paths in row metadata.

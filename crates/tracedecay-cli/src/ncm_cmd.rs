@@ -3582,9 +3582,12 @@ mod tests {
 
     #[test]
     fn worker_and_state_paths_require_absolute_non_traversing_values() {
+        let root = if cfg!(windows) { r"C:\tmp" } else { "/tmp" };
         assert!(require_absolute_path(Path::new("relative/worker"), "worker").is_err());
-        assert!(require_absolute_path(Path::new("/tmp/../worker"), "worker").is_err());
-        assert!(require_absolute_path(Path::new("/tmp/worker"), "worker").is_ok());
+        assert!(
+            require_absolute_path(&Path::new(root).join("..").join("worker"), "worker").is_err()
+        );
+        assert!(require_absolute_path(&Path::new(root).join("worker"), "worker").is_ok());
     }
 
     #[test]

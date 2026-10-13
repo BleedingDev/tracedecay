@@ -8,7 +8,7 @@
 //! new complete tree, while recovery can repair the short interval between
 //! the two renames after a process or machine failure.
 
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 use cap_std::{
     ambient_authority,
     fs::{Dir, OpenOptions},
@@ -2053,7 +2053,12 @@ pub(super) fn open_directory_path(path: &Path) -> Result<Dir, EncoderError> {
 
 fn open_directory_nofollow(parent: &Dir, name: &OsStr, path: &Path) -> Result<Dir, EncoderError> {
     let mut options = OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
+    // `maybe_dir` lets Windows open a directory handle (backup semantics);
+    // without it the open is refused with access denied.
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
     let file = parent.open_with(name, &options).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             EncoderError::ArtifactsMissing(path.display().to_string())

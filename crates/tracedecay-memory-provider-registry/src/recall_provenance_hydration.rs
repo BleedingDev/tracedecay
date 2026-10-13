@@ -1169,7 +1169,11 @@ mod tests {
             "profile.hydration",
             resolved_scope("project.hydration"),
             SESSION,
-            "/mounted/worktree",
+            if cfg!(windows) {
+                r"C:\mounted\worktree"
+            } else {
+                "/mounted/worktree"
+            },
         )
         .expect("host evidence scope")
     }

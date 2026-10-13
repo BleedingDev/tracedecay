@@ -443,7 +443,10 @@ impl HermesJourney {
         let result: Value =
             serde_json::from_slice(&output.stdout).expect("Hermes fixture sentinel JSON");
         assert_eq!(result["sync"], "complete");
-        let expected_project = fs::canonicalize(&self.project).expect("canonical project root");
+        // The product reports roots in plain host form (no Windows `\\?\` prefix).
+        let expected_project =
+            tracedecay_runtime_core::path_safety::canonical_existing_identity(&self.project)
+                .expect("canonical project root");
         assert_eq!(result["project_root"].as_str(), expected_project.to_str());
         assert_eq!(result["installed_provider_id"], "tracedecay");
         assert_eq!(

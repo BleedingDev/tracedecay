@@ -13,6 +13,13 @@ fn git(root: &Path, args: &[&str]) {
     assert!(status.success(), "git command failed: {args:?}");
 }
 
+/// The repository root in plain host form: Git for Windows rejects the
+/// `\\?\` spelling `std::fs::canonicalize` returns there.
+fn registered_root(repository: &tempfile::TempDir) -> std::path::PathBuf {
+    tracedecay_runtime_core::path_safety::canonical_existing_identity(repository.path())
+        .expect("registered root")
+}
+
 fn repository() -> tempfile::TempDir {
     let root = tempfile::TempDir::new().expect("repository");
     for args in [
@@ -29,7 +36,7 @@ fn repository() -> tempfile::TempDir {
 #[test]
 fn registered_scope_route_preserves_linked_worktree_identity() {
     let repository = repository();
-    let registered_root = repository.path().canonicalize().expect("registered root");
+    let registered_root = registered_root(&repository);
     let project_id = ProjectId::new("project.registered-route").expect("project id");
     assert!(
         tracedecay_runtime_core::storage::write_repository_identity_marker(
@@ -83,7 +90,7 @@ fn registered_scope_route_rejects_foreign_repository() {
 #[test]
 fn registered_scope_route_preserves_nested_linked_worktree_and_descendants() {
     let repository = repository();
-    let registered_root = repository.path().canonicalize().expect("registered root");
+    let registered_root = registered_root(&repository);
     let project_id = ProjectId::new("project.registered-route").expect("project id");
     assert!(
         tracedecay_runtime_core::storage::write_repository_identity_marker(
@@ -155,7 +162,7 @@ fn registered_scope_route_preserves_nested_linked_worktree_and_descendants() {
 #[test]
 fn registered_scope_route_rejects_foreign_nested_repository() {
     let repository = repository();
-    let registered_root = repository.path().canonicalize().expect("registered root");
+    let registered_root = registered_root(&repository);
     let project_id = ProjectId::new("project.registered-route").expect("project id");
     assert!(
         tracedecay_runtime_core::storage::write_repository_identity_marker(
