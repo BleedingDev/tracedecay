@@ -596,7 +596,7 @@ fn linked_worktree_spooled_events_reopen_after_restart_and_beside_a_mounted_peer
     };
 
     let home = tempfile::TempDir::new().unwrap();
-    let home = home.path().canonicalize().unwrap();
+    let home = crate::common::canonicalize_test_dir(home.path());
     let primary = init_git_project(&home);
     let sibling = home.join("sibling");
     assert!(
@@ -608,7 +608,7 @@ fn linked_worktree_spooled_events_reopen_after_restart_and_beside_a_mounted_peer
             .unwrap()
             .success()
     );
-    let sibling = sibling.canonicalize().unwrap();
+    let sibling = crate::common::canonicalize_test_dir(&sibling);
     let daemon = spawn_tracedecay_daemon(&home);
     tracedecay(&home, &primary, &["init"]);
     // Normal registered open enrolls this linked alias in the same project.
