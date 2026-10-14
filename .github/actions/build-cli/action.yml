@@ -21,6 +21,10 @@ inputs:
     description: Stage the generated NCM worker bundle for a supported release target.
     required: false
     default: 'false'
+  save-module-lockfile:
+    description: Save MODULE.bazel.lock right after a successful build when its exact key missed.
+    required: false
+    default: 'false'
 
 outputs:
   path:
@@ -69,6 +73,13 @@ runs:
             "$DEST/ncm-worker/model-acquisition-manifest.json"
         fi
         echo "path=${GITHUB_WORKSPACE}/${DEST}/tracedecay${exe}" >> "$GITHUB_OUTPUT"
+
+    - name: Save the Bazel module lockfile
+      if: inputs.save-module-lockfile == 'true' && steps.bazel.outputs.module-lockfile-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: MODULE.bazel.lock
+        key: ${{ steps.bazel.outputs.module-lockfile-key }}
 
     # Cargo's macOS link wrapper gave the product a stable ad-hoc identity;
     # Bazel links directly, so sign the staged file the way install.sh and
