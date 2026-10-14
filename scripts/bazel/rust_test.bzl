@@ -8,7 +8,15 @@ _POSIX_LAUNCHER = """#!/bin/sh
 set -eu
 : "${{TEST_TMPDIR:?Bazel did not provide TEST_TMPDIR}}"
 export RUSTUP_HOME="${{RUSTUP_HOME:-$HOME/.rustup}}"
-export TRACEDECAY_TEST_RUSTUP_BIN="${{CARGO_HOME:-$HOME/.cargo}}/bin"
+# The directory holding rustup and its proxies (rust-analyzer among them),
+# which the LSP acceptance puts on the daemon's PATH. The rustup on PATH is
+# the authority; CARGO_HOME is only a fallback, since a CARGO_HOME that
+# holds just a registry (a shared build cache) has no proxies in its bin.
+if rustup_path="$(command -v rustup 2>/dev/null)"; then
+  export TRACEDECAY_TEST_RUSTUP_BIN="$(dirname "$rustup_path")"
+else
+  export TRACEDECAY_TEST_RUSTUP_BIN="${{CARGO_HOME:-$HOME/.cargo}}/bin"
+fi
 export CARGO_HOME="$TEST_TMPDIR/cargo-home"
 export HOME="$TEST_TMPDIR/home"
 mkdir -p "$HOME"
@@ -41,6 +49,9 @@ if not defined RUSTUP_HOME set "RUSTUP_HOME=%USERPROFILE%/.rustup"
 if not defined CARGO_HOME set "CARGO_HOME=%USERPROFILE%/.cargo"
 set "TEST_TMPDIR=%TEST_TMPDIR:/=\\%"
 set "TRACEDECAY_TEST_RUSTUP_BIN=%CARGO_HOME%/bin"
+rem The rustup on PATH is the authority for the proxy directory; see the
+rem POSIX launcher. %%~dp$PATH:i resolves rustup.exe through PATH.
+for %%i in (rustup.exe) do if not "%%~dp$PATH:i"=="" set "TRACEDECAY_TEST_RUSTUP_BIN=%%~dp$PATH:i"
 set "CARGO_HOME=%TEST_TMPDIR%\\cargo-home"
 set "HOME=%TEST_TMPDIR%\\home"
 set "USERPROFILE=%HOME%"
