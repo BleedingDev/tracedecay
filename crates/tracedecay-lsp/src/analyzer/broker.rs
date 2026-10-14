@@ -622,6 +622,16 @@ impl DiagnosticBroker {
                 self.clear_launch_refusal(language);
             })
             .inspect_err(|error| {
+                // The route is dropped on this error and nothing else names
+                // the reason: the session then negotiates without the
+                // analyzer, which reads as a healthy project with none.
+                tracing::warn!(
+                    language,
+                    command,
+                    workspace_root = %workspace_root.display(),
+                    error = %error,
+                    "analyzer launch refused; the language routes without it"
+                );
                 let message = error.engine_error();
                 self.engine_errors
                     .insert(language.to_string(), message.clone());
