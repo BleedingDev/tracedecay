@@ -607,6 +607,11 @@ impl PendingCodexFixture {
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(&directory).unwrap();
         let project_id = ProjectId::new("pending-codex-fixture").unwrap();
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            &project,
+            project_id.as_str(),
+        )
+        .unwrap();
         let scope = ObservationScopeV1::Project {
             project_id: project_id.clone(),
         };

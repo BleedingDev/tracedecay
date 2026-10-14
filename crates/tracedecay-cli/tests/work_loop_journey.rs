@@ -767,18 +767,19 @@ fn the_work_loop_journey_runs_end_to_end_through_the_daemon() {
             started = started_marker.display(),
         ),
     );
-    let observed = fixture.payload(
-        "configuration observed state",
-        "/application/configuration/configuration_observed_state",
-        &json!({}),
-    );
-    let base_revision = observed
-        .as_array()
-        .and_then(|components| components.first())
-        .and_then(|component| component["desired_revision_id"].as_str())
-        .unwrap_or_else(|| panic!("configuration observed state: {observed}"))
-        .to_owned();
     let bindings_key = "work.executable_bindings.v1";
+    let current = fixture.payload(
+        "configuration get before pinning",
+        "/application/configuration/configuration_get",
+        &json!({ "key": bindings_key }),
+    );
+    // Activation evidence can still be empty on a fresh mount; the setting's
+    // resolved revision is the authority for the configuration write's CAS.
+    let base_revision = current["revision_id"]
+        .as_str()
+        .filter(|revision| !revision.is_empty())
+        .unwrap_or_else(|| panic!("configuration get before pinning: {current}"))
+        .to_owned();
     let set = fixture.payload(
         "configuration set (work executable bindings)",
         "/application/configuration/configuration_set",

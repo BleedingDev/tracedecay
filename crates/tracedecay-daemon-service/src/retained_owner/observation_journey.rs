@@ -7307,21 +7307,26 @@ mod tests {
             wait_for_census(&fixture, baseline).await;
         }
 
-        /// A provider whose reported state generation moves backwards is refused, and
-        /// the refusal is durable: the journal keeps the row deliverable rather than
-        /// recording an effect the host cannot verify.
+        /// A provider whose reported state generation moves backwards is refused,
+        /// and both attempts remain durable unknown effects when the retry cap
+        /// stops delivery without recording an effect the host cannot verify.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_state_generation_that_moved_backwards_is_refused_by_the_mounted_journey() {
             let provider = journey_double(AdversarialScriptV1::always(
                 MisbehaviourV1::StateGenerationBackwards,
             ));
             let temp = TempDir::new().expect("temporary journey root");
+            // The second receipt exhausts the real retry policy atomically.
+            // Waiting for a started attempt can observe it before settlement
+            // or after a later retry, so it cannot establish exactly two receipts.
+            let mut policy = bounded_policy(1_000_000);
+            policy.retention.max_attempts = 2;
             let fixture = mount_adversarial_journey(
                 &temp,
                 "project.adversarial-generation",
                 "profile.adversarial",
                 &provider,
-                bounded_policy(1_000_000),
+                policy,
             )
             .await;
             let baseline = worker_baseline(&fixture);
@@ -7331,7 +7336,13 @@ mod tests {
                 .await;
             fixture.journey.wake_delivery();
 
-            let (state, _, outcome) = wait_for_attempts(&fixture, 2).await;
+            let (state, attempts, outcome) = wait_for_delivery_row(
+                &fixture,
+                |row| row.0 == "exhausted" && fixture.journey.delivery_refusals_total() == 2,
+                "both generation refusals were not settled and published at the retry cap",
+            )
+            .await;
+            assert_eq!(attempts, 2);
             assert_ne!(state, "acknowledged", "outcome={outcome:?}");
             assert_eq!(receipt_count(fixture.journal_path()), 2);
             assert_eq!(attempt_refusals(fixture.journal_path()).len(), 2);

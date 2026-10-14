@@ -974,18 +974,19 @@ fn pin_executable_binding(
     executable_path: &Path,
     artifact_digest: &ManifestDigest,
 ) -> PinnedConfiguration {
-    let observed = payload(
+    let current = payload(
         agent,
         fixture,
-        "configuration observed state",
-        "/application/configuration/configuration_observed_state",
-        &json!({}),
+        "configuration get before pinning",
+        "/application/configuration/configuration_get",
+        &json!({ "key": BINDINGS_KEY }),
     );
-    let base_revision = observed
-        .as_array()
-        .and_then(|components| components.first())
-        .and_then(|component| component["desired_revision_id"].as_str())
-        .unwrap_or_else(|| panic!("configuration observed state: {observed}"))
+    // Activation evidence can still be empty on a fresh mount; the setting's
+    // resolved revision is the authority for the configuration write's CAS.
+    let base_revision = current["revision_id"]
+        .as_str()
+        .filter(|revision| !revision.is_empty())
+        .unwrap_or_else(|| panic!("configuration get before pinning: {current}"))
         .to_owned();
 
     let set = payload(
