@@ -10671,10 +10671,23 @@ async fn resident_memory_graph_refusal_serves_text_and_retries_when_memory_is_gi
         latest.interactive_graph_store().is_err(),
         "a budget-refused native graph must not gain a substitute store"
     );
-    let freshness = registry
-        .dashboard_freshness(fixture.path())
-        .await
-        .expect("mounted worktree freshness");
+    // The text seat can land before the graph activation attempt records its
+    // refusal; wait for the graph to leave `Pending`, then judge it.
+    let deadline = tokio::time::Instant::now() + SERVING_SEAT_FAILURE_CEILING;
+    let freshness = loop {
+        let freshness = registry
+            .dashboard_freshness(fixture.path())
+            .await
+            .expect("mounted worktree freshness");
+        if !matches!(
+            freshness.code_graph_serving,
+            Some(tracedecay_contracts::code_index_freshness::CodeGraphServingReadinessV1::Pending)
+        ) || tokio::time::Instant::now() >= deadline
+        {
+            break freshness;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
     match freshness.code_graph_serving {
         Some(
             tracedecay_contracts::code_index_freshness::CodeGraphServingReadinessV1::Refused {
