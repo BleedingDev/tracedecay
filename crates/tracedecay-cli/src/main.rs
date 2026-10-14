@@ -419,9 +419,24 @@ fn restore_sigpipe_default() -> std::io::Result<()> {
     // before that mode starts worker threads or writes output.
     let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     if previous == libc::SIG_ERR {
-        Err(std::io::Error::last_os_error())
-    } else {
+        return Err(std::io::Error::last_os_error());
+    }
+    // A blocked mask survives exec, and some launchers (macOS test sandboxes
+    // among them) hand SIGPIPE over blocked: the default action then never
+    // runs and the write fails with EPIPE instead. Unblock it on this thread,
+    // which writes the output and whose mask later threads inherit.
+    // SAFETY: `set` is a local signal set initialised by `sigemptyset` before
+    // use, and `pthread_sigmask` only reads it.
+    let unblocked = unsafe {
+        let mut set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        libc::sigemptyset(set.as_mut_ptr());
+        libc::sigaddset(set.as_mut_ptr(), libc::SIGPIPE);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, set.as_ptr(), std::ptr::null_mut())
+    };
+    if unblocked == 0 {
         Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(unblocked))
     }
 }
 
