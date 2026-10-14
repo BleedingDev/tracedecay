@@ -1101,13 +1101,15 @@ async fn packaged_host_ingest_delivers_a_registered_advisory_cycle() {
     // Codex records a turn in its rollout, not in the Stop event, so the
     // project-scoped Stop ingest below has to find a rollout whose `cwd` is
     // this project, exactly the shape the daemon's project scheduler admits.
+    // Each host owns a different native session; sharing the project does not
+    // make Cursor's session a valid Codex session identity.
     let codex_sessions = environment.home().join(".codex/sessions");
     std::fs::create_dir_all(&codex_sessions).unwrap();
     let mut codex_meta: Value = serde_json::from_str(include_str!(
         "../../../../tests/fixtures/provider_normalization/codex/session_meta.input.json"
     ))
     .unwrap();
-    codex_meta["payload"]["id"] = json!("session-advisory-proximity");
+    codex_meta["payload"]["id"] = json!("session-codex-advisory-proximity");
     codex_meta["payload"]["cwd"] = json!(project.clone());
     let codex_message: Value = serde_json::from_str(include_str!(
         "../../../../tests/fixtures/provider_normalization/codex/agent_message.input.json"
@@ -1123,7 +1125,7 @@ async fn packaged_host_ingest_delivers_a_registered_advisory_cycle() {
         "../../../../crates/tracedecay-hooks/fixtures/host_events/codex/stop.json"
     ))
     .unwrap();
-    stop["session_id"] = json!("session-advisory-proximity");
+    stop["session_id"] = json!("session-codex-advisory-proximity");
     stop["turn_id"] = json!("turn-advisory-proximity-stop");
     stop["cwd"] = json!(project.clone());
     stop["model"] = json!("codex-fixture");
@@ -1185,8 +1187,12 @@ async fn packaged_host_ingest_delivers_a_registered_advisory_cycle() {
             );
         } else {
             let stderr = String::from_utf8_lossy(&stop_output.stderr).into_owned();
+            let retryable_refusal =
+                serde_json::from_slice::<Value>(&stop_output.stdout).is_ok_and(|response| {
+                    response["structuredContent"]["problem"]["retryable"] == true
+                });
             assert!(
-                stderr.contains("is warming in the background"),
+                retryable_refusal || stderr.contains("is warming in the background"),
                 "registered daemon stop ingest failed\nstdout:\n{}\nstderr:\n{stderr}\ndaemon log:\n{}",
                 String::from_utf8_lossy(&stop_output.stdout),
                 std::fs::read_to_string(&daemon_log).expect("read isolated advisory daemon log"),

@@ -168,9 +168,9 @@ async fn replay_assembly_terminates_when_existing_summary_sources_contain_cycle(
 
 #[tokio::test]
 async fn threshold_pressure_summarizes_short_huge_active_context() {
-    // No `lcm.summarizer_executables.v1` binding is published for this
-    // profile shard, so the registered cursor-agent summarizer refuses with
-    // its typed unconfigured state instead of resolving a binary from PATH.
+    // This profile shard has no `user.lcm_codex_summarizer.v1` binding, so its
+    // Codex executor reports the typed unconfigured state for Cursor source
+    // messages instead of resolving a binary from PATH.
     let tmp = TempDir::new().unwrap();
     let db = open_lcm_db(&tmp).await;
     insert_session(&db, "cursor", "short-huge").await;
@@ -225,11 +225,10 @@ async fn threshold_pressure_summarizes_short_huge_active_context() {
         "response reason: {}",
         response.reason
     );
-    // The daemon authority resolves auxiliary summaries itself; while the
-    // registered cursor-agent summarizer has no configured executable, the
-    // pending summary stays typed unconfigured instead of asking the host to
-    // fill it.
-    assert_eq!(response.reason, "cursor_agent_unconfigured");
+    // Profile summaries use the configured Codex executor while retaining the
+    // original source provider. An unconfigured executor leaves this summary
+    // pending instead of asking the source host to fill it.
+    assert_eq!(response.reason, "codex_app_server_unconfigured");
     let summary_request = response
         .summary_request
         .expect("threshold pressure should select source messages to summarize");

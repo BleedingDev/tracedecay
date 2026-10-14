@@ -6383,6 +6383,7 @@ mod tests {
             AdversarialScriptV1, HandshakeMisbehaviourV1, MisbehaviourV1, NoPayloadSourceV1,
             ReleaseLatchV1,
         };
+        use tracedecay_memory_observation::{ObservationCommittedEffectV1, ObservationOutcomeV1};
         use tracedecay_memory_provider_registry::MemoryProviderV1;
 
         use super::*;
@@ -7316,9 +7317,9 @@ mod tests {
                 MisbehaviourV1::StateGenerationBackwards,
             ));
             let temp = TempDir::new().expect("temporary journey root");
-            // The second receipt exhausts the real retry policy atomically.
-            // Waiting for a started attempt can observe it before settlement
-            // or after a later retry, so it cannot establish exactly two receipts.
+            // Refused answers remain pending with unknown effects. Once both
+            // provider attempts are consumed, the journal adds its own exhaustion
+            // receipt without dispatching another provider call.
             let mut policy = bounded_policy(1_000_000);
             policy.retention.max_attempts = 2;
             let fixture = mount_adversarial_journey(
@@ -7342,15 +7343,79 @@ mod tests {
                 "both generation refusals were not settled and published at the retry cap",
             )
             .await;
-            assert_eq!(attempts, 2);
+            assert_eq!(attempts, 3);
             assert_ne!(state, "acknowledged", "outcome={outcome:?}");
-            assert_eq!(receipt_count(fixture.journal_path()), 2);
+            assert_eq!(provider.ledger().count_for(ProviderOperation::Observe), 2);
             assert_eq!(attempt_refusals(fixture.journal_path()).len(), 2);
+            let inspection = fixture
+                .journey
+                .journal
+                .inspect(&Default::default())
+                .unwrap();
+            assert_eq!(inspection.rows.len(), 1);
+            let receipts = fixture
+                .journey
+                .journal
+                .receipts_for(&inspection.rows[0].observation_id)
+                .unwrap();
+            assert_eq!(receipts.len(), 3);
+            for (receipt, attempt) in receipts[..2].iter().zip([1, 2]) {
+                assert_eq!(receipt.attempt_number, attempt);
+                assert_eq!(receipt.outcome, ObservationOutcomeV1::EffectUnknown);
+                assert_eq!(
+                    receipt.committed_effect,
+                    ObservationCommittedEffectV1::Unknown
+                );
+                assert_eq!(
+                    receipt.provider_instance_id.as_deref(),
+                    Some(JOURNEY_PROVIDER_INSTANCE_ID)
+                );
+                assert_eq!(receipt.provider_effect_summary.no_effect_reason, None);
+            }
+            let exhaustion = &receipts[2];
+            assert_eq!(exhaustion.attempt_number, 3);
+            assert_eq!(
+                exhaustion.outcome,
+                ObservationOutcomeV1::ProviderUnavailable
+            );
+            assert_eq!(
+                exhaustion.committed_effect,
+                ObservationCommittedEffectV1::None
+            );
+            assert_eq!(exhaustion.provider_instance_id, None);
+            assert_eq!(
+                exhaustion
+                    .provider_effect_summary
+                    .no_effect_reason
+                    .as_deref(),
+                Some("max_delivery_attempts_consumed")
+            );
+            for receipt in &receipts {
+                assert_eq!(receipt.provider_id.as_str(), JOURNEY_PROVIDER_ID);
+                assert_eq!(receipt.registration_revision, 1);
+                assert_eq!(receipt.state_generation_before, None);
+                assert_eq!(receipt.state_generation_after, None);
+                assert_eq!(receipt.provider_receipt_digest, None);
+                assert_eq!(receipt.provider_effect_summary.effect_count, 0);
+                assert!(
+                    receipt
+                        .provider_effect_summary
+                        .stable_memory_refs
+                        .is_empty()
+                );
+                assert!(
+                    receipt
+                        .provider_effect_summary
+                        .provider_trace_refs
+                        .is_empty()
+                );
+            }
             assert_eq!(
                 receipt_outcomes(fixture.journal_path()),
                 vec![
                     ("effect_unknown".to_owned(), "unknown".to_owned()),
                     ("effect_unknown".to_owned(), "unknown".to_owned()),
+                    ("provider_unavailable".to_owned(), "none".to_owned()),
                 ]
             );
             assert_eq!(provider.in_flight(), 0);
