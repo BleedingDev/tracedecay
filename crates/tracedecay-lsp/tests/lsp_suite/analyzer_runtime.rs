@@ -622,15 +622,27 @@ fn fake_lsp_script_with_initial_empty_publish() -> String {
     fake_lsp_script_with_preamble("", INITIAL_EMPTY_THEN_DIAGNOSTIC_PUBLISH)
 }
 
+/// A fake analyzer that records each start as one file under `counter_path`.
+///
+/// One file per start rather than one appended line: two analyzers starting
+/// at once must not share an append, which the Windows CRT implements as
+/// seek-then-write and can lose.
 fn fake_lsp_script_that_records_start(counter_path: &std::path::Path) -> String {
     let preamble = format!(
         r#"
-with open({:?}, "a", encoding="utf-8") as f:
-    f.write("start\n")
+import os, pathlib, time
+_starts = pathlib.Path({:?})
+_starts.mkdir(exist_ok=True)
+(_starts / f"{{os.getpid()}}-{{time.time_ns()}}").write_text("start", encoding="utf-8")
 "#,
         counter_path.display().to_string()
     );
     fake_lsp_script_with_preamble(&preamble, EMPTY_DIAGNOSTIC_PUBLISH)
+}
+
+/// Starts recorded by [`fake_lsp_script_that_records_start`].
+fn start_count(counter_path: &std::path::Path) -> usize {
+    std::fs::read_dir(counter_path).map_or(0, Iterator::count)
 }
 
 fn fake_lsp_script_that_never_initializes() -> &'static str {

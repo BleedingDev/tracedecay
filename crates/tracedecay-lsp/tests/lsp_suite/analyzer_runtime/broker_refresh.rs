@@ -740,8 +740,7 @@ async fn broker_reuses_warm_lsp_client_between_refreshes() {
         .await
         .unwrap();
 
-    let starts = std::fs::read_to_string(counter_path).unwrap();
-    assert_eq!(starts.lines().count(), 1);
+    assert_eq!(super::start_count(&counter_path), 1);
 }
 
 #[tokio::test]
@@ -864,8 +863,7 @@ async fn broker_keys_warm_lsp_clients_by_workspace_root() {
         .await
         .unwrap();
 
-    let starts = std::fs::read_to_string(counter_path).unwrap();
-    assert_eq!(starts.lines().count(), 2);
+    assert_eq!(super::start_count(&counter_path), 2);
 }
 
 #[tokio::test]
