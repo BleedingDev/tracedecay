@@ -1345,9 +1345,18 @@ async fn registered_persistence_failure_releases_only_after_join_and_writer_fenc
     let retained = registered.producer();
     assert!(!retained.shutdown_settled());
     let shutdown = tokio::spawn(registered.shutdown());
-    // Hold the writer past persistence's deadline, then release it within
-    // shutdown's existing budget so its fence can observe transaction closure.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Release the writer only once the worker has joined: its persistence
+    // attempt has then failed against the held writer and shutdown is parked
+    // on the fence, which the release lets observe transaction closure within
+    // shutdown's existing budget. A fixed hold could end before a starved
+    // worker even tried, and the attempt would then succeed.
+    while !retained.shutdown_joined() {
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown finished before the writer was released"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     assert!(!retained.shutdown_settled());
     blocker.commit().await.expect("release registered writer");
     let error = shutdown
