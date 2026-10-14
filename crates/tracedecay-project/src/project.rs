@@ -56,6 +56,12 @@ pub struct TraceDecay {
     /// Set when serving from a fallback (ancestor) DB instead of the exact branch.
     fallback_warning: Option<String>,
     read_only: bool,
+    /// The Context Scout owner a writable open started or reused. The owner
+    /// registry routes lookups to it weakly, so this handle is what keeps the
+    /// owner, and the project database clone it holds, alive.
+    context_scout_owner: Option<
+        Arc<tracedecay_agent_hosts::agents::context_scout::owner::ProjectContextScoutOwnerV1>,
+    >,
     /// The registered test runtime a fixture open went through, kept alive
     /// for as long as the graph is; `None` for every production open.
     #[cfg(any(test, feature = "test-helpers"))]

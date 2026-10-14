@@ -15,6 +15,7 @@ use tracedecay_contracts::retrieval::{
 };
 use tracedecay_contracts::{CancellationSignal, Deadline};
 use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_domain::{ContentDigest, LanguageId};
 
 use crate::McpToolContext;
 use crate::handlers::bounded_search::CancelSearchOnDrop;
@@ -26,6 +27,10 @@ use super::{
     graph_occurrence_id, graph_symbol_corrupt, graph_tool_completion, node_not_found_result,
     required_graph_file_path, required_graph_metadata, single_graph_adjacency_batch, user_line,
 };
+
+/// Most file records one preview consults for sealed digests; the same
+/// ceiling the analysis handlers read file records under.
+const SEALED_FILE_BUDGET: usize = 500_000;
 
 struct PreviewSource {
     text: String,
@@ -175,6 +180,9 @@ struct RenameReferenceSiteInput {
 
 struct PreviewFileWalk {
     project_root: PathBuf,
+    /// Language and sealed content digest of every touched file the graph
+    /// still records, so the walk can read each file in its sealed form.
+    sealed_files: HashMap<String, (LanguageId, ContentDigest)>,
     declaration_line: u32,
     result: RenamePreviewPrimitiveResultV1,
     reference_inputs: Vec<RenameReferenceSiteInput>,
@@ -184,9 +192,11 @@ struct PreviewFileWalk {
 }
 
 impl PreviewFileWalk {
-    fn run(self) -> Result<RenamePreviewPrimitiveResultV1> {
+    fn run(mut self) -> Result<RenamePreviewPrimitiveResultV1> {
         let project_root = self.project_root.clone();
-        with_sealed_form_reader(&project_root, |read_source| self.walk(read_source))
+        let sealed_files = std::mem::take(&mut self.sealed_files);
+        let sealed = |file: &str| sealed_files.get(file).cloned();
+        with_sealed_form_reader(&project_root, &sealed, |read_source| self.walk(read_source))
     }
 
     /// Walks the touched files in the byte form the graph's offsets index:
@@ -364,6 +374,20 @@ pub async fn compute_rename_preview(
     };
 
     let touched_files = unique_file_paths(touched.iter().map(std::string::String::as_str));
+    let sealed_files = {
+        let _span = tracing::trace_span!("mcp.graph.rename_preview.sealed_files").entered();
+        let touched: std::collections::HashSet<&str> =
+            touched_files.iter().map(String::as_str).collect();
+        graph
+            .files(SEALED_FILE_BUDGET)?
+            .into_iter()
+            .filter(|file| touched.contains(file.logical_path.as_str()))
+            .filter_map(|file| {
+                let language = file.language?;
+                Some((file.logical_path, (language, file.content_digest)))
+            })
+            .collect::<HashMap<_, _>>()
+    };
 
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancel_on_drop = CancelSearchOnDrop::new(Arc::clone(&cancelled));
@@ -393,6 +417,7 @@ pub async fn compute_rename_preview(
     };
     let walk = PreviewFileWalk {
         project_root: ctx.project_root().to_path_buf(),
+        sealed_files,
         declaration_line,
         result,
         reference_inputs,

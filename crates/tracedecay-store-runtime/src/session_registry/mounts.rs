@@ -738,6 +738,7 @@ impl DaemonSessionRuntimeRegistryV1 {
         let graph_open_task_key = format!("{shard_id:?}");
         let task_graph = Arc::clone(&graph);
         let task_database = database.clone();
+        let unadmitted_database = database.clone();
         let identity = self.identity.clone();
         let registry = self.registry.clone();
         let graph_registry = self.graph_registry.clone();
@@ -779,6 +780,7 @@ impl DaemonSessionRuntimeRegistryV1 {
                     cancellation,
                 )
                 .await;
+                let mut runtime_bound = false;
                 let state = match opened {
                     Ok(runtime) => {
                         let runtime = Arc::new(runtime);
@@ -786,6 +788,7 @@ impl DaemonSessionRuntimeRegistryV1 {
                             dyn tracedecay_runtime_core::shard_runtime::VerifiedGraphRuntimePortV1,
                         > = runtime.clone();
                         let activation = task_database.bind_memory_graph_runtime(graph_port);
+                        runtime_bound = activation.is_ok();
                         let reconciliation = activation
                             .as_ref()
                             .ok()
@@ -809,6 +812,11 @@ impl DaemonSessionRuntimeRegistryV1 {
                 *task_graph
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+                if !runtime_bound {
+                    // Deferred proxies would otherwise wait on an activation
+                    // that is never coming.
+                    task_database.mark_memory_graph_runtime_unavailable();
+                }
                 if let Some(project_id) = task_project_id
                     && let Err(error) =
                         bind_ready_project_memory_graph(&project_owners, &project_id)
@@ -832,6 +840,7 @@ impl DaemonSessionRuntimeRegistryV1 {
                     database,
                     error: "memory graph open task admission is closed".to_owned(),
                 };
+                unadmitted_database.mark_memory_graph_runtime_unavailable();
             }
         }
         Ok((

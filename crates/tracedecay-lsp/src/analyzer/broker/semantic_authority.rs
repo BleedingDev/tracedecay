@@ -100,13 +100,13 @@ impl StdioLspSemanticAuthority {
         })
     }
 
-    /// Atomic project-scoped lifecycle evidence for doctor, dashboard, and
-    /// other non-LSP callers. The snapshot contains no process or stderr data.
     /// The adapter language this analyzer serves.
     pub fn language(&self) -> &str {
         &self.inner.language
     }
 
+    /// Atomic project-scoped lifecycle evidence for doctor, dashboard, and
+    /// other non-LSP callers. The snapshot contains no process or stderr data.
     pub fn analyzer_readiness(&self) -> AnalyzerSupervisor {
         self.inner.shared.supervisor()
     }

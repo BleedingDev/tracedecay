@@ -196,17 +196,6 @@ async fn lsp_runtime_fixture() -> RuntimeFixture {
         &common::repository_path("tests/fixtures/managed_run_overlay"),
         &project,
     );
-    // The daemon resolves `rust-analyzer` through rustup from the project
-    // root, so the project decides which toolchain's analyzer answers. The
-    // fixture pins the toolchain CI installs the component for; without a
-    // pin, the host's default toolchain answers, and a host image whose
-    // default lacks the component (Windows runners ship a bare stable)
-    // negotiates no analyzer at all.
-    std::fs::copy(
-        common::repository_path("rust-toolchain.toml"),
-        project.join("rust-toolchain.toml"),
-    )
-    .expect("pin the fixture toolchain");
     git(&project, &["init", "--quiet"]);
     git(&project, &["config", "user.name", "TraceDecay Test"]);
     git(
