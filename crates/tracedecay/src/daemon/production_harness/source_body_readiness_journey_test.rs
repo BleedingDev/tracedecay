@@ -45,9 +45,23 @@ async fn source_body_serves_while_the_released_catalog_cannot_rewarm() {
         .await
         .unwrap();
     let store = serving.interactive_graph_store().unwrap();
-    store
-        .warm_interactive_catalog_with_cancellation(None, Arc::new(NeverCancelled))
-        .unwrap();
+    // A background idle release may drop the engine first; that answer is
+    // retryable by contract, so warm until it takes.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match store.warm_interactive_catalog_with_cancellation(None, Arc::new(NeverCancelled)) {
+            Ok(()) => break,
+            Err(
+                tracedecay_code_index::graph_projection::CodeGraphProjectionError::Unavailable(
+                    reason,
+                ),
+            ) if std::time::Instant::now() < deadline => {
+                tracing::debug!(%reason, "catalog warm retried after a background release");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("warm the interactive catalog: {error:?}"),
+        }
+    }
     let node_id = lookup["matches"][0]["id"].as_str().unwrap();
     let occurrence = SymbolOccurrenceId::new(node_id).unwrap();
     // An admitted reader pins the catalog, so release it before retaining the engine.
