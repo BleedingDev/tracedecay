@@ -4621,7 +4621,7 @@ async fn a_disproving_exact_source_probe_withdraws_the_busy_read_witness() {
 async fn a_same_content_successor_pointer_keeps_the_seated_generation_serving() {
     let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
     let store = TempDir::new().expect("store root");
-    let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
+    let (registry, scope) = mounted_core_query_worktree_with_one_permit(&fixture, &store).await;
 
     let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let ready = tokio::time::timeout(SERVING_SEAT_FAILURE_CEILING, async {
@@ -4638,6 +4638,19 @@ async fn a_same_content_successor_pointer_keeps_the_seated_generation_serving() 
     .await
     .expect("the mounted generation becomes ready-decoded");
     let generation_id = ready.generation().manifest().generation_id.clone();
+
+    // Admission parks new passes; the scheduler guard also fences witness
+    // renewal in a completed pass's graph tail through the activation window.
+    let admission = quiesced_background_reconcile_admission(&registry, fixture.path()).await;
+    let scheduler = hold_scheduler_for_root(&registry, fixture.path()).await;
+    assert_eq!(
+        registry
+            .latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
+            .await
+            .map(|ready| ready.generation().manifest().generation_id.clone()),
+        Some(generation_id.clone()),
+        "the predecessor is current before its pointer is superseded"
+    );
 
     // Flip the durable pointer to an unseated successor sealed from the same
     // source content, the exact durable state between a convergence
@@ -4664,6 +4677,8 @@ async fn a_same_content_successor_pointer_keeps_the_seated_generation_serving() 
         "the readiness census reports the same-content predecessor through the activation window"
     );
 
+    scheduler.release().await;
+    drop(admission);
     registry.shutdown().await;
 }
 
@@ -4675,7 +4690,7 @@ async fn a_same_content_successor_pointer_keeps_the_seated_generation_serving() 
 async fn a_different_content_successor_pointer_refuses_the_stale_seat() {
     let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
     let store = TempDir::new().expect("store root");
-    let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
+    let (registry, scope) = mounted_core_query_worktree_with_one_permit(&fixture, &store).await;
 
     let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let ready = tokio::time::timeout(SERVING_SEAT_FAILURE_CEILING, async {
@@ -4692,6 +4707,19 @@ async fn a_different_content_successor_pointer_refuses_the_stale_seat() {
     .await
     .expect("the mounted generation becomes ready-decoded");
     let stale_generation_id = ready.generation().manifest().generation_id.clone();
+
+    // Keep background renewal from restoring the witness after the read
+    // withdraws it, so the assertion observes the read's own disproof.
+    let admission = quiesced_background_reconcile_admission(&registry, fixture.path()).await;
+    let scheduler = hold_scheduler_for_root(&registry, fixture.path()).await;
+    assert_eq!(
+        registry
+            .latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
+            .await
+            .map(|ready| ready.generation().manifest().generation_id.clone()),
+        Some(stale_generation_id.clone()),
+        "the predecessor is current before its pointer is superseded"
+    );
 
     let witness = registry
         .serving_source_witness_for_root(fixture.path())
@@ -4722,6 +4750,8 @@ async fn a_different_content_successor_pointer_refuses_the_stale_seat() {
         "the disproving probe withdraws the busy-read witness"
     );
 
+    scheduler.release().await;
+    drop(admission);
     registry.shutdown().await;
 }
 
