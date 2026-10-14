@@ -172,7 +172,7 @@ mod cadence;
 mod classification;
 mod demand_admission;
 mod freshness_witness;
-pub use freshness_witness::sealed_source_bytes;
+pub use freshness_witness::{sealed_source_bytes, with_sealed_form_reader};
 mod git_tree_capture;
 pub use git_tree_capture::{
     ExactGitTreeSourceV1, NativeCandidateGenerationBindingsV1, NativeCandidateGenerationIdentityV1,

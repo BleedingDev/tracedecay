@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
+use tracedecay_code_index_runtime::code_index_scheduler::with_sealed_form_reader;
 use tracedecay_contracts::graph_tool::{GraphToolCompletionV1, GraphToolResultV1};
 use tracedecay_contracts::retrieval::{
     RenamePreviewNodeV1, RenamePreviewPrimitiveOutcomeV1, RenamePreviewPrimitiveRequestV1,
@@ -183,7 +184,20 @@ struct PreviewFileWalk {
 }
 
 impl PreviewFileWalk {
-    fn run(mut self) -> Result<RenamePreviewPrimitiveResultV1> {
+    fn run(self) -> Result<RenamePreviewPrimitiveResultV1> {
+        let project_root = self.project_root.clone();
+        with_sealed_form_reader(&project_root, |read_source| self.walk(read_source))
+    }
+
+    /// Walks the touched files in the byte form the graph's offsets index:
+    /// the current checkout text, run through the repository's clean
+    /// filters where they apply (a CRLF checkout under `core.autocrlf=true`
+    /// seals LF blobs, and every offset past the first line ending would
+    /// otherwise land one byte early per line).
+    fn walk(
+        mut self,
+        read_source: &mut dyn FnMut(&str) -> std::io::Result<String>,
+    ) -> Result<RenamePreviewPrimitiveResultV1> {
         let mut reference_inputs = self.reference_inputs;
         reference_inputs.sort_unstable_by(|left, right| left.file.cmp(&right.file));
         let mut reference_inputs = reference_inputs.into_iter().peekable();
@@ -199,9 +213,7 @@ impl PreviewFileWalk {
             let has_references = reference_inputs
                 .peek()
                 .is_some_and(|input| input.file == file);
-            let text = match tracedecay_runtime_core::sync::read_source_file(
-                &self.project_root.join(&file),
-            ) {
+            let text = match read_source(&file) {
                 Ok(text) => text,
                 Err(error) if has_references => return Err(error.into()),
                 // Declaration snippets are optional; reference evidence is not.
