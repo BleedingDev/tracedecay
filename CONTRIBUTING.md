@@ -264,11 +264,22 @@ refactor: simplify reference resolver lookup
 
 Keep the first line under 72 characters. Add a body explaining *why* if the change isn't obvious.
 
-Install the local `commit-msg` hook once per checkout:
+Install the local Git hooks once per checkout:
 
 ```bash
 scripts/install-git-hooks.sh
 ```
+
+- `commit-msg` runs commitlint.
+- `pre-commit` rejects whitespace errors in staged changes and rustfmt-formats
+  staged `.rs` files (edition 2024, `rustfmt.toml`).
+- `pre-push` runs `scripts/local-gates.sh pre-push`: rustfmt and whitespace
+  checks on the pushed range, then the cheap Repository gates policy scripts.
+  CI runs the same script, so the lists cannot drift.
+
+The hooks use the pinned toolchain's rustfmt when installed, otherwise the
+newest installed one, and fail when none works. Set `TRACEDECAY_RUSTFMT` to
+choose a binary. Cargo, Clippy, and Bazel checks stay CI-only.
 
 CI validates commit messages with commitlint (`commitlint.config.cjs`):
 

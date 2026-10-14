@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Mutex, RwLock};
@@ -71,7 +71,12 @@ struct MountedContextScoutClaimV1 {
 pub(crate) type ProjectScoutRuntime =
     ContextScoutDurableRuntimeV1<Arc<dyn ContextScoutModelAssistantV1>>;
 
-type ProjectContextScoutOwnerRegistry = BTreeMap<[u8; 16], Arc<ProjectContextScoutOwnerV1>>;
+/// Weak on purpose: the project handles that started or reused an owner keep
+/// it alive (`TraceDecay` retains the `Arc`), and the registry only routes
+/// lookups to it. A strong slot here kept every owner, with its clone of the
+/// project database and that database's reader pool and writer, alive for the
+/// rest of the process after the last handle was dropped without `close`.
+type ProjectContextScoutOwnerRegistry = BTreeMap<[u8; 16], Weak<ProjectContextScoutOwnerV1>>;
 
 pub struct ProjectContextScoutOwnerV1 {
     store: Arc<ProjectContextScoutDurableStoreV1>,
@@ -96,7 +101,7 @@ pub fn lookup_registered_context_scout_owners(
     };
     owners
         .get(&project_id)
-        .cloned()
+        .and_then(Weak::upgrade)
         .map(|owner| vec![owner])
         .unwrap_or_default()
 }
@@ -125,7 +130,9 @@ pub fn unregister_registered_context_scout_owner(
     let Ok(mut owners) = registered_context_scout_owners().lock() else {
         return ContextScoutOwnerUnregisterOutcomeV1::Vacant;
     };
-    let Some(existing) = owners.get(&project_id) else {
+    let Some(existing) = owners.get(&project_id).and_then(Weak::upgrade) else {
+        // A dead slot's owner already ended with its last handle.
+        owners.remove(&project_id);
         return ContextScoutOwnerUnregisterOutcomeV1::Vacant;
     };
     if !tracedecay_runtime_core::path_safety::same_canonical_path(
@@ -174,12 +181,12 @@ impl ProjectContextScoutOwnerV1 {
             claim_authorities: RwLock::new(Vec::new()),
         });
         let mut owners = registered_context_scout_owners().lock().ok()?;
-        if let Some(existing) = owners.get(&project_id)
+        if let Some(existing) = owners.get(&project_id).and_then(Weak::upgrade)
             && existing.binds_database(owner.store.database())
         {
-            return Some(Arc::clone(existing));
+            return Some(existing);
         }
-        owners.insert(project_id, Arc::clone(&owner));
+        owners.insert(project_id, Arc::downgrade(&owner));
         Some(owner)
     }
 

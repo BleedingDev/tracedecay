@@ -1982,46 +1982,37 @@ impl ProjectOpenInputs<'_> {
     }
 
     /// Code reads (primitives and callable code) on a route whose full
-    /// upgrade a reset-required session store refused. A refusal to mount
-    /// them leaves those reads answering the store's reset refusal.
+    /// upgrade a reset-required session store refused. The error is the
+    /// caller's to settle: without these owners the route cannot honestly
+    /// publish the refusal those reads are exempt from.
     async fn register_reset_required_code_reads(
         &self,
+        opened: &OpenedProjectGraph,
         core: &ComposedCoreServer,
         resolved: &Arc<crate::mcp::McpServer>,
-    ) {
-        let registered = match tracedecay_domain::ProjectId::new(core.project_id.clone()) {
-            Ok(project_id) => match core
-                .graph_runtime
-                .mounted_project_session_store(&project_id)
-                .await
-            {
-                Some(session_store) => {
-                    Box::pin(
-                        project_open_owners::register_reset_required_route_code_read_owners(
-                            self.invocation,
-                            self.canonical_project_path,
-                            &core.project_id,
-                            resolved,
-                            session_store,
-                        ),
-                    )
-                    .await
-                }
-                None => Err(TraceDecayError::Config {
-                    message: "the project session store is not mounted".to_owned(),
-                }),
-            },
-            Err(error) => Err(TraceDecayError::Config {
-                message: format!("invalid project identity: {error}"),
-            }),
-        };
-        if let Err(error) = registered {
-            self.log_phase(
-                "reset_required_code_reads_unavailable",
-                Some(("error", error.to_string())),
-                self.started,
-            );
-        }
+    ) -> Result<()> {
+        // A store held reset-required still serves its configuration
+        // authority, which is the mounting authority these owners need. The
+        // mounted-store peek is not that authority: it answers `None` until
+        // the project owner is Ready, so it races this attempt's own session
+        // store settlement and leaves the primitives unowned.
+        let session_store = self
+            .store_administration
+            .registered_project_configuration_database(
+                opened.cg.project_root(),
+                opened.cg.store_layout(),
+            )
+            .await?;
+        Box::pin(
+            project_open_owners::register_reset_required_route_code_read_owners(
+                self.invocation,
+                self.canonical_project_path,
+                &core.project_id,
+                resolved,
+                session_store,
+            ),
+        )
+        .await
     }
 
     /// The retained core answers Doctor over every store it still serves:
@@ -2103,14 +2094,52 @@ impl ProjectOpenInputs<'_> {
         }
         if core_retained {
             let reset_refusal = tracedecay_mcp::reset_required_detail(&error);
+            // A session store in its typed reset-required state keeps the
+            // full upgrade refused until the operator resets it, so the
+            // retained core serves the code index meanwhile. Those owners are
+            // registered before the publication records the refusal: a
+            // primitive invocation that reads the refusal while its owner is
+            // merely not registered yet would answer that terminal refusal
+            // instead of the retryable mounting state.
+            let reset_required_reads_registered = if reset_refusal.is_some() {
+                let code_index_status = self.activate_code_index(core);
+                let registered =
+                    Box::pin(self.register_reset_required_code_reads(opened, core, resolved)).await;
+                Box::pin(self.publish_reset_required_doctor_report(opened, core, resolved)).await;
+                self.log_phase(
+                    "full_upgrade_reset_required",
+                    Some(("code_index", code_index_status.to_owned())),
+                    self.started,
+                );
+                match registered {
+                    Ok(()) => true,
+                    Err(error) => {
+                        self.log_phase(
+                            "reset_required_code_reads_unavailable",
+                            Some(("error", error.to_string())),
+                            self.started,
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
             if let Some(attempt) = &activation.publication_attempt {
                 let project_runtimes = &self.invocation.service.project_runtimes;
                 match &reset_refusal {
-                    Some(refusal) => {
-                        project_runtimes.mark_publication_reset_required(attempt, refusal.clone())
+                    Some(refusal) if reset_required_reads_registered => {
+                        project_runtimes.mark_publication_reset_required(attempt, refusal.clone());
                     }
-                    None => project_runtimes.mark_publication_failed(attempt),
-                };
+                    // The refusal is only the honest answer once the code
+                    // reads it exempts are owned. Unowned, it would be the
+                    // only answer a primitive could get, so the publication
+                    // stays warming and admission retries the open.
+                    Some(_) => {}
+                    None => {
+                        project_runtimes.mark_publication_failed(attempt);
+                    }
+                }
             }
             if let Some(failed_full_server) = failed_full_server {
                 failed_full_server.revoke_project_server_responses();
@@ -2121,19 +2150,6 @@ impl ProjectOpenInputs<'_> {
                     None,
                 )
                 .await;
-            }
-            // A session store in its typed reset-required state keeps the
-            // full upgrade refused until the operator resets it, so the
-            // retained core serves the code index meanwhile.
-            if reset_refusal.is_some() {
-                let code_index_status = self.activate_code_index(core);
-                Box::pin(self.register_reset_required_code_reads(core, resolved)).await;
-                Box::pin(self.publish_reset_required_doctor_report(opened, core, resolved)).await;
-                self.log_phase(
-                    "full_upgrade_reset_required",
-                    Some(("code_index", code_index_status.to_owned())),
-                    self.started,
-                );
             }
             self.log_phase(
                 "full_upgrade_degraded",

@@ -3,10 +3,11 @@
 
 import json
 import os
-import select
+import queue
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 
@@ -54,13 +55,36 @@ def turn_start_response(message, thread_id):
     return turn_id
 
 
+_LINE_QUEUES = {}
+
+
+def _line_queue(stdout):
+    # select() only accepts sockets on Windows, so a reader thread drains the
+    # pipe one frame per readline() on every platform; an empty line is EOF.
+    lines = _LINE_QUEUES.get(stdout)
+    if lines is None:
+        lines = queue.Queue()
+
+        def pump():
+            while True:
+                line = stdout.readline()
+                lines.put(line)
+                if not line:
+                    return
+
+        threading.Thread(target=pump, daemon=True).start()
+        _LINE_QUEUES[stdout] = lines
+    return lines
+
+
 def _receive_until(stdout, parse, label):
     deadline = time.monotonic() + 15
+    lines = _line_queue(stdout)
     while time.monotonic() < deadline:
-        readable, _, _ = select.select([stdout], [], [], 0.25)
-        if not readable:
+        try:
+            line = lines.get(timeout=0.25)
+        except queue.Empty:
             continue
-        line = stdout.readline()
         if not line:
             raise RuntimeError(f"app-server closed stdout while waiting for {label}")
         value = parse(json.loads(line))
@@ -75,9 +99,7 @@ def run_app_server(binary, cwd):
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        # Unbuffered stdout reads one frame per readline(). A buffered reader
-        # would keep later frames from the same pipe write where select()
-        # cannot see them.
+        # Unbuffered stdout reads one frame per readline().
         bufsize=0,
         env={"HOME": os.environ["HOME"], "PATH": os.environ["PATH"]},
         cwd=cwd,

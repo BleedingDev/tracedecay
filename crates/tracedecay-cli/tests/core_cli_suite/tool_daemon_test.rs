@@ -2070,12 +2070,23 @@ fn configuration_tool_cli_persists_effects_and_fails_on_stale_cas() {
         "configuration_set",
         mutation.clone(),
     );
-    let advanced = configuration_tool_success(
-        &home_path,
-        &project_path,
-        "configuration_observed_state",
-        json!({}),
-    );
+    // The runtime records its configuration activation asynchronously, so
+    // the observed state can briefly list no components after the set.
+    let deadline = Instant::now() + CLI_ROUNDTRIP_TIMEOUT;
+    let advanced = loop {
+        let advanced = configuration_tool_success(
+            &home_path,
+            &project_path,
+            "configuration_observed_state",
+            json!({}),
+        );
+        if advanced["outcome"]["value"]["payload"][0]["desired_revision_id"].is_string()
+            || Instant::now() >= deadline
+        {
+            break advanced;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
     let advanced_revision = advanced["outcome"]["value"]["payload"][0]["desired_revision_id"]
         .as_str()
         .expect("advanced configuration revision")
@@ -2407,15 +2418,18 @@ fn doctor_renders_the_daemon_canonical_findings_the_dashboard_serves() {
         .unwrap_or_else(|| panic!("dashboard launch URL is not loopback HTTP: {launch_url}"));
     let findings_url = format!("http://tracedecay:{token}@{authority}/api/doctor/findings");
 
-    // Live producers (table-growth sampling) may settle between reads, so the
-    // comparison is taken once the route answers the same identity on both
-    // sides of the CLI read.
+    // Live producers (table-growth sampling) may settle between reads, and
+    // Doctor's zero-wait health reader honestly reports partial coverage
+    // whenever the store-size sampler holds it. The comparison is taken once
+    // the route and the CLI answer the same identity in one settled window; a
+    // divergence that persists across every attempt still fails below.
     for _ in 0..3 {
         let before = doctor_route_findings(&findings_url);
         let (code, document, stderr) = doctor_json(&home_path, &project_path);
         let after = doctor_route_findings(&findings_url);
-        if doctor_finding_identities(&before["payload"])
-            != doctor_finding_identities(&after["payload"])
+        let settled = doctor_finding_identities(&before["payload"]);
+        if settled != doctor_finding_identities(&after["payload"])
+            || settled != doctor_finding_identities(&document["daemon_findings"]["payload"])
         {
             continue;
         }
@@ -2469,7 +2483,9 @@ fn doctor_renders_the_daemon_canonical_findings_the_dashboard_serves() {
         );
         return;
     }
-    panic!("/api/doctor/findings never answered the same findings twice in a row");
+    panic!(
+        "Doctor and /api/doctor/findings never answered the same findings in one settled window"
+    );
 }
 
 /// With no daemon listening, Doctor still runs its binary-local checks and

@@ -151,13 +151,18 @@ impl ProviderStateAuthorityV1 {
     /// Binds the host-owned root every grant sits under.
     ///
     /// The root must be absolute and free of `.`, `..`, and other non-normal
-    /// components: a root a caller could re-interpret is not a root.
+    /// components: a root a caller could re-interpret is not a root. A Windows
+    /// drive or UNC prefix (`C:`, `\\?\C:`) is part of an absolute root; the
+    /// path API only ever yields it as the first component.
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, ProviderStateAuthorityError> {
         let root = root.into();
         let normalized = root.is_absolute()
-            && root
-                .components()
-                .all(|component| matches!(component, Component::RootDir | Component::Normal(_)));
+            && root.components().all(|component| {
+                matches!(
+                    component,
+                    Component::Prefix(_) | Component::RootDir | Component::Normal(_)
+                )
+            });
         if !normalized {
             return Err(ProviderStateAuthorityError::RootUnusable { path: root });
         }

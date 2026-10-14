@@ -124,7 +124,11 @@ struct Fixture {
 }
 
 fn fixture(name: &str) -> Fixture {
-    let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("hydration-{name}"));
+    // Build tools may hand over a relative target tmpdir (Bazel on Windows);
+    // the evidence scope only admits an absolute worktree root.
+    let base = std::path::absolute(env!("CARGO_TARGET_TMPDIR"))
+        .expect("absolute target tmpdir")
+        .join(format!("hydration-{name}"));
     let _ = fs::remove_dir_all(&base);
     let root = base.join("worktree");
     let outside = base.join("other-worktree");

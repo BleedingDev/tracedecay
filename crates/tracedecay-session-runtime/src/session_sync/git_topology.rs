@@ -23,6 +23,10 @@ use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 
 use super::{DaemonSessionSyncService, SessionSyncProjectContext, work::SessionSyncInterruption};
 
+/// How often a git sync re-checks a project memory graph that is still
+/// activating.
+const GRAPH_ACTIVATION_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GitTopologySyncFailure {
     Stale,
@@ -64,6 +68,20 @@ impl SessionSyncProjectContext {
         let Some(runtime) = project_sessions.project_graph_runtime() else {
             return GitTopologySyncOutcome::Finished(Err(GitTopologySyncFailure::Unavailable));
         };
+        // The project memory graph binds to project sessions from a background
+        // task that project open does not await, so a sync admitted right
+        // after the mount can run before the declared authority exists. The
+        // authority is mounting, not missing: wait for the binding under the
+        // request's own deadline and interruptions instead of failing.
+        while !runtime.activation_completed() {
+            tokio::select! {
+                biased;
+                interruption = service.wait_for_interruption(request) => {
+                    return GitTopologySyncOutcome::Interrupted(interruption);
+                }
+                () = tokio::time::sleep(GRAPH_ACTIVATION_POLL) => {}
+            }
+        }
         let runtime: Arc<dyn VerifiedGraphRuntimePortV1> = Arc::new(runtime.clone());
         let scope_sets = match project_sessions.authorized_scope_set_storage() {
             Ok(scope_sets) => scope_sets,

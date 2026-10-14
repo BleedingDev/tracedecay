@@ -409,6 +409,7 @@ impl TraceDecay {
             read_only: false,
             #[cfg(any(test, feature = "test-helpers"))]
             test_runtime_guard: None,
+            context_scout_owner: None,
             _standalone_maintenance_scope: None,
         };
         // First-touch parity with the registered open path: daemon warm-up
@@ -426,7 +427,7 @@ impl TraceDecay {
         if let Some(project_id) =
             tracedecay_agent_hosts::hooks::hook_project_id_for_layout(&ts.store_layout)
         {
-            let _ = tracedecay_agent_hosts::agents::context_scout::owner::ProjectContextScoutOwnerV1::startup(
+            ts.context_scout_owner = tracedecay_agent_hosts::agents::context_scout::owner::ProjectContextScoutOwnerV1::startup(
                 ts.db.clone(),
                 project_id,
                 tracedecay_runtime_core::tracedecay::utc_now_or_one(),
@@ -647,6 +648,7 @@ impl TraceDecay {
             read_only: false,
             #[cfg(any(test, feature = "test-helpers"))]
             test_runtime_guard: None,
+            context_scout_owner: None,
             _standalone_maintenance_scope: None,
         };
 
@@ -664,7 +666,7 @@ impl TraceDecay {
         if let Some(project_id) =
             tracedecay_agent_hosts::hooks::hook_project_id_for_layout(&ts.store_layout)
         {
-            let _ = tracedecay_agent_hosts::agents::context_scout::owner::ProjectContextScoutOwnerV1::startup(
+            ts.context_scout_owner = tracedecay_agent_hosts::agents::context_scout::owner::ProjectContextScoutOwnerV1::startup(
                 ts.db.clone(),
                 project_id,
                 tracedecay_runtime_core::tracedecay::utc_now_or_one(),
@@ -848,6 +850,7 @@ impl TraceDecay {
             read_only: true,
             #[cfg(any(test, feature = "test-helpers"))]
             test_runtime_guard: None,
+            context_scout_owner: None,
             _standalone_maintenance_scope: None,
         })
     }

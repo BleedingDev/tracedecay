@@ -1455,9 +1455,12 @@ mod tests {
     fn unbounded_snapshot_captures_a_listing_beyond_the_default_read_limit() {
         let (directory, _assembler, _runner) = repository_fixture();
         let blob = git_value(directory.path(), &["rev-parse", "HEAD:packet.txt"]);
-        let segment = "d".repeat(240);
+        // Over the 16 MiB default read limit in total, while each absolute
+        // path stays inside macOS's 1024-byte PATH_MAX so Git can still lstat
+        // the (deleted) working-tree entries.
+        let segment = "d".repeat(100);
         let mut index_info = String::new();
-        for entry in 0..18_000 {
+        for entry in 0..45_000 {
             std::fmt::Write::write_fmt(
                 &mut index_info,
                 format_args!("100644 {blob}\t{segment}/{segment}/{segment}/{segment}/{entry}\n"),

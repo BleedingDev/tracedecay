@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Runs the cheap Repository gates checks (rustfmt and whitespace on the pushed
+# range, then the repository policy scripts) before anything leaves the machine.
+# The same entrypoint runs in CI, so the lists cannot drift.
+set -euo pipefail
+exec "$(git rev-parse --show-toplevel)/scripts/local-gates.sh" pre-push

@@ -240,12 +240,17 @@ impl IsolatedCli {
     fn new() -> Self {
         // The native macOS per-user temp path leaves insufficient space for
         // the profile's Unix socket; keep the isolated home under short /tmp.
-        let home = if cfg!(target_os = "macos") {
-            TempDir::new_in(fs::canonicalize("/tmp").unwrap()).unwrap()
-        } else {
-            TempDir::new().unwrap()
+        // The project shares that base: registration refuses a project under
+        // the OS temporary directory paired with a profile outside it.
+        let scratch_dir = || {
+            if cfg!(target_os = "macos") {
+                TempDir::new_in(fs::canonicalize("/tmp").unwrap()).unwrap()
+            } else {
+                TempDir::new().unwrap()
+            }
         };
-        let project = TempDir::new().unwrap();
+        let home = scratch_dir();
+        let project = scratch_dir();
         let profile = home.path().join(".tracedecay-test-profile");
         let bin_dir = home.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();

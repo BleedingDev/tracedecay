@@ -2713,6 +2713,17 @@ fn native_message_search(
     .expect("typed canonical message search")
 }
 
+/// Path spelling for comparison: Windows paths are case-insensitive and take
+/// either separator, so `c:/repo` and `C:\repo` name the same root there.
+fn host_path_key(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) {
+        tracedecay_domain::forward_slash_text(&text).to_lowercase()
+    } else {
+        text.into_owned()
+    }
+}
+
 fn assert_native_search_hits(
     journey: &ClaudeHostJourney,
     project: &Path,
@@ -2755,14 +2766,21 @@ fn assert_native_search_hits(
     assert_eq!(hits.len(), expected.len());
     assert!(hits.len() <= 5);
     hits.sort_by(|left, right| left.message.message_id.cmp(&right.message.message_id));
-    let project = fs::canonicalize(project).expect("canonical project root");
+    // Native location metadata keeps the path the host reported verbatim;
+    // only the registered root is canonical (macOS `/var` -> `/private/var`).
+    let native_project = project.to_string_lossy().into_owned();
+    let project = tracedecay_runtime_core::path_safety::canonical_existing_identity(project)
+        .expect("canonical project root");
     let project_id = journey.project_id();
     for (hit, expected) in hits.iter().zip(expected) {
         assert_eq!(hit.session.provider, provider);
         assert_eq!(hit.session.session_id, journey.session_id());
         assert_eq!(hit.session.project_key, project_id);
         if journey.codex {
-            assert_eq!(Path::new(&hit.session.project_path), project);
+            assert_eq!(
+                host_path_key(Path::new(&hit.session.project_path)),
+                host_path_key(&project)
+            );
         } else {
             // Claude's canonical projection stores its registered project ID
             // in both identity fields and keeps native paths in row metadata.
@@ -2774,14 +2792,8 @@ fn assert_native_search_hits(
                     .expect("Claude native location metadata"),
             )
             .expect("canonical Claude location metadata");
-            assert_eq!(
-                metadata["claude_session_cwd"],
-                project.to_string_lossy().as_ref()
-            );
-            assert_eq!(
-                metadata["claude_session_worktree"],
-                project.to_string_lossy().as_ref()
-            );
+            assert_eq!(metadata["claude_session_cwd"], native_project.as_str());
+            assert_eq!(metadata["claude_session_worktree"], native_project.as_str());
         }
         assert_eq!(hit.message.provider, provider);
         assert_eq!(hit.message.session_id, journey.session_id());

@@ -1111,10 +1111,12 @@ mod tests {
             _scope: &HostEvidenceScopeV1,
             relative_path: &Path,
         ) -> Result<u64, HostEvidenceLookupErrorV1> {
-            let key = relative_path.to_string_lossy().into_owned();
+            // Compared as paths: the authority rebuilds the claim from its
+            // components, which Windows spells with `\`.
             self.0
-                .get(&key)
-                .copied()
+                .iter()
+                .find(|(key, _)| Path::new(key.as_str()) == relative_path)
+                .map(|(_, lines)| *lines)
                 .ok_or(HostEvidenceLookupErrorV1::NotFound)
         }
     }
@@ -1169,7 +1171,11 @@ mod tests {
             "profile.hydration",
             resolved_scope("project.hydration"),
             SESSION,
-            "/mounted/worktree",
+            if cfg!(windows) {
+                r"C:\mounted\worktree"
+            } else {
+                "/mounted/worktree"
+            },
         )
         .expect("host evidence scope")
     }

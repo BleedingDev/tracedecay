@@ -48,10 +48,21 @@ async fn files_for_session(
             },
         })),
     };
-    server
-        .handle_request(&request)
-        .await
-        .expect("files response")
+    // A background idle release can leave the graph re-warming between the
+    // readiness wait and this call; that problem is retryable by contract.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let response = server
+            .handle_request(&request)
+            .await
+            .expect("files response");
+        let rewarming = serde_json::to_string(&response)
+            .is_ok_and(|text| text.contains("code-graph-unavailable"));
+        if !rewarming || std::time::Instant::now() >= deadline {
+            return response;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 }
 
 #[cfg(unix)]

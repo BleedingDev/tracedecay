@@ -882,6 +882,65 @@ pub fn sealed_source_bytes(
     Ok((content_digest(&sanitized) == *sealed).then_some(sanitized))
 }
 
+/// Reads checkout files as the text the graph's byte offsets index.
+///
+/// A generation seals one of two forms of a tracked file: HEAD's blob for a
+/// clean tree, or the disk bytes for a dirty one. Under clean filters
+/// (`core.autocrlf=true` over CRLF sources) the two differ by one byte per
+/// line ending, so every sealed offset past the first line ending points
+/// elsewhere in the other form. The reader takes the current disk text, and
+/// when `sealed` knows the file's language and sealed digest it keeps the
+/// form whose sanitized digest matches: the disk text as it is, or the disk
+/// text run through the repository's own clean filters. Neither matching
+/// means the file changed since the generation; the filtered form is then
+/// the better guess for a tracked file, and edits stay visible either way.
+/// Files the index does not track, and checkouts without a usable
+/// repository, read as they are on disk.
+///
+/// The repository and its filter pipeline open once for every reader, so a
+/// walk over many files pays the open once.
+pub fn with_sealed_form_reader<R>(
+    project_root: &Path,
+    sealed: &dyn Fn(&str) -> Option<(LanguageId, ContentDigest)>,
+    walk: impl FnOnce(&mut dyn FnMut(&str) -> std::io::Result<String>) -> R,
+) -> R {
+    let repository = tracedecay_runtime_core::git_open::open(project_root).ok();
+    let mut filters = repository
+        .as_ref()
+        .and_then(|repository| repository.filter_pipeline(None).ok());
+    let mut read = |logical_path: &str| -> std::io::Result<String> {
+        let text =
+            tracedecay_runtime_core::sync::read_source_file(&project_root.join(logical_path))?;
+        let sealed = sealed(logical_path);
+        let matches_sealed = |bytes: &[u8]| {
+            sealed.as_ref().is_some_and(|(language, digest)| {
+                privacy::sanitize_code_file(language, bytes)
+                    .is_ok_and(|(sanitized, _, _)| content_digest(&sanitized) == *digest)
+            })
+        };
+        if matches_sealed(text.as_bytes()) {
+            return Ok(text);
+        }
+        let Some((pipeline, index)) = filters.as_mut() else {
+            return Ok(text);
+        };
+        if index.entry_by_path(BStr::new(logical_path)).is_none() {
+            return Ok(text);
+        }
+        let Ok(mut converted) =
+            pipeline.convert_to_git(text.as_bytes(), Path::new(logical_path), index)
+        else {
+            return Ok(text);
+        };
+        let mut bytes = Vec::new();
+        if converted.read_to_end(&mut bytes).is_err() {
+            return Ok(text);
+        }
+        Ok(String::from_utf8(bytes).unwrap_or(text))
+    };
+    walk(&mut read)
+}
+
 /// What the last completed reconcile proved the worktree's source to be, in
 /// the two forms a later probe consults: the stat signature as the negative
 /// cache and the generation's sealed file digests as the proof.

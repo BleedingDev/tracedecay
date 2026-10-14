@@ -9129,13 +9129,20 @@ async fn serving_seat_wake_arrives_only_after_the_slot_is_seated() {
         .await
         .expect("seating wakes its waiters instead of leaving them to poll")
         .expect("the seating channel stays open while the registry lives");
-    assert!(
-        registry
-            .latest_complete_serving_for_test(fixture.path())
-            .await
-            .is_some(),
-        "a seat wake must not fire before the serving slot holds the generation"
-    );
+    // The counter also moves when the parked worker later releases the seat,
+    // and a watch coalesces both into one wake. Read the slot, then the
+    // counter: while it still reads the single seating, an empty slot can only
+    // mean the wake fired before the slot held the generation.
+    let seated = registry
+        .latest_complete_serving_for_test(fixture.path())
+        .await
+        .is_some();
+    if *seats.borrow_and_update() == 1 {
+        assert!(
+            seated,
+            "a seat wake must not fire before the serving slot holds the generation"
+        );
+    }
     registry.shutdown().await;
 }
 
@@ -10671,10 +10678,23 @@ async fn resident_memory_graph_refusal_serves_text_and_retries_when_memory_is_gi
         latest.interactive_graph_store().is_err(),
         "a budget-refused native graph must not gain a substitute store"
     );
-    let freshness = registry
-        .dashboard_freshness(fixture.path())
-        .await
-        .expect("mounted worktree freshness");
+    // The text seat can land before the graph activation attempt records its
+    // refusal; wait for the graph to leave `Pending`, then judge it.
+    let deadline = tokio::time::Instant::now() + SERVING_SEAT_FAILURE_CEILING;
+    let freshness = loop {
+        let freshness = registry
+            .dashboard_freshness(fixture.path())
+            .await
+            .expect("mounted worktree freshness");
+        if !matches!(
+            freshness.code_graph_serving,
+            Some(tracedecay_contracts::code_index_freshness::CodeGraphServingReadinessV1::Pending)
+        ) || tokio::time::Instant::now() >= deadline
+        {
+            break freshness;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
     match freshness.code_graph_serving {
         Some(
             tracedecay_contracts::code_index_freshness::CodeGraphServingReadinessV1::Refused {

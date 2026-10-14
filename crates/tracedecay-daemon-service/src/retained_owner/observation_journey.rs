@@ -6397,11 +6397,6 @@ mod tests {
         /// snapshot instead of a bare timeout.
         const SETTLEMENT_BUDGET: Duration = Duration::from_secs(20);
 
-        /// The double's blocking hold, chosen far above every host bound in this
-        /// module so "the host answered at its own bound" is never an accident of the
-        /// provider finishing early.
-        const BLOCK_MILLIS: u64 = 5_000;
-
         /// The hold used when the point is the provider *ignoring* cancellation: long
         /// enough that the host's per-attempt bound and its whole shutdown budget both
         /// expire while the call is still inside the provider, short enough that the
@@ -6978,10 +6973,12 @@ mod tests {
         /// the provider.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_provider_that_hangs_past_the_attempt_budget_does_not_park_the_delivery_worker() {
+            // The hold ends when the test says so, not after a wall-clock span: a
+            // loaded runner must not let the provider answer before the host's
+            // retry is observed.
+            let release = tracedecay_memory_conformance::ReleaseLatchV1::new();
             let provider = journey_double(AdversarialScriptV1::always(
-                MisbehaviourV1::BlocksPastDeadline {
-                    block_millis: BLOCK_MILLIS,
-                },
+                MisbehaviourV1::NeverRepliesUntilReleased(release.clone()),
             ));
             let temp = TempDir::new().expect("temporary journey root");
             let fixture = mount_adversarial_journey(
@@ -7068,9 +7065,9 @@ mod tests {
             every_refusal_is_classified(&fixture);
 
             // Shutdown is the host's own statement about its worker: with the
-            // delivery thread free it quiesces well inside a budget far shorter
-            // than the provider's five-second hold. A worker parked in the
-            // provider reports `WorkerDeadline` here instead.
+            // delivery thread free it quiesces inside its budget while the
+            // provider still holds the call. A worker parked in the provider
+            // reports `WorkerDeadline` here instead.
             let failures = shutdown_within(&fixture.journey, Duration::from_secs(2)).await;
             assert!(
                 failures.is_empty(),
@@ -7099,6 +7096,7 @@ mod tests {
                 "the host parked {parked_at_peak} threads in the provider, past its own \
                  ceiling of {MAX_ABANDONED_PROVIDER_CALLS}"
             );
+            release.release();
             wait_for_provider_idle(&provider, &fixture).await;
             wait_for_census(&fixture, baseline).await;
         }

@@ -228,7 +228,7 @@ impl TraceDecay {
             tracedecay_runtime_core::worktree::detached_worktree_graph_scope(project_root)
                 .as_deref()
                 == Some(branch_name);
-        let graph = Self {
+        let mut graph = Self {
             db,
             profile_database,
             store_runtime_registry: runtime_registry,
@@ -246,12 +246,13 @@ impl TraceDecay {
             read_only,
             #[cfg(any(test, feature = "test-helpers"))]
             test_runtime_guard: None,
+            context_scout_owner: None,
             _standalone_maintenance_scope: None,
         };
         if let Some(project_id) =
             tracedecay_agent_hosts::hooks::hook_project_id_for_layout(&graph.store_layout)
         {
-            let _ = tracedecay_agent_hosts::agents::context_scout::owner::ProjectContextScoutOwnerV1::startup(
+            graph.context_scout_owner = tracedecay_agent_hosts::agents::context_scout::owner::ProjectContextScoutOwnerV1::startup(
                 graph.db.clone(),
                 project_id,
                 tracedecay_runtime_core::tracedecay::utc_now_or_one(),
