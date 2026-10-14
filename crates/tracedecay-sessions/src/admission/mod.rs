@@ -947,6 +947,7 @@ pub(crate) mod test_support {
         cancel_on_discovery_queue_read: Arc<Mutex<Option<ObservationCancellation>>>,
         session_backfill_page_pause: Arc<Mutex<Option<SessionBackfillPagePause>>>,
         deterministic_capture_refusal: Arc<Mutex<Option<&'static str>>>,
+        parse_offset_write_failure: Arc<Mutex<Option<(HostAdmissionOutcome, bool)>>>,
     }
 
     impl MemoryHostAdmission {
@@ -961,6 +962,18 @@ pub(crate) mod test_support {
 
         pub(crate) fn fail_next_capture(&self) {
             self.store.state().capture_failures_remaining = 1;
+        }
+
+        pub(crate) fn fail_next_parse_offset_write(
+            &self,
+            outcome: HostAdmissionOutcome,
+            persisted_before_failure: bool,
+        ) {
+            *self
+                .parse_offset_write_failure
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) =
+                Some((outcome, persisted_before_failure));
         }
 
         /// Refuse every capture the way a deterministic content refusal does:
@@ -1472,6 +1485,14 @@ pub(crate) mod test_support {
             offset: ParseOffset,
         ) -> AdmissionFuture<'a, ()> {
             Box::pin(async move {
+                let failure = self
+                    .parse_offset_write_failure
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take();
+                if let Some((outcome, false)) = &failure {
+                    return Err(outcome.clone());
+                }
                 let mut state = self.store.state();
                 state
                     .parse_offsets
@@ -1481,6 +1502,9 @@ pub(crate) mod test_support {
                 state
                     .parse_offsets
                     .push((scope.clone(), path.to_owned(), offset));
+                if let Some((outcome, true)) = failure {
+                    return Err(outcome);
+                }
                 Ok(())
             })
         }

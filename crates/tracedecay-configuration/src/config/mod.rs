@@ -578,9 +578,11 @@ mod memory_provider_snapshot_tests {
             disabled.memory_provider_ncm_observer,
             MemoryProviderNcmObserverV1::default()
         );
+        // Absolute on the host: a rooted Unix literal has no drive on Windows.
+        let root = PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" });
         let observer = MemoryProviderNcmObserverV1::Enabled {
-            worker_binary: PathBuf::from("/opt/tracedecay/tracedecay-ncm-worker"),
-            state_root: PathBuf::from("/var/lib/tracedecay/ncm"),
+            worker_binary: root.join("opt/tracedecay/tracedecay-ncm-worker"),
+            state_root: root.join("var/lib/tracedecay/ncm"),
         };
         let value = ConfigurationValueV1::Text(serde_json::to_string(&observer).unwrap());
         let selected = runtime_config_from_snapshot(&snapshot_with(

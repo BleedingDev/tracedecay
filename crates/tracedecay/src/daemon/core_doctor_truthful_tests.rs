@@ -93,11 +93,12 @@ async fn live_runtime_snapshot_does_not_fabricate_store_metadata_after_observati
         "core-doctor-missing-live-store-metadata",
     )
     .expect("enter daemon database scope");
-    let graph = super::super::open_project_for_handshake(
+    let graph = super::super::open_project_for_handshake_with_hook_recovery(
         &project,
         &handshake,
         &store_administration,
         &CancellationToken::new(),
+        None,
     )
     .await
     .expect("open retained project graph");

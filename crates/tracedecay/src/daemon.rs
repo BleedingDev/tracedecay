@@ -435,11 +435,12 @@ use project_open_admission::{
 };
 pub(crate) use tracedecay_session_runtime::StoreOwnerKey;
 mod project_open_handshake;
-#[cfg(test)]
-use project_open_handshake::is_missing_index_error;
 use project_open_handshake::{
-    initialize_project_open_error, open_project_for_handshake, project_open_error_response,
-    write_project_open_error,
+    initialize_project_open_error, project_open_error_response, write_project_open_error,
+};
+#[cfg(test)]
+use project_open_handshake::{
+    is_missing_index_error, open_project_for_handshake_with_hook_recovery,
 };
 mod project_open_orchestration;
 mod project_routing;

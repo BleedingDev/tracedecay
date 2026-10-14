@@ -12,21 +12,22 @@ use tracedecay_domain::configuration::{
     INDEX_EXTRACT_DOCSTRINGS_SETTING_KEY, INDEX_INCLUDE_SETTING_KEY,
     INDEX_MAX_FILE_SIZE_SETTING_KEY, INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
     INDEX_TRACK_CALL_SITES_SETTING_KEY, LCM_SUMMARIZER_EXECUTABLES_SETTING_KEY,
-    LcmSummarizerExecutablesV1, MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
-    MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
-    MemoryProviderKindV1, MemoryProviderNcmObserverV1, MemoryProviderRecallRoutingV1,
-    MemoryProviderSelectionErrorV1, MemoryProviderSelectionV1, PROFILE_SETTING_KEYS_V1,
-    PROJECT_WORK_EXPERTISE_CONSENT_SETTING_KEY, RestartRequirementV1, SOURCE_BINDINGS_SETTING_KEY,
-    SYNC_AUTO_INIT_SETTING_KEY, SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY,
-    SYNC_AUTO_TRACK_PR_POLL_SECS_SETTING_KEY, SYNC_AUTO_WATCH_SETTING_KEY,
-    SYNC_BACKSTOP_INTERVAL_MINS_SETTING_KEY, SYNC_BRANCH_GC_DAYS_SETTING_KEY,
-    SYNC_FULL_SYNC_ESCALATION_FILES_SETTING_KEY, SYNC_MAX_CONCURRENT_SYNCS_SETTING_KEY,
-    SYNC_READ_COOLDOWN_SECS_SETTING_KEY, SYNC_READ_REFRESH_SETTING_KEY,
-    SYNC_SESSION_START_STALE_THRESHOLD_SECS_SETTING_KEY, SYNC_SESSION_START_SYNC_SETTING_KEY,
-    SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY, SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY,
-    SYNC_WATCH_MAX_DELAY_MS_SETTING_KEY, SYNC_WATCH_MAX_PROJECTS_SETTING_KEY, SettingDefinitionV1,
-    SettingKey, SettingScopeV1, SettingSensitivityV1, TELEMETRY_TIMINGS_SETTING_KEY,
-    USER_CODE_INDEX_WORKERS_SETTING_KEY, USER_EXTRACTION_TIMEOUT_SECS_SETTING_KEY,
+    LcmSummarizerExecutableV1, LcmSummarizerExecutablesV1,
+    MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+    MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY, MemoryProviderKindV1, MemoryProviderNcmObserverV1,
+    MemoryProviderRecallRoutingV1, MemoryProviderSelectionErrorV1, MemoryProviderSelectionV1,
+    PROFILE_SETTING_KEYS_V1, PROJECT_WORK_EXPERTISE_CONSENT_SETTING_KEY, RestartRequirementV1,
+    SOURCE_BINDINGS_SETTING_KEY, SYNC_AUTO_INIT_SETTING_KEY,
+    SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY, SYNC_AUTO_TRACK_PR_POLL_SECS_SETTING_KEY,
+    SYNC_AUTO_WATCH_SETTING_KEY, SYNC_BACKSTOP_INTERVAL_MINS_SETTING_KEY,
+    SYNC_BRANCH_GC_DAYS_SETTING_KEY, SYNC_FULL_SYNC_ESCALATION_FILES_SETTING_KEY,
+    SYNC_MAX_CONCURRENT_SYNCS_SETTING_KEY, SYNC_READ_COOLDOWN_SECS_SETTING_KEY,
+    SYNC_READ_REFRESH_SETTING_KEY, SYNC_SESSION_START_STALE_THRESHOLD_SECS_SETTING_KEY,
+    SYNC_SESSION_START_SYNC_SETTING_KEY, SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY,
+    SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY, SYNC_WATCH_MAX_DELAY_MS_SETTING_KEY,
+    SYNC_WATCH_MAX_PROJECTS_SETTING_KEY, SettingDefinitionV1, SettingKey, SettingScopeV1,
+    SettingSensitivityV1, TELEMETRY_TIMINGS_SETTING_KEY, USER_CODE_INDEX_WORKERS_SETTING_KEY,
+    USER_EXTRACTION_TIMEOUT_SECS_SETTING_KEY, USER_LCM_CODEX_SUMMARIZER_SETTING_KEY,
     USER_REPEATED_QUERY_HINTS_SETTING_KEY, USER_UPLOAD_ENABLED_SETTING_KEY,
     USER_WATCHER_DEBOUNCE_MS_SETTING_KEY, USER_WORK_EXPERTISE_CONSENT_SETTING_KEY,
     WORK_EXECUTABLE_BINDINGS_SETTING_KEY, WORK_TOPOLOGY_POLICY_SETTING_KEY, WorkExpertiseConsentV1,
@@ -41,7 +42,7 @@ pub const MAX_PROXIMITY_RISK_THRESHOLD_BASIS_POINTS_V1: u64 = 10_000;
 
 /// Registry schema revision. Increment only when setting-definition semantics
 /// change, not when a setting value changes.
-pub const CONFIGURATION_REGISTRY_SCHEMA_REVISION: u16 = 7;
+pub const CONFIGURATION_REGISTRY_SCHEMA_REVISION: u16 = 8;
 
 #[derive(Debug, Error)]
 pub enum ConfigurationRegistryError {
@@ -244,6 +245,18 @@ impl ConfigurationRegistry {
             definitions: BTreeMap::new(),
         };
         registry.register(code_index_worker_definition()?)?;
+        registry.register(SettingDefinitionV1 {
+            key: setting_key(USER_LCM_CODEX_SUMMARIZER_SETTING_KEY)?,
+            schema_revision: CONFIGURATION_REGISTRY_SCHEMA_REVISION,
+            value_kind: ConfigurationValueKindV1::LcmSummarizerExecutable,
+            default_value: ConfigurationValueV1::LcmSummarizerExecutable(
+                LcmSummarizerExecutableV1::Unconfigured,
+            ),
+            sensitivity: SettingSensitivityV1::Sensitive,
+            scope: SettingScopeV1::UserProfile,
+            restart_requirement: RestartRequirementV1::None,
+            deprecation: DeprecationStateV1::Active,
+        })?;
         register_profile_scalar_settings(&mut registry)?;
         Ok(registry)
     }
@@ -1105,7 +1118,10 @@ mod user_profile_settings_tests {
         );
         let definition = registry.definition(&key).expect("definition");
 
-        assert_eq!(definition.schema_revision, 7);
+        assert_eq!(
+            definition.schema_revision,
+            CONFIGURATION_REGISTRY_SCHEMA_REVISION
+        );
         assert_eq!(definition.scope, SettingScopeV1::UserProfile);
         assert_eq!(
             definition.value_kind,
@@ -1373,5 +1389,48 @@ mod memory_provider_registration_tests {
             )) if provider == "provider.unregistered"
         ));
         assert_eq!(values, before);
+    }
+}
+
+#[cfg(test)]
+mod profile_summarizer_tests {
+    use super::*;
+
+    #[test]
+    fn profile_codex_executor_is_sensitive_direct_and_validated_as_a_single_executable() {
+        let registry = ConfigurationRegistry::profile().unwrap();
+        let key = setting_key(USER_LCM_CODEX_SUMMARIZER_SETTING_KEY).unwrap();
+        let definition = registry.definition(&key).unwrap();
+        assert_eq!(definition.scope, SettingScopeV1::UserProfile);
+        assert_eq!(definition.sensitivity, SettingSensitivityV1::Sensitive);
+        assert_eq!(definition.restart_requirement, RestartRequirementV1::None);
+        assert_eq!(
+            definition.default_value,
+            ConfigurationValueV1::LcmSummarizerExecutable(LcmSummarizerExecutableV1::Unconfigured)
+        );
+        assert!(
+            registry
+                .validate_value(
+                    &key,
+                    &ConfigurationValueV1::LcmSummarizerExecutables(
+                        LcmSummarizerExecutablesV1::unconfigured()
+                    )
+                )
+                .is_err()
+        );
+        assert!(
+            registry
+                .validate_value(
+                    &key,
+                    &ConfigurationValueV1::LcmSummarizerExecutable(
+                        LcmSummarizerExecutableV1::Configured {
+                            canonical_path: std::path::PathBuf::from("codex"),
+                            model: None,
+                            timeout_secs: None
+                        }
+                    )
+                )
+                .is_err()
+        );
     }
 }

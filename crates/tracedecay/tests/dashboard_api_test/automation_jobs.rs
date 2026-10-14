@@ -356,20 +356,17 @@ for line in sys.stdin:
             "admitted execution must not expose ledger history before outer settlement"
         );
 
-        let mut settled = None;
-        for _ in 0..250 {
-            settled =
-                tracedecay_automation_runtime::automation::run_ledger::find_run_record_exact_bounded(
-                    &dashboard_root,
-                    run_id,
-                )
-                .await
-                .unwrap_or_else(|error| panic!("read settled user-job history: {error}"));
-            if settled.is_some() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        // Wait on the run's own terminal status, the suite's settlement
+        // signal, rather than a fixed polling window that a slower host
+        // outlasts; the ledger must hold the record once it has settled.
+        crate::automation::wait_for_settled_run(&agent, &base_url, run_id);
+        let settled =
+            tracedecay_automation_runtime::automation::run_ledger::find_run_record_exact_bounded(
+                &dashboard_root,
+                run_id,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("read settled user-job history: {error}"));
         let settled = settled.unwrap_or_else(|| {
             panic!("retained dashboard user-job history must appear after settlement")
         });

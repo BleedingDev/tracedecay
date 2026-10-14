@@ -1,5 +1,8 @@
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Poll;
 use std::time::Duration;
 
 use tempfile::TempDir;
@@ -26,6 +29,8 @@ use tracedecay_sessions::admission::HostAdmissionScope;
 use tracedecay_store::{
     SessionRefreshReceiptRequestV1, SessionRefreshStore, SessionRefreshTerminalStateV1,
 };
+use tracing::instrument::WithSubscriber;
+use tracing_subscriber::layer::SubscriberExt;
 
 use crate::DaemonWorkflowIndexReadService;
 use crate::session_refresh::DaemonSessionRefreshService;
@@ -537,5 +542,268 @@ async fn retained_cancel_reports_partial_effect_with_canonical_cancelled_receipt
         .expect("cancel must commit a terminal receipt");
     assert_eq!(receipt.operation_id().as_str(), operation_id);
     assert_eq!(receipt.state(), SessionRefreshTerminalStateV1::Cancelled);
+    fixture.registry.shutdown().await;
+}
+
+async fn refresh_publication_rows(
+    database: &RegisteredGlobalDb,
+) -> Vec<Vec<tracedecay_runtime_core::db::engine::Row>> {
+    let mut tables = Vec::new();
+    for sql in [
+        "SELECT * FROM session_refresh_operations ORDER BY session_id, operation_id",
+        "SELECT * FROM session_refresh_bindings ORDER BY session_id, operation_id",
+        "SELECT * FROM session_temporal_generations ORDER BY session_id, generation",
+        "SELECT * FROM session_refresh_receipts ORDER BY session_id, operation_id",
+    ] {
+        let mut rows = database.read_connection().query(sql, ()).await.unwrap();
+        let mut table = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            table.push(row);
+        }
+        tables.push(table);
+    }
+    tables
+}
+
+async fn begin_refresh_for_gate_test(
+    fixture: &RetiredRefreshFixture,
+    session_id: &SessionId,
+) -> String {
+    let request = fixture.request(SessionRefreshActionV1::Begin, session_id, None);
+    let (context, signal) = application_context(fixture, &request, "request.publication-gate.seed");
+    let command = admitted_session_refresh_command(
+        &request,
+        &context,
+        &signal,
+        &fixture.mounted_authority(&context),
+    )
+    .unwrap();
+    match fixture.refresh.execute(command).await {
+        SessionRefreshServiceOutcome::StartedReconciliationRequired { handle, .. } => handle,
+        other => panic!("expected a durable running refresh, got {other:?}"),
+    }
+}
+
+async fn assert_refresh_control_refuses_publication(action: SessionRefreshActionV1, expired: bool) {
+    let temp = TempDir::new().unwrap();
+    let fixture = RetiredRefreshFixture::open(&temp, "publication-gate-control").await;
+    let session_id = SessionId::new("session.publication-gate.control").unwrap();
+    let handle = if action == SessionRefreshActionV1::Cancel {
+        Some(begin_refresh_for_gate_test(&fixture, &session_id).await)
+    } else {
+        None
+    };
+    let before = refresh_publication_rows(&fixture.database).await;
+    let request = fixture.request(action, &session_id, handle);
+    let (context, signal) =
+        application_context(&fixture, &request, "request.publication-gate.control");
+    let mut command = admitted_session_refresh_command(
+        &request,
+        &context,
+        &signal,
+        &fixture.mounted_authority(&context),
+    )
+    .unwrap();
+    let cancellation = command.binding.cancellation().clone();
+    if expired {
+        command.context = command
+            .context
+            .with_deadline(Deadline::new(UtcMicros(1)).unwrap());
+    }
+    let publication = fixture.database.session_publication_guard().await;
+    let mut execution = fixture.refresh.execute(command);
+    if !expired {
+        // Poll the actual command into the held gate before cancellation;
+        // an already-cancelled request would not exercise a queued waiter.
+        std::future::poll_fn(|cx| {
+            assert!(execution.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        cancellation.cancel();
+    }
+    assert_eq!(
+        execution.await,
+        if expired {
+            SessionRefreshServiceOutcome::DeadlineExceeded
+        } else {
+            SessionRefreshServiceOutcome::Aborted
+        }
+    );
+    assert_eq!(refresh_publication_rows(&fixture.database).await, before);
+    drop(publication);
+    fixture.registry.shutdown().await;
+}
+
+#[tokio::test]
+async fn queued_refresh_begin_cancellation_commits_no_candidate_or_receipt() {
+    assert_refresh_control_refuses_publication(SessionRefreshActionV1::Begin, false).await;
+}
+
+#[tokio::test]
+async fn expired_refresh_begin_commits_no_candidate_or_receipt() {
+    assert_refresh_control_refuses_publication(SessionRefreshActionV1::Begin, true).await;
+}
+
+#[tokio::test]
+async fn queued_refresh_cancel_cancellation_preserves_running_candidate() {
+    assert_refresh_control_refuses_publication(SessionRefreshActionV1::Cancel, false).await;
+}
+
+#[tokio::test]
+async fn expired_refresh_cancel_preserves_running_candidate() {
+    assert_refresh_control_refuses_publication(SessionRefreshActionV1::Cancel, true).await;
+}
+
+#[tokio::test]
+async fn refresh_status_reads_running_candidate_while_publication_is_owned() {
+    let temp = TempDir::new().unwrap();
+    let fixture = RetiredRefreshFixture::open(&temp, "publication-gate-status").await;
+    let session_id = SessionId::new("session.publication-gate.status").unwrap();
+    let handle = begin_refresh_for_gate_test(&fixture, &session_id).await;
+    let before = refresh_publication_rows(&fixture.database).await;
+    let request = fixture.request(SessionRefreshActionV1::Status, &session_id, Some(handle));
+    let (context, signal) =
+        application_context(&fixture, &request, "request.publication-gate.status");
+    let command = admitted_session_refresh_command(
+        &request,
+        &context,
+        &signal,
+        &fixture.mounted_authority(&context),
+    )
+    .unwrap();
+    let publication = fixture.database.session_publication_guard().await;
+    assert!(matches!(
+        fixture.refresh.execute(command).await,
+        SessionRefreshServiceOutcome::Running(_)
+    ));
+    assert_eq!(refresh_publication_rows(&fixture.database).await, before);
+    drop(publication);
+    fixture.registry.shutdown().await;
+}
+
+#[tokio::test]
+async fn refresh_begin_waits_for_publication_before_committing_its_candidate() {
+    let temp = TempDir::new().unwrap();
+    let fixture = RetiredRefreshFixture::open(&temp, "publication-gate-begin").await;
+    let session_id = SessionId::new("session.publication-gate.begin").unwrap();
+    let request = fixture.request(SessionRefreshActionV1::Begin, &session_id, None);
+    let (context, signal) =
+        application_context(&fixture, &request, "request.publication-gate.begin");
+    let command = admitted_session_refresh_command(
+        &request,
+        &context,
+        &signal,
+        &fixture.mounted_authority(&context),
+    )
+    .unwrap();
+    let before = refresh_publication_rows(&fixture.database).await;
+    let publication = fixture.database.session_publication_guard().await;
+    let mut execution = fixture.refresh.execute(command);
+    std::future::poll_fn(|cx| {
+        assert!(execution.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    // Begin's first store await acquires this same FIFO writer lane. If
+    // publication did not stop the command, its candidate commit would have
+    // to finish before this barrier could acquire the lane.
+    let barrier = tokio::select! {
+        biased;
+        outcome = &mut execution => {
+            panic!("begin crossed the held publication owner: {outcome:?}");
+        }
+        transaction = fixture.database.begin_write_transaction() => transaction.unwrap(),
+    };
+    assert_eq!(refresh_publication_rows(&fixture.database).await, before);
+    barrier.rollback().await.unwrap();
+    drop(publication);
+    let SessionRefreshServiceOutcome::StartedReconciliationRequired { operation_id, .. } =
+        execution.await
+    else {
+        panic!("released begin must commit its canonical candidate");
+    };
+    let recovery = SessionTemporalStore::new(fixture.database.as_ref())
+        .session_refresh_recovery(&session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovery.operation_id().as_str(), operation_id);
+    assert_ne!(refresh_publication_rows(&fixture.database).await, before);
+    fixture.registry.shutdown().await;
+}
+
+struct RefreshCancelAuthorityEntry(Arc<AtomicBool>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RefreshCancelAuthorityEntry {
+    fn on_new_span(
+        &self,
+        attributes: &tracing::span::Attributes<'_>,
+        _id: &tracing::span::Id,
+        _context: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if attributes.metadata().name() == "usecases.session.refresh.cancel" {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+#[tokio::test]
+async fn refresh_cancel_waits_for_publication_before_entering_its_authority() {
+    let temp = TempDir::new().unwrap();
+    let fixture = RetiredRefreshFixture::open(&temp, "publication-gate-cancel").await;
+    let session_id = SessionId::new("session.publication-gate.cancel").unwrap();
+    let handle = begin_refresh_for_gate_test(&fixture, &session_id).await;
+    let request = fixture.request(SessionRefreshActionV1::Cancel, &session_id, Some(handle));
+    let (context, signal) =
+        application_context(&fixture, &request, "request.publication-gate.cancel");
+    let command = admitted_session_refresh_command(
+        &request,
+        &context,
+        &signal,
+        &fixture.mounted_authority(&context),
+    )
+    .unwrap();
+    let before = refresh_publication_rows(&fixture.database).await;
+    let entered = Arc::new(AtomicBool::new(false));
+    let subscriber = tracing_subscriber::Registry::default()
+        .with(RefreshCancelAuthorityEntry(Arc::clone(&entered)));
+    let publication = fixture.database.session_publication_guard().await;
+    let mut execution = Box::pin(fixture.refresh.execute(command).with_subscriber(subscriber));
+    std::future::poll_fn(|cx| {
+        assert!(execution.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    // Cancel reads progress and receipt before acquiring the writer. A writer
+    // barrier could overtake those reads; its existing authority span instead
+    // identifies entry before the first store await without scheduling guesses.
+    assert!(!entered.load(Ordering::SeqCst));
+    assert_eq!(refresh_publication_rows(&fixture.database).await, before);
+    drop(publication);
+    let SessionRefreshServiceOutcome::CancelledReconciliationRequired(receipt) = execution.await
+    else {
+        panic!("released cancel must commit its canonical terminal receipt");
+    };
+    assert!(entered.load(Ordering::SeqCst));
+    assert_eq!(receipt.state, "cancelled");
+    let store = SessionTemporalStore::new(fixture.database.as_ref());
+    let durable = store
+        .session_refresh_receipt(SessionRefreshReceiptRequestV1::new(
+            SessionRefreshOperationIdV1::new(receipt.operation_id).unwrap(),
+            session_id.clone(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.state(), SessionRefreshTerminalStateV1::Cancelled);
+    assert!(
+        store
+            .session_refresh_recovery(&session_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_ne!(refresh_publication_rows(&fixture.database).await, before);
     fixture.registry.shutdown().await;
 }

@@ -1367,11 +1367,12 @@ async fn mount_cancellation_executor(
         .project_path
         .as_deref()
         .expect("fixture project");
-    let cg = super::super::open_project_for_handshake(
+    let cg = super::super::open_project_for_handshake_with_hook_recovery(
         project_path,
         &fixture.handshake,
         &fixture.engine.store_administration,
         &CancellationToken::new(),
+        None,
     )
     .await
     .expect("open controlled project");

@@ -283,6 +283,8 @@ pub(super) struct PendingRecordV1 {
     pub(super) framed_len: u32,
     pub(super) file_offset: u64,
     pub(super) event_id: [u8; 16],
+    pub(super) project_id: [u8; 16],
+    pub(super) worktree_id: [u8; 16],
     pub(super) checksum: [u8; 32],
     pub(super) envelope: Option<HookEventEnvelopeV2>,
     pub(super) native_lifecycle: Option<NativeContextScoutLifecycleV1>,
@@ -297,6 +299,8 @@ impl PendingRecordV1 {
             framed_len: record.framed_len,
             file_offset,
             event_id: record.envelope.event_id,
+            project_id: record.envelope.project_id,
+            worktree_id: record.envelope.worktree_id,
             checksum: record.checksum,
             envelope: Some(record.envelope.clone()),
             native_lifecycle: record.native_lifecycle.clone(),
@@ -324,6 +328,8 @@ impl PendingRecordV1 {
             && self.queued_at == record.queued_at
             && self.framed_len == record.framed_len
             && self.event_id == record.envelope.event_id
+            && self.project_id == record.envelope.project_id
+            && self.worktree_id == record.envelope.worktree_id
             && self.checksum == record.checksum
             && self.envelope.as_ref().is_none_or(|envelope| {
                 envelope == &record.envelope && self.native_lifecycle == record.native_lifecycle

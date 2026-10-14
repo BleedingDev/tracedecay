@@ -5,7 +5,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -169,6 +169,30 @@ pub fn file_len(path: &Path) -> io::Result<u64> {
     }
 }
 
+/// Inspect a directory without creating it or following a substituted root.
+/// A missing path is absent only after its nearest existing ancestor passes
+/// the maintained directory policy (Windows also checks reparse ancestors).
+pub fn validate_directory_or_missing(path: &Path) -> io::Result<bool> {
+    match crate::validate_directory_path(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            for ancestor in path
+                .ancestors()
+                .skip(1)
+                .filter(|path| !path.as_os_str().is_empty())
+            {
+                match crate::validate_directory_path(ancestor) {
+                    Ok(()) => return Ok(false),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub fn validate_regular_or_missing(path: &Path) -> io::Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => Ok(true),
@@ -241,6 +265,46 @@ fn open_no_follow(path: &Path) -> io::Result<File> {
         options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     }
     options.open(path).map_err(normalize_no_follow_error)
+}
+
+/// Refuse a regular path that no longer names the exact retained file.
+/// Held handles prevent Unix inode reuse; Windows uses its maintained
+/// volume/file-index identity. No file is created or adopted by this check.
+pub fn validate_retained_file(path: &Path, retained: &File) -> io::Result<()> {
+    let current = open_no_follow(path)?;
+    let current_metadata = current.metadata()?;
+    let retained_metadata = retained.metadata()?;
+    if !current_metadata.is_file() || !retained_metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    let same = {
+        current_metadata.dev() == retained_metadata.dev()
+            && current_metadata.ino() == retained_metadata.ino()
+    };
+    #[cfg(windows)]
+    let same = {
+        let current = crate::windows_file::information(&current)?;
+        let retained = crate::windows_file::information(retained)?;
+        current.volume_serial_number == retained.volume_serial_number
+            && current.file_index == retained.file_index
+    };
+    #[cfg(not(any(unix, windows)))]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "retained file identity is unsupported",
+    ));
+    #[cfg(any(unix, windows))]
+    if !same {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path no longer names the retained file",
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_no_follow_error(error: io::Error) -> io::Error {
@@ -1088,6 +1152,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_directory_probe_distinguishes_absence_from_a_file_ancestor() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(super::validate_directory_or_missing(root.path()).unwrap());
+        let missing = root.path().join("missing").join("nested");
+        assert!(!super::validate_directory_or_missing(&missing).unwrap());
+        assert!(!root.path().join("missing").exists());
+        let file = root.path().join("file");
+        fs::write(&file, b"unchanged").unwrap();
+        assert!(super::validate_directory_or_missing(&file).is_err());
+        assert!(super::validate_directory_or_missing(&file.join("nested")).is_err());
+        assert_eq!(fs::read(file).unwrap(), b"unchanged");
+    }
+
     #[cfg(unix)]
     #[test]
     fn regular_read_opener_rejects_symlinks_and_fifos_without_a_writer() {
@@ -1110,6 +1188,33 @@ mod tests {
             open_regular_read_no_follow(&fifo).unwrap_err().kind(),
             std::io::ErrorKind::InvalidInput
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_probe_refuses_a_substituted_root_without_touching_its_target() {
+        let root = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let link = root.path().join("root");
+        std::os::unix::fs::symlink(foreign.path(), &link).unwrap();
+        assert!(super::validate_directory_or_missing(&link).is_err());
+        assert!(super::validate_directory_or_missing(&link.join("missing")).is_err());
+        assert_eq!(fs::read_dir(foreign.path()).unwrap().count(), 0);
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn a_retained_file_probe_refuses_an_atomic_regular_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("log");
+        fs::write(&path, b"owned").unwrap();
+        let retained = fs::File::open(&path).unwrap();
+        super::validate_retained_file(&path, &retained).unwrap();
+        let replacement = root.path().join("replacement");
+        fs::write(&replacement, b"foreign").unwrap();
+        fs::rename(replacement, &path).unwrap();
+        assert!(super::validate_retained_file(&path, &retained).is_err());
+        assert_eq!(fs::read(path).unwrap(), b"foreign");
     }
 
     #[test]

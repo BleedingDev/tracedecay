@@ -294,7 +294,10 @@ pub struct McpServer {
     branch_reopen_completions: Arc<AtomicU64>,
     /// Retains non-request maintenance futures so shutdown can fence task
     /// admission, cancel every live future, and join it before stores close.
-    background_tasks: McpBackgroundTaskOwner,
+    background_tasks: Arc<McpBackgroundTaskOwner>,
+    /// Successful registration of this server's separate Hook V2 consumer.
+    /// Core and Full servers may share a graph, but only Full retains this receipt.
+    hook_replay_owned: Arc<AtomicBool>,
     /// Single-flights optional tool-activity persistence. A busy session-store
     /// writer may delay this local-detail observation, but it must never delay
     /// the foreground tool whose activity is being observed.
@@ -1019,7 +1022,8 @@ impl McpServer {
             cg: Arc::new(tokio::sync::RwLock::new(cg)),
             branch_reopen: Arc::new(tokio::sync::Mutex::new(())),
             branch_reopen_completions: Arc::new(AtomicU64::new(0)),
-            background_tasks: McpBackgroundTaskOwner::default(),
+            background_tasks: Arc::new(McpBackgroundTaskOwner::default()),
+            hook_replay_owned: Arc::new(AtomicBool::new(false)),
             tool_activity_publish_running: Arc::new(AtomicBool::new(false)),
             stats: ServerStats::new(),
             method_call_counts: std::sync::Mutex::new(HashMap::new()),

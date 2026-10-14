@@ -8,7 +8,7 @@
 //! new complete tree, while recovery can repair the short interval between
 //! the two renames after a process or machine failure.
 
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 use cap_std::{
     ambient_authority,
     fs::{Dir, OpenOptions},
@@ -263,6 +263,9 @@ fn install_or_update(
                 &candidate_directory,
                 &manifest,
             )?;
+            // Windows refuses to rename a directory while a handle to it is
+            // open, so close the candidate before publication moves it.
+            drop(candidate_directory);
             super::write_manifest(&candidate_models, &manifest)?;
             validate_candidate(&candidate_models, &manifest)?;
             sync_tree_path(&candidate_models)?;
@@ -276,7 +279,7 @@ fn install_or_update(
                 &root_directory,
                 journal,
                 &staging_path,
-                &staging_directory,
+                staging_directory,
                 &acquisition,
                 &manifest,
             )?;
@@ -449,7 +452,7 @@ fn publish_candidate(
     root_directory: &Dir,
     mut journal: LifecycleJournal,
     staging_path: &Path,
-    staging_directory: &Dir,
+    staging_directory: Dir,
     acquisition: &ModelAcquisitionManifest,
     manifest: &PinnedEncoder,
 ) -> Result<(), EncoderError> {
@@ -500,7 +503,7 @@ fn publish_candidate(
     // staging capability so a swapped path cannot redirect publication.
     let candidate_path = staging_path.join(CANDIDATE_DIRECTORY);
     let staged_digest = digest_optional_entry(
-        staging_directory,
+        &staging_directory,
         OsStr::new(CANDIDATE_DIRECTORY),
         &candidate_path,
     )?
@@ -520,7 +523,7 @@ fn publish_candidate(
     }
     validate_candidate_structure(&candidate_path, manifest)?;
     let verified_staged_digest = digest_optional_entry(
-        staging_directory,
+        &staging_directory,
         OsStr::new(CANDIDATE_DIRECTORY),
         &candidate_path,
     )?
@@ -539,7 +542,7 @@ fn publish_candidate(
         );
     }
     if let Err(error) = tracedecay_private_fs::capability_dir::rename_noreplace(
-        staging_directory,
+        &staging_directory,
         OsStr::new(CANDIDATE_DIRECTORY),
         root_directory,
         OsStr::new("models"),
@@ -618,6 +621,8 @@ fn publish_candidate(
             })?,
         )?;
     }
+    // Windows refuses to remove a directory while a handle to it is open.
+    drop(staging_directory);
     cleanup_staging_entry(
         root,
         root_directory,
@@ -1429,7 +1434,12 @@ fn secure_private_directory_entry(
     path: &Path,
 ) -> Result<Dir, EncoderError> {
     let mut options = OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
+    // `maybe_dir`: Windows grants a directory handle only with backup
+    // semantics and refuses the open as access denied otherwise.
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
     let file = parent
         .open_with(name, &options)
         .map_err(|error| io_error("open model staging directory for privacy", path, error))?;
@@ -2053,7 +2063,12 @@ pub(super) fn open_directory_path(path: &Path) -> Result<Dir, EncoderError> {
 
 fn open_directory_nofollow(parent: &Dir, name: &OsStr, path: &Path) -> Result<Dir, EncoderError> {
     let mut options = OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
+    // `maybe_dir` lets Windows open a directory handle (backup semantics);
+    // without it the open is refused with access denied.
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
     let file = parent.open_with(name, &options).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             EncoderError::ArtifactsMissing(path.display().to_string())
@@ -2092,7 +2107,11 @@ fn open_optional_directory(
 
 fn path_entry_exists(parent: &Dir, name: &OsStr, path: &Path) -> Result<bool, EncoderError> {
     let mut options = OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
+    // The entry may be a directory; Windows opens one only with `maybe_dir`.
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
     match parent.open_with(name, &options) {
         Ok(file) => {
             let metadata = file
@@ -2222,8 +2241,28 @@ fn open_file_nofollow(
     name: &OsStr,
     path: &Path,
 ) -> Result<cap_std::fs::File, EncoderError> {
+    open_file_nofollow_with(parent, name, path, false)
+}
+
+/// [`open_file_nofollow`] for a handle that will be flushed: Windows'
+/// `FlushFileBuffers` refuses a read-only handle with access denied.
+#[cfg(feature = "real-encoder")]
+fn open_file_nofollow_for_sync(
+    parent: &Dir,
+    name: &OsStr,
+    path: &Path,
+) -> Result<cap_std::fs::File, EncoderError> {
+    open_file_nofollow_with(parent, name, path, cfg!(windows))
+}
+
+fn open_file_nofollow_with(
+    parent: &Dir,
+    name: &OsStr,
+    path: &Path,
+    write: bool,
+) -> Result<cap_std::fs::File, EncoderError> {
     let mut options = OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
+    options.read(true).write(write).follow(FollowSymlinks::No);
     let file = parent.open_with(name, &options).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             EncoderError::ArtifactsMissing(path.display().to_string())
@@ -2349,7 +2388,7 @@ fn sync_tree(directory: &Dir, path: &Path) -> Result<(), EncoderError> {
             let child = open_directory_nofollow(directory, &name, &child_path)?;
             sync_tree(&child, &child_path)?;
         } else if file_type.is_file() {
-            open_file_nofollow(directory, &name, &child_path)?
+            open_file_nofollow_for_sync(directory, &name, &child_path)?
                 .sync_all()
                 .map_err(|error| io_error("sync model lifecycle file", &child_path, error))?;
         } else {

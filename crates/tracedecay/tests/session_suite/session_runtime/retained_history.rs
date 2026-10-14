@@ -8,6 +8,10 @@ use std::time::Duration;
 
 use serde_json::json;
 use tempfile::TempDir;
+use tracing::Subscriber;
+use tracing::span::{Attributes, Id};
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::{Context, SubscriberExt};
 
 use super::SessionTemporalRefreshTestAuthority;
 use tracedecay_domain::{
@@ -21,6 +25,7 @@ use tracedecay_domain::{
     SessionId, UtcMicros,
 };
 use tracedecay_global_db::{RegisteredGlobalDb, RegisteredGlobalDbLeaseV1};
+use tracedecay_session_runtime::session_sync::test_harness::SessionTemporalRefreshWakeState;
 use tracedecay_session_runtime::session_sync::test_harness::configure_scheduler;
 use tracedecay_session_runtime::session_temporal_refresh_scheduler::history::{
     SessionHistoricalCapacityRelease, SessionHistoricalIngestOutcome, SessionHistoricalIngestPass,
@@ -31,11 +36,14 @@ use tracedecay_session_runtime::session_temporal_refresh_scheduler::projector::{
     SessionTemporalRefreshProjectionFuture, SessionTemporalRefreshProjector,
 };
 use tracedecay_session_runtime::session_temporal_refresh_scheduler::registry::SessionTemporalRefreshSchedulerRegistry;
-use tracedecay_session_temporal_store::{SessionRefreshRecoveryV1, SessionTemporalStore};
+use tracedecay_session_runtime::session_temporal_refresh_scheduler::run_session_temporal_refresh_pass;
+use tracedecay_session_runtime::session_temporal_refresh_scheduler::wake::{
+    SessionTemporalRefreshRetryClass, SessionTemporalRefreshUnavailableReason,
+};
+use tracedecay_session_temporal_store::SessionRefreshRecoveryV1;
 use tracedecay_store::{
     AnchoredObservationWrite, ObservationPersistOutcome, ObservationProjectionStore,
-    ObservationStore, ObservationWrite, SessionRefreshBeginOrJoinRequestV1,
-    SessionRefreshFrontierV1, SessionRefreshStore, build_observation_resolution_authorization_v1,
+    ObservationStore, ObservationWrite, build_observation_resolution_authorization_v1,
     build_observation_retrieval_anchor,
 };
 
@@ -102,16 +110,24 @@ struct BlockThirdHistoricalIngestor {
 
 struct CountingDeferredProjector {
     calls: AtomicUsize,
+    released: AtomicBool,
 }
 
 impl SessionTemporalRefreshProjector for CountingDeferredProjector {
     fn project<'a>(
         &'a self,
-        _database: &'a RegisteredGlobalDbLeaseV1,
-        _recovery: SessionRefreshRecoveryV1,
+        database: &'a RegisteredGlobalDbLeaseV1,
+        recovery: SessionRefreshRecoveryV1,
     ) -> SessionTemporalRefreshProjectionFuture<'a> {
         self.calls.fetch_add(1, Ordering::AcqRel);
-        Box::pin(async { Ok(SessionTemporalRefreshEffect::Deferred) })
+        Box::pin(async move {
+            if !self.released.load(Ordering::Acquire) {
+                return Ok(SessionTemporalRefreshEffect::Deferred);
+            }
+            CanonicalSessionTemporalProjector
+                .project(database, recovery)
+                .await
+        })
     }
 }
 
@@ -507,6 +523,100 @@ async fn wait_until(predicate: impl Fn() -> bool, timeout: Duration) -> bool {
     true
 }
 
+struct SummaryConvergencePageCensus(Arc<AtomicUsize>);
+
+impl<S: Subscriber> Layer<S> for SummaryConvergencePageCensus {
+    fn on_new_span(&self, attributes: &Attributes<'_>, _id: &Id, _context: Context<'_, S>) {
+        if attributes.metadata().name() == "daemon.lcm.summary_convergence.page" {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+#[tokio::test]
+async fn initial_projection_discovery_failure_withholds_summary_admission_until_recovery() {
+    let temp = TempDir::new().unwrap();
+    let authority = profile_authority(&temp, "history-initial-discovery-failure").await;
+    let path = authority.database().db_path().to_path_buf();
+    // Cached readers survive pathname loss. Temporarily withhold the discovery
+    // table through the registered writer so the real refresh query must fail.
+    authority
+        .database()
+        .writer_connection()
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE session_refresh_operations RENAME TO unavailable_session_refresh_operations",
+        )
+        .await
+        .unwrap();
+    let pages = Arc::new(AtomicUsize::new(0));
+    let _capture = tracedecay_runtime_core::logging::set_tracing_capture(
+        tracing_subscriber::registry().with(SummaryConvergencePageCensus(Arc::clone(&pages))),
+    );
+    let report = run_session_temporal_refresh_pass(
+        &authority.database,
+        &Arc::new(SessionTemporalRefreshWakeState::default()),
+        &CanonicalSessionTemporalProjector,
+        SessionTemporalRefreshPolicy::default(),
+    )
+    .await;
+    assert_eq!(
+        report.retry_class,
+        Some(SessionTemporalRefreshRetryClass::Storage)
+    );
+    assert_eq!(report.backlog, None);
+
+    let ingestor = Arc::new(ScriptedHistoricalIngestor::new([
+        SessionHistoricalIngestOutcome::Complete,
+    ]));
+    let registry = SessionTemporalRefreshSchedulerRegistry::default();
+    let wake = registry
+        .ensure_profile_with_history(path.clone(), authority.database.clone(), ingestor.clone())
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status = registry.profile_worker_status(&path).await;
+            if status.retry_class == Some(SessionTemporalRefreshRetryClass::Storage)
+                && status.unavailable_reason
+                    == Some(SessionTemporalRefreshUnavailableReason::Stalled)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the initial failed discovery must report its stalled storage retry");
+    assert_eq!(
+        pages.load(Ordering::Acquire),
+        0,
+        "an unknown failed projection frontier must withhold full summary admission"
+    );
+    assert_eq!(ingestor.passes.load(Ordering::Acquire), 1);
+
+    authority
+        .database()
+        .writer_connection()
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE unavailable_session_refresh_operations RENAME TO session_refresh_operations",
+        )
+        .await
+        .unwrap();
+    assert!(wake.wake_and_wait_until_idle(Duration::from_secs(2)).await);
+    assert!(
+        pages.load(Ordering::Acquire) > 0,
+        "restoring the discovery table must admit convergence and prove the census is live"
+    );
+    assert_eq!(ingestor.passes.load(Ordering::Acquire), 1);
+    registry.shutdown().await;
+    assert_eq!(registry.profile_worker_count().await, 0);
+    assert!(
+        !wake.wake(),
+        "shutdown must join and retire the retained worker"
+    );
+}
+
 #[tokio::test]
 async fn retained_history_worker_wakes_again_after_idle() {
     let temp = TempDir::new().unwrap();
@@ -617,6 +727,7 @@ async fn history_only_retry_does_not_admit_projection_snapshots() {
     let ingestor = Arc::new(BlockThirdHistoricalIngestor::new());
     let projector = Arc::new(CountingDeferredProjector {
         calls: AtomicUsize::new(0),
+        released: AtomicBool::new(false),
     });
     let mut registry = SessionTemporalRefreshSchedulerRegistry::default();
     configure_scheduler(
@@ -624,15 +735,14 @@ async fn history_only_retry_does_not_admit_projection_snapshots() {
         projector.clone(),
         SessionTemporalRefreshPolicy::default(),
     );
-    SessionTemporalStore::new(authority.database())
-        .begin_or_join_session_refresh(SessionRefreshBeginOrJoinRequestV1::new(
-            SessionId::new("session.history-only-retry").unwrap(),
-            SessionRefreshFrontierV1::new(1, 0).unwrap(),
-        ))
-        .await
-        .unwrap();
+    let seeded = HealthyProvidersWithBlockedCursorIngestor::new(authority.database.clone());
+    assert!(
+        seeded
+            .admit_healthy_provider("claude", "session.history-only-retry")
+            .await
+    );
 
-    registry
+    let wake = registry
         .ensure_profile_with_history(
             authority.database().db_path().to_path_buf(),
             authority.database.clone(),
@@ -644,8 +754,24 @@ async fn history_only_retry_does_not_admit_projection_snapshots() {
             .wait_profile_idle(authority.database().db_path(), Duration::from_secs(2))
             .await
     );
+    assert!(projector.calls.load(Ordering::Acquire) > 0);
+    assert_eq!(ingestor.passes.load(Ordering::Acquire), 1);
+    // History stays withheld while the initial projector is deferred. Release
+    // that real publication before exercising a history-only capacity retry.
+    projector.released.store(true, Ordering::Release);
+    assert!(
+        wake.wake_and_wait_until_idle(Duration::from_secs(2)).await,
+        "the released canonical projector must publish the initial refresh"
+    );
+    assert_eq!(ingestor.passes.load(Ordering::Acquire), 1);
     let baseline_projection_calls = projector.calls.load(Ordering::Acquire);
     assert!(baseline_projection_calls > 0);
+
+    assert!(
+        seeded
+            .admit_healthy_provider("codex", "session.history-only-explicit-wake")
+            .await
+    );
 
     registry
         .ensure_profile_with_history(
@@ -996,6 +1122,7 @@ async fn blocked_cursor_failure_projects_healthy_provider_progress_once_across_r
             .await,
         "healthy provider progress must request temporal projection even while Cursor is blocked"
     );
+    assert_eq!(ingestor.passes.load(Ordering::Acquire), 1);
     assert_eq!(
         wake.serving_status().state,
         SessionProjectionServingState::Stale {
@@ -1076,6 +1203,7 @@ async fn blocked_cursor_failure_projects_healthy_provider_progress_once_across_r
     );
     assert_eq!(ingestor.committed.load(Ordering::Acquire), 2);
     assert_eq!(ingestor.duplicates.load(Ordering::Acquire), 2);
+    assert_eq!(ingestor.passes.load(Ordering::Acquire), 2);
 
     restarted.shutdown().await;
 }
@@ -1161,12 +1289,32 @@ async fn convergence_is_published_only_after_the_last_owed_projection_commits() 
     );
     let held_epoch = held.convergence.epoch;
 
+    let deferred_wake = registry
+        .ensure_profile_with_history(
+            authority.database().db_path().to_path_buf(),
+            authority.database.clone(),
+            ingestor.clone(),
+        )
+        .await;
+    assert!(wake.same_route(&deferred_wake));
+    assert_eq!(
+        ingestor.0.passes.load(Ordering::Acquire),
+        1,
+        "an explicit history wake must wait behind the held publication"
+    );
     projector.release.add_permits(1);
     assert_eq!(
         await_convergence(&wake, authority.database()).await,
         held_epoch + 1,
         "settling the owed projection publishes one convergence event"
     );
+    assert_eq!(
+        ingestor.0.passes.load(Ordering::Acquire),
+        2,
+        "the history wake deferred during publication must run exactly once"
+    );
+    assert_eq!(ingestor.0.committed.load(Ordering::Acquire), 2);
+    assert_eq!(ingestor.0.duplicates.load(Ordering::Acquire), 2);
 
     assert!(wake.wake(), "the worker is still mounted");
     assert_eq!(

@@ -3521,10 +3521,9 @@ fn init_refuses_ephemeral_project_in_persistent_profile() {
 
 /// `storage report` is read-only and works against an explicit
 /// `--profile-root` without any daemon or registered project, reporting a
-/// real registered store's size and an unregistered directory's presence
-/// (plan 38 §7, size observability reachable from a command).
+/// logical file sizes and an explicit unavailable registry inventory.
 #[test]
-fn storage_report_prints_registered_store_size_and_unregistered_backlog() {
+fn storage_report_offline_preserves_files_and_reports_registry_unavailable() {
     let home = TempDir::new().unwrap();
     let project = TempDir::new().unwrap();
     let profile_root = profile_root(home.path());
@@ -3559,6 +3558,20 @@ fn storage_report_prints_registered_store_size_and_unregistered_backlog() {
     std::fs::create_dir_all(&unregistered).unwrap();
     std::fs::write(unregistered.join("payload.bin"), vec![0u8; 4096]).unwrap();
     std::fs::write(profile_root.join("user-sessions.db"), vec![1u8; 2048]).unwrap();
+    let database_paths = [
+        registered_root.join("tracedecay.db"),
+        profile_root.join("global.db"),
+        profile_root.join("user-sessions.db"),
+    ];
+    let before = database_paths
+        .iter()
+        .map(|path| {
+            (
+                std::fs::read(path).unwrap(),
+                path.metadata().unwrap().modified().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
 
     let mut command = tracedecay_command_without_daemon(home.path(), project.path());
     command.args([
@@ -3577,12 +3590,46 @@ fn storage_report_prints_registered_store_size_and_unregistered_backlog() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("report json");
-    assert_eq!(report["stores"].as_array().unwrap().len(), 1);
-    assert_eq!(report["stores"][0]["project_id"], "proj_cli");
-    assert!(report["stores"][0]["total_bytes"].as_u64().unwrap() > 0);
-    assert_eq!(report["unregistered_dir_count"], 1);
-    assert!(report["unregistered_bytes"].as_u64().unwrap() >= 4096);
+    assert!(report["stores"].as_array().unwrap().is_empty());
+    assert_eq!(report["registry"]["state"], "unavailable");
+    assert_eq!(
+        report["registry"]["reason"],
+        "registered_database_authority_unavailable"
+    );
+    assert_eq!(report["unregistered_dir_count"], 0);
+    assert_eq!(report["unregistered_bytes"], 0);
     assert_eq!(report["user_sessions_db_bytes"], 2048);
+    assert_eq!(
+        report["user_sessions_database"]["main"]["logical_bytes"],
+        2048
+    );
+    assert_eq!(
+        report["user_sessions_database"]["pages"]["state"],
+        "unavailable"
+    );
+    let census =
+        tracedecay_maintenance::retention::storage_report::scan_full_profile_size(&profile_root);
+    assert_eq!(
+        report["full_profile_size"]["total_bytes"],
+        census.total_bytes
+    );
+    assert!(
+        census.total_bytes
+            >= before
+                .iter()
+                .map(|(bytes, _)| bytes.len() as u64)
+                .sum::<u64>()
+                + 4096
+    );
+    for (path, (bytes, modified)) in database_paths.iter().zip(before) {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert_eq!(path.metadata().unwrap().modified().unwrap(), modified);
+        for suffix in ["-wal", "-shm"] {
+            let mut member = path.as_os_str().to_os_string();
+            member.push(suffix);
+            assert!(!PathBuf::from(member).exists());
+        }
+    }
 }
 
 #[tokio::test]

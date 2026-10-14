@@ -8,7 +8,7 @@ use tracedecay_store::observation::{ObservationCoverageReason, ObservationCovera
 use crate::global_db_operation_error;
 use crate::observation::decode_observation_json;
 use tracedecay_domain::errors::ProjectOpenFailureKind;
-use tracedecay_runtime_core::db::engine::{Error as EngineError, QueryExecutor, params};
+use tracedecay_runtime_core::db::engine::{Error as EngineError, Executor, QueryExecutor, params};
 use tracedecay_session_temporal_store::operations::{
     FrozenPublicationReceipt, SANITIZER_VERSION as SUMMARY_PUBLICATION_SANITIZER_VERSION,
     receipt_id as summary_receipt_id,
@@ -255,8 +255,46 @@ pub(super) async fn validate_observation_authority_page(
     conn: &impl QueryExecutor,
     after_sequence: i64,
 ) -> tracedecay_domain::errors::Result<(i64, i64, bool)> {
+    let (next, audited, complete, _) =
+        read_validated_observation_authority_page(conn, after_sequence).await?;
+    Ok((next, audited, complete))
+}
+
+/// The observation watermark and these pending repairs commit together.
+/// Resuming an audited page therefore cannot skip its cursor reconciliation.
+pub(super) async fn validate_and_stage_observation_authority_page(
+    conn: &impl Executor,
+    after_sequence: i64,
+) -> tracedecay_domain::errors::Result<(i64, i64, bool)> {
+    let (next, audited, complete, cursors) =
+        read_validated_observation_authority_page(conn, after_sequence).await?;
+    for (sequence, cursor) in cursors {
+        conn.execute(
+            "INSERT INTO authority_cursor_audit_pending
+                (source_json, scope_json, observation_sequence, cursor_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(source_json, scope_json) DO UPDATE SET
+                observation_sequence = excluded.observation_sequence,
+                cursor_json = excluded.cursor_json
+             WHERE excluded.observation_sequence > authority_cursor_audit_pending.observation_sequence",
+            params![
+                encode_authority_json(cursor.source(), "validated observation source")?,
+                encode_authority_json(cursor.scope(), "validated observation scope")?,
+                sequence,
+                encode_authority_json(&cursor, "validated committed cursor")?,
+            ],
+        ).await.map_err(audit_read_error)?;
+    }
+    Ok((next, audited, complete))
+}
+
+async fn read_validated_observation_authority_page(
+    conn: &impl QueryExecutor,
+    after_sequence: i64,
+) -> tracedecay_domain::errors::Result<(i64, i64, bool, Vec<(i64, ObservationSourceCursorV1)>)> {
     let mut high_water = after_sequence;
     let mut audited = 0;
+    let mut cursors = Vec::new();
     let mut rows = conn
         .query(
             "SELECT observation.sequence, observation.observation_id,
@@ -305,16 +343,23 @@ pub(super) async fn validate_observation_authority_page(
         if cursor.source() != observation.source()
             || cursor.scope() != observation.scope()
             || cursor.generation() != observation.identity().generation()
+            || cursor.ordering_domain() != observation.identity().ordering_domain()
             || cursor.position() != observation.identity().position().end()
         {
             return Err(authority_violation(
                 "committed source cursor disagrees with observation source evidence",
             ));
         }
+        cursors.push((sequence, cursor));
         audited += 1;
     }
     drop(rows);
-    Ok((high_water, audited, page_rows < OBSERVATION_AUDIT_PAGE_ROWS))
+    Ok((
+        high_water,
+        audited,
+        page_rows < OBSERVATION_AUDIT_PAGE_ROWS,
+        cursors,
+    ))
 }
 
 pub(super) async fn validate_source_cursor_authority_rows(

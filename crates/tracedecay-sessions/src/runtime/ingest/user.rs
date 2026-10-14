@@ -213,6 +213,7 @@ pub(super) async fn try_ingest_user_codex_sessions_rotated(
     let mut bytes_consumed = 0u64;
     let mut deferred_by_byte_cap = discovery.is_truncated();
     let mut frontier_committable = true;
+    let mut metadata_failures = 0usize;
     let mut failures = Vec::new();
     for path in &discovery.paths {
         if remaining == Some(0) {
@@ -228,7 +229,7 @@ pub(super) async fn try_ingest_user_codex_sessions_rotated(
         };
         if let Some(failure) = pending.cached_source_failure(path) {
             failures.push(failure);
-            frontier_committable = false;
+            deferred_by_byte_cap = true;
             continue;
         }
         let progress = match codex::try_admit_codex_jsonl_observations_for_profile_with_admission_and_cancellation(
@@ -250,12 +251,17 @@ pub(super) async fn try_ingest_user_codex_sessions_rotated(
                     &error,
                     "Codex transcript catch-up failed",
                 );
-                if failure.retryable {
+                if !error.is_source_disposition() {
                     return Err(error);
                 }
+                metadata_failures += usize::from(error.consumes_metadata_failure_budget());
                 pending.record_source_failure(path, &error, failure)?;
                 failures.push(failure);
-                frontier_committable = false;
+                deferred_by_byte_cap = true;
+                if metadata_failures >= super::failure::MAX_CODEX_SOURCE_FAILURES_PER_PASS {
+                    frontier_committable = false;
+                    break;
+                }
                 continue;
             }
         };
@@ -266,6 +272,14 @@ pub(super) async fn try_ingest_user_codex_sessions_rotated(
         if let Some(available) = remaining {
             remaining = Some(available.saturating_sub(progress.bytes_consumed));
         }
+    }
+    if let Some((hub, consumer)) = discovery_state {
+        for failure in hub.retained_source_failures(consumer) {
+            if !failures.contains(&failure) {
+                failures.push(failure);
+            }
+        }
+        deferred_by_byte_cap |= !failures.is_empty();
     }
     let stats = drain_observation_projections(
         admission,

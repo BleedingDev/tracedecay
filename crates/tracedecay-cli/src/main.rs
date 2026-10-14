@@ -415,14 +415,52 @@ fn process_exit_code(code: i32) -> ExitCode {
 
 #[cfg(unix)]
 fn restore_sigpipe_default() -> std::io::Result<()> {
-    // SAFETY: `async_main` calls this only after selecting the one-shot tool
-    // client mode, before that mode starts worker threads or writes output.
+    // SAFETY: `async_main` calls this only for the one-shot tool client mode,
+    // before that mode starts worker threads or writes output.
     let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     if previous == libc::SIG_ERR {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
+        return Err(std::io::Error::last_os_error());
     }
+    // A blocked mask survives exec, and some launchers hand SIGPIPE over
+    // blocked: the default action then never runs and the write fails with
+    // EPIPE instead. Unblock it on this thread, which writes the output and
+    // whose mask later threads inherit.
+    // SAFETY: `set` is a local signal set initialised by `sigemptyset` before
+    // use, and `pthread_sigmask` only reads it.
+    let unblocked = unsafe {
+        let mut set = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        libc::sigemptyset(set.as_mut_ptr());
+        libc::sigaddset(set.as_mut_ptr(), libc::SIGPIPE);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, set.as_ptr(), std::ptr::null_mut())
+    };
+    if unblocked != 0 {
+        return Err(std::io::Error::from_raw_os_error(unblocked));
+    }
+    // The default disposition alone is not enough everywhere. Linux raises
+    // the pipe write's SIGPIPE on the writing thread before the call returns,
+    // so the process ends inside `write`. macOS posts it to the process and
+    // delivers it asynchronously: `write` returns EPIPE first, `println!`
+    // panics, and the panic message reaches stderr before the pending signal
+    // ends the process. End the process the way the signal would have, from
+    // the thread that hit the closed pipe, before anything is printed.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        if message.contains("Broken pipe") {
+            // SAFETY: SIGPIPE's disposition was restored to the default above;
+            // raising it on this thread terminates the process.
+            unsafe {
+                libc::raise(libc::SIGPIPE);
+            }
+        }
+        default_hook(info);
+    }));
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -493,6 +531,18 @@ fn async_main() -> tracedecay_domain::errors::Result<CommandOutcome> {
         // parse replaces it below with the exact canonical nested command path.
         tracing::trace!(name: "cli.command.name", value = ?command.as_str());
     }
+    // The one-shot tool client is a pipeline stage: a reader that exits early
+    // (`tracedecay tool | head`) must end it quietly. Selected from argv, before
+    // help, usage, or parse errors can write to a closed pipe with SIGPIPE
+    // still ignored, which panicked in `println!` instead.
+    #[cfg(unix)]
+    if args.get(1).map(String::as_str) == Some("tool") {
+        restore_sigpipe_default().map_err(|error| {
+            tracedecay_domain::errors::TraceDecayError::Config {
+                message: format!("failed to configure tool pipeline output: {error}"),
+            }
+        })?;
+    }
     if render_dynamic_command_help(&args) {
         return Ok(CommandOutcome::Success);
     }
@@ -516,6 +566,8 @@ fn async_main() -> tracedecay_domain::errors::Result<CommandOutcome> {
         }
     };
     normalize_tool_reserved_global_flags(&mut cli);
+    // Global flags may precede the subcommand (`tracedecay --json tool ...`),
+    // which the argv check above does not see.
     #[cfg(unix)]
     if matches!(cli.command.as_ref(), Some(Commands::Tool { .. })) {
         restore_sigpipe_default().map_err(|error| {

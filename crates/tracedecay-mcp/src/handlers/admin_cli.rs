@@ -48,6 +48,7 @@ struct AdminCliContext<'a> {
     /// The daemon's code-index scheduler registry, which resolves the
     /// retention protection set a storage report plans against.
     code_index_schedulers: Option<&'a CodeIndexSchedulerRegistryV1>,
+    storage_report_databases: &'a [RegisteredGlobalDbLeaseV1],
 }
 
 impl<'a> AdminCliContext<'a> {
@@ -80,6 +81,7 @@ impl<'a> AdminCliContext<'a> {
             deadline,
             cancellation,
             code_index_schedulers: None,
+            storage_report_databases: &[],
         }
     }
 
@@ -89,6 +91,7 @@ impl<'a> AdminCliContext<'a> {
         profile_root: &'a Path,
         active_checkout: Option<&'a Path>,
         code_index_schedulers: Option<&'a CodeIndexSchedulerRegistryV1>,
+        storage_report_databases: &'a [RegisteredGlobalDbLeaseV1],
     ) -> Self {
         Self {
             global_db,
@@ -104,6 +107,7 @@ impl<'a> AdminCliContext<'a> {
             deadline: None,
             cancellation: None,
             code_index_schedulers,
+            storage_report_databases,
         }
     }
 
@@ -232,6 +236,7 @@ pub async fn compute_projectless_admin_cli(
     profile_root: &Path,
     active_checkout: Option<&Path>,
     code_index_schedulers: Option<&CodeIndexSchedulerRegistryV1>,
+    storage_report_databases: &[RegisteredGlobalDbLeaseV1],
 ) -> Result<AdminCliResultV1> {
     dispatch_admin_cli(
         AdminCliContext::projectless(
@@ -240,6 +245,7 @@ pub async fn compute_projectless_admin_cli(
             profile_root,
             active_checkout,
             code_index_schedulers,
+            storage_report_databases,
         ),
         request,
     )
@@ -418,6 +424,23 @@ async fn dispatch_admin_cli(
             limit,
         } => {
             let profile_root = context.require_profile_root()?;
+            let session_databases = [
+                context
+                    .registered_user_session_db
+                    .map(|database| &**database),
+                context
+                    .registered_project_session_db
+                    .map(|database| &**database),
+            ]
+            .into_iter()
+            .flatten()
+            .chain(
+                context
+                    .storage_report_databases
+                    .iter()
+                    .map(|database| &**database),
+            )
+            .collect::<Vec<_>>();
             let report = match (project_id, project_root) {
                 (Some(project_id), Some(project_root)) => {
                     if cursor.is_some() {
@@ -432,6 +455,7 @@ async fn dispatch_admin_cli(
                         &project_root,
                         global_db,
                         context.code_index_schedulers,
+                        &session_databases,
                     )
                     .await?
                 }
@@ -442,6 +466,7 @@ async fn dispatch_admin_cli(
                         context.code_index_schedulers,
                         cursor.as_deref(),
                         limit,
+                        &session_databases,
                     )
                     .await?
                 }
@@ -883,7 +908,7 @@ mod tests {
             .await
             .unwrap();
         let mut context =
-            AdminCliContext::projectless(&profile_database, None, &profile, None, None);
+            AdminCliContext::projectless(&profile_database, None, &profile, None, None, &[]);
         context.project = Some(&project);
         // A supplied foreign session pointer must never substitute for the
         // current project's registered runtime authority.
@@ -906,6 +931,102 @@ mod tests {
             error
                 .to_string()
                 .contains("requires an initialized project")
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_cli_storage_report_uses_retained_session_authorities_and_pages_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let profile = directory.path().join("profile");
+        let checkout = directory.path().join("checkout");
+        let identity =
+            tracedecay_daemon_identity::profile_identity::load_or_create(&profile).unwrap();
+        let runtime = tracedecay_global_db::tests::harness::RegisteredGlobalDbTestRuntime::project_for_profile_identity(
+            &profile,
+            &checkout,
+            ProjectId::new("proj_report").unwrap(),
+            tracedecay_runtime_core::db::TestRuntimeProfileIdentityV1::new(
+                identity.brain_id().clone(),
+                identity.profile_id().clone(),
+            ),
+        )
+        .await
+        .unwrap();
+        let registry = runtime.profile_database_arc();
+        let project = runtime.project_database_arc().unwrap();
+        registry
+            .upsert_code_project("proj_report", &checkout, None, None, None)
+            .await
+            .unwrap();
+        let held = [registry.clone(), project];
+        let request = AdminCliSurfaceRequestV1::StorageReport {
+            project_id: None,
+            project_root: None,
+            cursor: None,
+            limit: 1,
+        };
+        let result =
+            compute_projectless_admin_cli(request, &registry, None, &profile, None, None, &held)
+                .await
+                .unwrap();
+        let AdminCliResultV1::StorageReport(first) = result else {
+            panic!("storage report expected");
+        };
+        assert!(matches!(
+            first.user_sessions_database.as_ref().unwrap().pages,
+            tracedecay_contracts::retrieval::SessionDatabasePagesV1::Observed { .. }
+        ));
+        assert_eq!(first.stores.len(), 1);
+        assert_eq!(
+            first.stores[0]["sessions_database"]["pages"]["state"],
+            "observed"
+        );
+        let cursor = first.coverage["next_cursor"].as_str().unwrap().to_owned();
+        let result = compute_projectless_admin_cli(
+            AdminCliSurfaceRequestV1::StorageReport {
+                project_id: None,
+                project_root: None,
+                cursor: Some(cursor),
+                limit: 1,
+            },
+            &registry,
+            None,
+            &profile,
+            None,
+            None,
+            &held,
+        )
+        .await
+        .unwrap();
+        let AdminCliResultV1::StorageReport(second) = result else {
+            panic!("storage report expected");
+        };
+        assert!(second.user_sessions_database.is_none());
+        assert_eq!(
+            second.registry,
+            Some(tracedecay_contracts::retrieval::StorageReportRegistryV1::Available)
+        );
+        let foreign_root = directory.path().join("foreign-root");
+        std::fs::create_dir_all(&foreign_root).unwrap();
+        let refused = compute_projectless_admin_cli(
+            AdminCliSurfaceRequestV1::StorageReport {
+                project_id: Some("proj_report".to_owned()),
+                project_root: Some(foreign_root),
+                cursor: None,
+                limit: 1,
+            },
+            &registry,
+            None,
+            &profile,
+            None,
+            None,
+            &held,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            refused.project_route_context().unwrap().0,
+            "project_identity_mismatch"
         );
     }
 

@@ -7,6 +7,7 @@
 
 use std::path::{Component, Path};
 
+use tracedecay_contracts::automation::AgentTaskFailureClass;
 use tracedecay_domain::HydrationStateV1;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -498,6 +499,7 @@ pub enum LcmError {
     StaleRawProtectionSource {
         store_id: i64,
     },
+    StaleSummarySourceContent,
     StaleSummarySourceRange {
         expected_from: i64,
         expected_to: i64,
@@ -510,6 +512,12 @@ pub enum LcmError {
     Cancelled,
     DeadlineExceeded,
     BudgetExhausted,
+    /// A configured executor failed after selection. Its provider classification
+    /// remains authoritative for retry, independently of missing configuration.
+    SummarizerFailed {
+        class: AgentTaskFailureClass,
+        reason: &'static str,
+    },
     /// The content deterministically failed privacy sanitization or receipt
     /// binding. These are pure functions of the bytes, so retrying the same
     /// content can never succeed; callers must record a durable refusal
@@ -606,6 +614,7 @@ impl std::fmt::Display for LcmError {
                 f,
                 "raw protection source {store_id} changed while payloads were staged"
             ),
+            Self::StaleSummarySourceContent => write!(f, "selected summary source content changed"),
             Self::StaleSummarySourceRange {
                 expected_from,
                 expected_to,
@@ -628,6 +637,9 @@ impl std::fmt::Display for LcmError {
             }
             Self::BudgetExhausted => {
                 write!(f, "LCM payload verification budget was exhausted")
+            }
+            Self::SummarizerFailed { class, reason } => {
+                write!(f, "LCM summarizer failed ({class:?}): {reason}")
             }
             Self::SanitizationRefused { reason, .. } => {
                 write!(f, "content sanitization refused: {reason}")

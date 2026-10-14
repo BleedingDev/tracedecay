@@ -56,7 +56,9 @@ impl NcmJourney {
         } else {
             TempDir::new().expect("isolated NCM HOME")
         };
-        let root = fs::canonicalize(home.path()).expect("canonical NCM HOME");
+        // Plain host form, as the product reports roots (no Windows `\\?\` prefix).
+        let root = tracedecay_runtime_core::path_safety::canonical_existing_identity(home.path())
+            .expect("canonical NCM HOME");
         let profile = ProfileRoot::new(root.join("tracedecay-profile"))
             .with_home(&root)
             .with_xdg_config_home(root.join(".config"));

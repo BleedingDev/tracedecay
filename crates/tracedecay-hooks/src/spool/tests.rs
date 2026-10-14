@@ -1828,3 +1828,29 @@ fn bounded_writer_admission_preserves_failfast_and_times_out_without_mutation() 
     let (_, report) = HookSpoolV1::open(&root.0, config(), UtcMicros(13)).unwrap();
     assert_eq!(report.next_sequence, 2);
 }
+
+#[test]
+fn corrupted_checkpoint_scope_rebuilds_from_exact_records_before_selection() {
+    let root = TestDir::new("checkpoint-scope-corruption");
+    let cfg = HookSpoolConfigV1::stock(NativeHostIdentityV1::CursorDesktop);
+    let events = vec![envelope(1, 9), envelope(2, 10)];
+    publish_checkpoint(&root.0, cfg, &events);
+    let mut bytes = fs::read(checkpoint_path(&root.0)).unwrap();
+    let entry_at = CHECKPOINT_HEADER_BYTES + 4 + checkpoint_header_json_len(&bytes);
+    bytes[entry_at + 116] ^= 0xff;
+    fs::write(checkpoint_path(&root.0), bytes).unwrap();
+    let (mut spool, report) = HookSpoolV1::open(&root.0, cfg, UtcMicros(20)).unwrap();
+    assert_eq!(report.scanned_records, 2);
+    assert_eq!(spool.pending_scope_count([1; 16], [3; 16]), 2);
+    let batches = spool
+        .claim_replay_batches_in_scope(UtcMicros(20), 4, Some(([1; 16], [3; 16])))
+        .unwrap();
+    assert_eq!(
+        batches
+            .iter()
+            .flat_map(|batch| &batch.records)
+            .map(|record| record.envelope.clone())
+            .collect::<Vec<_>>(),
+        events
+    );
+}

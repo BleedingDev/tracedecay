@@ -12,7 +12,7 @@
 //! the production model gate.
 
 use crate::ports::{Deadline, Embedding, EncoderError, EncoderIdentity, StateRoot, TextEncoder};
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsMaybeDirExt};
 use cap_std::{
     ambient_authority,
     fs::{Dir, OpenOptions},
@@ -1382,7 +1382,12 @@ fn open_model_directory(models_dir: &Path) -> Result<Dir, EncoderError> {
 
 fn open_directory_nofollow(parent: &Dir, name: &OsStr, path: &Path) -> Result<Dir, EncoderError> {
     let mut options = OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
+    // `maybe_dir`: Windows grants a directory handle only with backup
+    // semantics and refuses the open as access denied otherwise.
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
     let file = parent.open_with(name, &options).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             EncoderError::ArtifactsMissing(path.display().to_string())

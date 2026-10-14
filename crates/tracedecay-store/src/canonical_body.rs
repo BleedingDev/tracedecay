@@ -32,6 +32,69 @@ pub const CANONICAL_BODIES_TABLE_SQL: &str = "
             uncompressed_bytes INTEGER NOT NULL CHECK(uncompressed_bytes >= 0)
         );";
 
+/// Rebuildable ownership projection. Missing bodies remain a retrieval error,
+/// so hashes deliberately have no foreign key to canonical content.
+pub const CANONICAL_BODY_REFERENCES_TABLE_SQL: &str =
+    "CREATE TABLE IF NOT EXISTS session_canonical_body_references (
+        owner_kind TEXT NOT NULL CHECK(owner_kind IN ('observation', 'raw')),
+        owner_key TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        PRIMARY KEY(owner_kind, owner_key, content_hash)
+    );";
+
+pub const CANONICAL_BODY_REFERENCES_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_session_canonical_body_references_hash
+        ON session_canonical_body_references(content_hash);";
+
+pub const INSERT_OBSERVATION_BODY_REFERENCE_SQL: &str = "
+    INSERT OR IGNORE INTO session_canonical_body_references
+        (owner_kind, owner_key, content_hash) VALUES ('observation', ?1, ?2)";
+
+/// Every raw hash stays pinned because existing readers can hydrate canonical
+/// storage even when the row also describes an external payload.
+pub const LCM_RAW_CANONICAL_REFS_INSERT_SQL: &str =
+    "CREATE TRIGGER IF NOT EXISTS lcm_raw_canonical_refs_insert
+    AFTER INSERT ON lcm_raw_messages BEGIN
+        INSERT OR IGNORE INTO session_canonical_body_references
+            (owner_kind, owner_key, content_hash)
+        VALUES ('raw', CAST(NEW.store_id AS TEXT), NEW.content_hash);
+    END;";
+
+pub const LCM_RAW_CANONICAL_REFS_UPDATE_SQL: &str =
+    "CREATE TRIGGER IF NOT EXISTS lcm_raw_canonical_refs_update
+    AFTER UPDATE OF content_hash, store_id ON lcm_raw_messages BEGIN
+        DELETE FROM session_canonical_body_references
+        WHERE owner_kind = 'raw' AND owner_key = CAST(OLD.store_id AS TEXT);
+        INSERT OR IGNORE INTO session_canonical_body_references
+            (owner_kind, owner_key, content_hash)
+        VALUES ('raw', CAST(NEW.store_id AS TEXT), NEW.content_hash);
+    END;";
+
+pub const LCM_RAW_CANONICAL_REFS_DELETE_SQL: &str =
+    "CREATE TRIGGER IF NOT EXISTS lcm_raw_canonical_refs_delete
+    AFTER DELETE ON lcm_raw_messages BEGIN
+        DELETE FROM session_canonical_body_references
+        WHERE owner_kind = 'raw' AND owner_key = CAST(OLD.store_id AS TEXT);
+    END;";
+
+pub const RAW_CANONICAL_BODY_REFERENCE_TRIGGERS: &[(&str, &str, &str)] = &[
+    (
+        "lcm_raw_canonical_refs_insert",
+        "lcm_raw_messages",
+        LCM_RAW_CANONICAL_REFS_INSERT_SQL,
+    ),
+    (
+        "lcm_raw_canonical_refs_update",
+        "lcm_raw_messages",
+        LCM_RAW_CANONICAL_REFS_UPDATE_SQL,
+    ),
+    (
+        "lcm_raw_canonical_refs_delete",
+        "lcm_raw_messages",
+        LCM_RAW_CANONICAL_REFS_DELETE_SQL,
+    ),
+];
+
 pub const UPSERT_CANONICAL_BODY_SQL: &str = "INSERT OR IGNORE INTO session_canonical_bodies
             (content_hash, encoding, body, uncompressed_bytes)
          VALUES (?1, ?2, ?3, ?4)";

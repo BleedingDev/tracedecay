@@ -20,7 +20,8 @@ use crate::configuration::registry::ConfigurationRegistry;
 use crate::configuration::resolver::resolve_configuration;
 use tracedecay_domain::configuration::{
     CodeIndexWorkerSelectionV1, ConfigurationIdempotencyKey, ConfigurationLayerIdV1,
-    ConfigurationMutationOperationV1, SettingKey, USER_CODE_INDEX_WORKERS_SETTING_KEY,
+    ConfigurationMutationOperationV1, LcmSummarizerExecutableV1, SettingKey,
+    USER_CODE_INDEX_WORKERS_SETTING_KEY, USER_LCM_CODEX_SUMMARIZER_SETTING_KEY,
     USER_REPEATED_QUERY_HINTS_SETTING_KEY, USER_UPLOAD_ENABLED_SETTING_KEY,
 };
 
@@ -177,6 +178,12 @@ async fn worker_only_profile_store_converges_onto_the_profile_registry() {
     assert_eq!(
         converged.code_index_workers().unwrap().selection,
         CodeIndexWorkerSelectionV1::Exact { workers: 8 }
+    );
+    assert_eq!(
+        converged
+            .value(USER_LCM_CODEX_SUMMARIZER_SETTING_KEY)
+            .unwrap(),
+        &ConfigurationValueV1::LcmSummarizerExecutable(LcmSummarizerExecutableV1::Unconfigured)
     );
     assert_eq!(
         converged.value(USER_UPLOAD_ENABLED_SETTING_KEY).unwrap(),
@@ -573,5 +580,157 @@ async fn fresh_stores_resolve_without_the_retired_default_collection_setting() {
     assert!(
         !current.snapshot.effective_values.contains_key(&retired),
         "a canonically initialized revision-4 store must not carry the retired setting"
+    );
+}
+
+#[tokio::test]
+async fn profile_summarizer_mutation_reopens_with_exact_profile_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    let profile_root = directory.path().join("profile");
+    let configured = LcmSummarizerExecutableV1::configured_with(
+        directory.path().join("explicit-codex"),
+        Some("operator-model".to_owned()),
+        Some(30),
+    )
+    .unwrap();
+    let key = SettingKey::new(USER_LCM_CODEX_SUMMARIZER_SETTING_KEY).unwrap();
+    let committed = {
+        let runtime = crate::tests::harness::HostAdmissionTestRuntimeV1::profile(&profile_root)
+            .await
+            .unwrap();
+        let db = runtime
+            .registered_database(HostAdmissionScope::Profile)
+            .unwrap();
+        let profile_id = db.binding().shard_id.profile_id.clone();
+        let store =
+            super::super::ProfileConfigurationStore::new_registered(db, &profile_id).unwrap();
+        let initial = store.read_or_initialize(UtcMicros(1)).await.unwrap();
+        assert_eq!(
+            initial
+                .value(USER_LCM_CODEX_SUMMARIZER_SETTING_KEY)
+                .unwrap(),
+            &ConfigurationValueV1::LcmSummarizerExecutable(LcmSummarizerExecutableV1::Unconfigured)
+        );
+        let layer = ConfigurationLayerIdV1::UserProfile { profile_id };
+        let authority = control_authority_with_key_for_layer(
+            ConfigurationMutationOperationV1::DirectMutation,
+            &initial.revision_id,
+            Some(
+                ConfigurationIdempotencyKey::new("configuration.idempotency.profile-summarizer")
+                    .unwrap(),
+            ),
+            layer.clone(),
+        );
+        store
+            .commit_direct(
+                &authority,
+                &DirectConfigurationMutation::Set {
+                    layer,
+                    key: key.clone(),
+                    value: Box::new(ConfigurationValueV1::LcmSummarizerExecutable(
+                        configured.clone(),
+                    )),
+                },
+                &initial.revision_id,
+            )
+            .await
+            .unwrap()
+            .current
+    };
+    let reopened = crate::tests::harness::HostAdmissionTestRuntimeV1::profile(&profile_root)
+        .await
+        .unwrap();
+    let db = reopened
+        .registered_database(HostAdmissionScope::Profile)
+        .unwrap();
+    let profile_id = db.binding().shard_id.profile_id.clone();
+    let store = super::super::ProfileConfigurationStore::new_registered(db, &profile_id).unwrap();
+    let current = store.read_or_initialize(UtcMicros(2)).await.unwrap();
+    assert_eq!(current, committed);
+    assert_eq!(
+        current
+            .value(USER_LCM_CODEX_SUMMARIZER_SETTING_KEY)
+            .unwrap(),
+        &ConfigurationValueV1::LcmSummarizerExecutable(configured)
+    );
+    let other = crate::tests::harness::HostAdmissionTestRuntimeV1::profile(
+        directory.path().join("other-profile"),
+    )
+    .await
+    .unwrap();
+    let other_db = other
+        .registered_database(HostAdmissionScope::Profile)
+        .unwrap();
+    let other_id = &other_db.binding().shard_id.profile_id;
+    assert!(super::super::ProfileConfigurationStore::new_registered(db, other_id).is_err());
+    assert_eq!(
+        super::super::ProfileConfigurationStore::new_registered(other_db, other_id)
+            .unwrap()
+            .read_or_initialize(UtcMicros(3))
+            .await
+            .unwrap()
+            .value(USER_LCM_CODEX_SUMMARIZER_SETTING_KEY)
+            .unwrap(),
+        &ConfigurationValueV1::LcmSummarizerExecutable(LcmSummarizerExecutableV1::Unconfigured)
+    );
+    assert!(
+        ConfigurationRegistry::core()
+            .unwrap()
+            .definition(&key)
+            .is_err()
+    );
+    let (_project_dir, project_runtime, _) = global_setup().await;
+    let project_db = project_runtime
+        .registered_database(HostAdmissionScope::Project)
+        .unwrap();
+    assert!(
+        super::super::ProfileConfigurationStore::new_registered(project_db, &profile_id).is_err()
+    );
+}
+
+#[tokio::test]
+async fn shipped_profile_snapshot_adds_only_the_unconfigured_summarizer() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = crate::tests::harness::HostAdmissionTestRuntimeV1::profile(
+        directory.path().join("profile"),
+    )
+    .await
+    .unwrap();
+    let db = runtime
+        .registered_database(HostAdmissionScope::Profile)
+        .unwrap();
+    let registry = ConfigurationRegistry::profile().unwrap();
+    let shipped = ConfigurationRegistry::from_definitions(
+        registry
+            .definitions()
+            .filter(|definition| definition.key.as_str() != USER_LCM_CODEX_SUMMARIZER_SETTING_KEY)
+            .cloned(),
+    )
+    .unwrap();
+    let initial = id("configuration.profile.before-summarizer");
+    let old = resolve_configuration(&shipped, &[]).unwrap();
+    GlobalDbConfigurationControlStore::new_registered(db)
+        .initialize_canonical_with_registry(&initial, &old, UtcMicros(1), &shipped)
+        .await
+        .unwrap();
+    let store = super::super::ProfileConfigurationStore::new_registered(
+        db,
+        &db.binding().shard_id.profile_id,
+    )
+    .unwrap();
+    let current = store.read_or_initialize(UtcMicros(2)).await.unwrap();
+    assert_ne!(current.revision_id, initial);
+    assert_eq!(
+        current
+            .value(USER_LCM_CODEX_SUMMARIZER_SETTING_KEY)
+            .unwrap(),
+        &ConfigurationValueV1::LcmSummarizerExecutable(LcmSummarizerExecutableV1::Unconfigured)
+    );
+    for (key, value) in old.snapshot.effective_values {
+        assert_eq!(current.snapshot.effective_values.get(&key), Some(&value));
+    }
+    assert_eq!(
+        store.read_or_initialize(UtcMicros(3)).await.unwrap(),
+        current
     );
 }

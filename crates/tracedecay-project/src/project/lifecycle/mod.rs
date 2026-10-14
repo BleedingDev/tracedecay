@@ -393,7 +393,7 @@ impl TraceDecay {
             let _ = branch_meta::save_branch_meta(&store_layout.data_root, &meta);
         }
 
-        let ts = Self {
+        let mut ts = Self {
             db,
             profile_database,
             store_runtime_registry: runtime_registry,
@@ -401,6 +401,7 @@ impl TraceDecay {
             configuration_runtime,
             project_root: project_root.to_path_buf(),
             store_layout,
+            hook_publications: std::sync::Mutex::new(Vec::new()),
             open_options,
             active_branch,
             serving_branch,
@@ -408,23 +409,25 @@ impl TraceDecay {
             read_only: false,
             #[cfg(any(test, feature = "test-helpers"))]
             test_runtime_guard: None,
+            context_scout_owner: None,
             _standalone_maintenance_scope: None,
         };
         // First-touch parity with the registered open path: daemon warm-up
         // refuses to advertise an identity-bearing project whose Context
         // Scout owner is absent, so init must start it too.
-        tracedecay_agent_hosts::hooks::publish_hook_bindings(
-            &crate::runtime_ports::hook_runtime(
-                tracedecay_runtime_core::config::ProfileRoot::new(
-                    ts.open_options.resolved_profile_root()?,
-                ),
-            )?,
-            &ts.store_layout,
-        )?;
+        ts.hook_publications =
+            std::sync::Mutex::new(tracedecay_agent_hosts::hooks::publish_hook_bindings(
+                &crate::runtime_ports::hook_runtime(
+                    tracedecay_runtime_core::config::ProfileRoot::new(
+                        ts.open_options.resolved_profile_root()?,
+                    ),
+                )?,
+                &ts.store_layout,
+            )?);
         if let Some(project_id) =
             tracedecay_agent_hosts::hooks::hook_project_id_for_layout(&ts.store_layout)
         {
-            let _ = tracedecay_agent_hosts::agents::context_scout::owner::ProjectContextScoutOwnerV1::startup(
+            ts.context_scout_owner = tracedecay_agent_hosts::agents::context_scout::owner::ProjectContextScoutOwnerV1::startup(
                 ts.db.clone(),
                 project_id,
                 tracedecay_runtime_core::tracedecay::utc_now_or_one(),
@@ -571,6 +574,27 @@ impl TraceDecay {
         profile_database: RegisteredGlobalDbLeaseV1,
         runtime_registry: Arc<DaemonSessionRuntimeRegistryV1>,
     ) -> Result<Self> {
+        Self::open_with_registered_configuration_for_hook_replay(
+            project_root,
+            open_options,
+            store_layout,
+            configuration_database,
+            profile_database,
+            runtime_registry,
+            None,
+        )
+        .await
+    }
+
+    pub async fn open_with_registered_configuration_for_hook_replay(
+        project_root: &Path,
+        open_options: TraceDecayOpenOptions,
+        store_layout: StoreLayout,
+        configuration_database: RegisteredGlobalDbLeaseV1,
+        profile_database: RegisteredGlobalDbLeaseV1,
+        runtime_registry: Arc<DaemonSessionRuntimeRegistryV1>,
+        hook_recovery: Option<&[tracedecay_hooks::HookConfigurationSnapshotV1]>,
+    ) -> Result<Self> {
         let active_branch = branch::current_branch(project_root);
         let db_path = store_layout.graph_db_path.clone();
         let (serving_branch, fallback_warning) =
@@ -608,7 +632,7 @@ impl TraceDecay {
         .into_parts();
         let (configuration_runtime, _) = ProjectConfigurationRuntime::open(opened)?;
         let configuration_runtime = Arc::new(configuration_runtime);
-        let ts = Self {
+        let mut ts = Self {
             db,
             profile_database,
             store_runtime_registry: runtime_registry,
@@ -616,6 +640,7 @@ impl TraceDecay {
             configuration_runtime,
             project_root: project_root.to_path_buf(),
             store_layout,
+            hook_publications: std::sync::Mutex::new(Vec::new()),
             open_options,
             active_branch,
             serving_branch,
@@ -623,21 +648,25 @@ impl TraceDecay {
             read_only: false,
             #[cfg(any(test, feature = "test-helpers"))]
             test_runtime_guard: None,
+            context_scout_owner: None,
             _standalone_maintenance_scope: None,
         };
 
-        tracedecay_agent_hosts::hooks::publish_hook_bindings(
-            &crate::runtime_ports::hook_runtime(
-                tracedecay_runtime_core::config::ProfileRoot::new(
-                    ts.open_options.resolved_profile_root()?,
-                ),
+        ts.hook_publications = std::sync::Mutex::new(
+            tracedecay_agent_hosts::hooks::publish_hook_bindings_for_open(
+                &crate::runtime_ports::hook_runtime(
+                    tracedecay_runtime_core::config::ProfileRoot::new(
+                        ts.open_options.resolved_profile_root()?,
+                    ),
+                )?,
+                &ts.store_layout,
+                hook_recovery,
             )?,
-            &ts.store_layout,
-        )?;
+        );
         if let Some(project_id) =
             tracedecay_agent_hosts::hooks::hook_project_id_for_layout(&ts.store_layout)
         {
-            let _ = tracedecay_agent_hosts::agents::context_scout::owner::ProjectContextScoutOwnerV1::startup(
+            ts.context_scout_owner = tracedecay_agent_hosts::agents::context_scout::owner::ProjectContextScoutOwnerV1::startup(
                 ts.db.clone(),
                 project_id,
                 tracedecay_runtime_core::tracedecay::utc_now_or_one(),
@@ -813,6 +842,7 @@ impl TraceDecay {
             configuration_runtime,
             project_root: project_root.to_path_buf(),
             store_layout,
+            hook_publications: std::sync::Mutex::new(Vec::new()),
             open_options,
             active_branch,
             serving_branch,
@@ -820,6 +850,7 @@ impl TraceDecay {
             read_only: true,
             #[cfg(any(test, feature = "test-helpers"))]
             test_runtime_guard: None,
+            context_scout_owner: None,
             _standalone_maintenance_scope: None,
         })
     }

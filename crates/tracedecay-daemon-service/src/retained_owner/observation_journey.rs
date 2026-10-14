@@ -6383,6 +6383,7 @@ mod tests {
             AdversarialScriptV1, HandshakeMisbehaviourV1, MisbehaviourV1, NoPayloadSourceV1,
             ReleaseLatchV1,
         };
+        use tracedecay_memory_observation::{ObservationCommittedEffectV1, ObservationOutcomeV1};
         use tracedecay_memory_provider_registry::MemoryProviderV1;
 
         use super::*;
@@ -6395,11 +6396,6 @@ mod tests {
         /// How long a settlement wait may run before the test reports the journal
         /// snapshot instead of a bare timeout.
         const SETTLEMENT_BUDGET: Duration = Duration::from_secs(20);
-
-        /// The double's blocking hold, chosen far above every host bound in this
-        /// module so "the host answered at its own bound" is never an accident of the
-        /// provider finishing early.
-        const BLOCK_MILLIS: u64 = 5_000;
 
         /// The hold used when the point is the provider *ignoring* cancellation: long
         /// enough that the host's per-attempt bound and its whole shutdown budget both
@@ -6977,10 +6973,12 @@ mod tests {
         /// the provider.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_provider_that_hangs_past_the_attempt_budget_does_not_park_the_delivery_worker() {
+            // The hold ends when the test says so, not after a wall-clock span: a
+            // loaded runner must not let the provider answer before the host's
+            // retry is observed.
+            let release = tracedecay_memory_conformance::ReleaseLatchV1::new();
             let provider = journey_double(AdversarialScriptV1::always(
-                MisbehaviourV1::BlocksPastDeadline {
-                    block_millis: BLOCK_MILLIS,
-                },
+                MisbehaviourV1::NeverRepliesUntilReleased(release.clone()),
             ));
             let temp = TempDir::new().expect("temporary journey root");
             let fixture = mount_adversarial_journey(
@@ -7067,9 +7065,9 @@ mod tests {
             every_refusal_is_classified(&fixture);
 
             // Shutdown is the host's own statement about its worker: with the
-            // delivery thread free it quiesces well inside a budget far shorter
-            // than the provider's five-second hold. A worker parked in the
-            // provider reports `WorkerDeadline` here instead.
+            // delivery thread free it quiesces inside its budget while the
+            // provider still holds the call. A worker parked in the provider
+            // reports `WorkerDeadline` here instead.
             let failures = shutdown_within(&fixture.journey, Duration::from_secs(2)).await;
             assert!(
                 failures.is_empty(),
@@ -7098,6 +7096,7 @@ mod tests {
                 "the host parked {parked_at_peak} threads in the provider, past its own \
                  ceiling of {MAX_ABANDONED_PROVIDER_CALLS}"
             );
+            release.release();
             wait_for_provider_idle(&provider, &fixture).await;
             wait_for_census(&fixture, baseline).await;
         }
@@ -7307,21 +7306,26 @@ mod tests {
             wait_for_census(&fixture, baseline).await;
         }
 
-        /// A provider whose reported state generation moves backwards is refused, and
-        /// the refusal is durable: the journal keeps the row deliverable rather than
-        /// recording an effect the host cannot verify.
+        /// A provider whose reported state generation moves backwards is refused,
+        /// and both attempts remain durable unknown effects when the retry cap
+        /// stops delivery without recording an effect the host cannot verify.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_state_generation_that_moved_backwards_is_refused_by_the_mounted_journey() {
             let provider = journey_double(AdversarialScriptV1::always(
                 MisbehaviourV1::StateGenerationBackwards,
             ));
             let temp = TempDir::new().expect("temporary journey root");
+            // Refused answers remain pending with unknown effects. Once both
+            // provider attempts are consumed, the journal adds its own exhaustion
+            // receipt without dispatching another provider call.
+            let mut policy = bounded_policy(1_000_000);
+            policy.retention.max_attempts = 2;
             let fixture = mount_adversarial_journey(
                 &temp,
                 "project.adversarial-generation",
                 "profile.adversarial",
                 &provider,
-                bounded_policy(1_000_000),
+                policy,
             )
             .await;
             let baseline = worker_baseline(&fixture);
@@ -7331,15 +7335,81 @@ mod tests {
                 .await;
             fixture.journey.wake_delivery();
 
-            let (state, _, outcome) = wait_for_attempts(&fixture, 2).await;
+            let (state, attempts, outcome) = wait_for_delivery_row(
+                &fixture,
+                |row| row.0 == "exhausted" && fixture.journey.delivery_refusals_total() == 2,
+                "both generation refusals were not settled and published at the retry cap",
+            )
+            .await;
+            assert_eq!(attempts, 3);
             assert_ne!(state, "acknowledged", "outcome={outcome:?}");
-            assert_eq!(receipt_count(fixture.journal_path()), 2);
+            assert_eq!(provider.ledger().count_for(ProviderOperation::Observe), 2);
             assert_eq!(attempt_refusals(fixture.journal_path()).len(), 2);
+            let inspection = fixture
+                .journey
+                .journal
+                .inspect(&JournalInspectionFilterV1::default())
+                .unwrap();
+            assert_eq!(inspection.rows.len(), 1);
+            let receipts = fixture
+                .journey
+                .journal
+                .receipts_for(&inspection.rows[0].observation_id)
+                .unwrap();
+            assert_eq!(receipts.len(), 3);
+            for (receipt, attempt) in receipts[..2].iter().zip([1, 2]) {
+                assert_eq!(receipt.attempt_number, attempt);
+                assert_eq!(receipt.outcome, ObservationOutcomeV1::EffectUnknown);
+                assert_eq!(
+                    receipt.committed_effect,
+                    ObservationCommittedEffectV1::Unknown
+                );
+                assert_eq!(
+                    receipt.provider_instance_id.as_deref(),
+                    Some(JOURNEY_PROVIDER_INSTANCE_ID)
+                );
+                assert_eq!(receipt.provider_effect_summary.no_effect_reason, None);
+            }
+            let exhaustion = &receipts[2];
+            assert_eq!(exhaustion.attempt_number, 3);
+            assert_eq!(
+                exhaustion.outcome,
+                ObservationOutcomeV1::ProviderUnavailable
+            );
+            assert_eq!(
+                exhaustion.committed_effect,
+                ObservationCommittedEffectV1::None
+            );
+            assert_eq!(exhaustion.provider_instance_id, None);
+            assert_eq!(
+                exhaustion
+                    .provider_effect_summary
+                    .no_effect_reason
+                    .as_deref(),
+                Some("max_delivery_attempts_consumed")
+            );
+            for receipt in &receipts {
+                assert_eq!(receipt.provider_id.as_str(), JOURNEY_PROVIDER_ID);
+                assert_eq!(receipt.registration_revision, 1);
+                assert_eq!(receipt.state_generation_before, None);
+                assert_eq!(receipt.state_generation_after, None);
+                assert_eq!(receipt.provider_receipt_digest, None);
+                assert_eq!(receipt.provider_effect_summary.effect_count, 0);
+                assert_eq!(
+                    receipt.provider_effect_summary.stable_memory_refs,
+                    Vec::<String>::new()
+                );
+                assert_eq!(
+                    receipt.provider_effect_summary.provider_trace_refs,
+                    Vec::<String>::new()
+                );
+            }
             assert_eq!(
                 receipt_outcomes(fixture.journal_path()),
                 vec![
                     ("effect_unknown".to_owned(), "unknown".to_owned()),
                     ("effect_unknown".to_owned(), "unknown".to_owned()),
+                    ("provider_unavailable".to_owned(), "none".to_owned()),
                 ]
             );
             assert_eq!(provider.in_flight(), 0);

@@ -18,15 +18,15 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tracedecay_private_fs::RewriteWitness;
+use tracedecay_private_fs::{ChangeClockReading, RewriteWitness};
 use tracedecay_store::cursor_dispatch::{
     cursor_dispatch_model, is_subagent_dispatch_tool, record_bytes_may_name_subagent_dispatch,
 };
 
 use crate::runtime::source::{
     JsonlFileChangeToken, JsonlNativeFileIdentity, MAX_JSONL_RECORD_BYTES, RawJsonlFrame,
-    RawJsonlFrameReader, ResumeDigest, jsonl_change_token_settled, jsonl_file_change_token_under,
-    jsonl_native_file_identity, jsonl_prefix_digest,
+    RawJsonlFrameReader, ResumeDigest, jsonl_change_token_settled_at,
+    jsonl_file_change_token_under, jsonl_native_file_identity, jsonl_prefix_digest,
 };
 
 /// Bound on retained parent-transcript entries.
@@ -116,8 +116,10 @@ impl ParentFileRevision {
 /// Whether `revision` can authorize a later zero-I/O hit: its change token
 /// carries a rewrite witness that is already behind the coarse clock, so a
 /// later write must move it.
-fn parent_revision_settled(revision: &ParentFileRevision) -> bool {
-    jsonl_change_token_settled(revision.change)
+/// `reading` must predate the stat behind `revision` and every byte read it
+/// vouches for; see [`jsonl_change_token_settled_at`].
+fn parent_revision_settled(revision: &ParentFileRevision, reading: ChangeClockReading) -> bool {
+    jsonl_change_token_settled_at(revision.change, reading)
 }
 
 struct ParentDispatchEntry {
@@ -145,6 +147,9 @@ enum LookupPlan {
 
 struct ScanCommit<'a> {
     parent_path: &'a Path,
+    /// The change clock as read before `revision` was taken and before any
+    /// byte of the scan was read.
+    reading: ChangeClockReading,
     revision: ParentFileRevision,
     start: u64,
     reset: bool,
@@ -181,6 +186,10 @@ impl ParentDispatchIndex {
                 return (None, DispatchScanReceipt::EMPTY);
             }
         };
+        // Read the change clock before the stat and before any byte read:
+        // only a stamp already behind this reading proves that a later write
+        // must move it.
+        let reading = ChangeClockReading::now();
         let revision = match parent_file_revision(&file, self.witness) {
             Ok(Some(revision)) => revision,
             Ok(None) | Err(_) => {
@@ -189,7 +198,7 @@ impl ParentDispatchIndex {
             }
         };
         let (plan, digest_bytes) =
-            match self.plan_lookup(parent_path, &mut file, revision, agent_id) {
+            match self.plan_lookup(parent_path, &mut file, revision, reading, agent_id) {
                 Ok(planned) => planned,
                 Err(_) => {
                     self.forget(parent_path);
@@ -208,8 +217,8 @@ impl ParentDispatchIndex {
             LookupPlan::RefreshObserved { model } => {
                 if let Some(entry) = self.entries.get_mut(parent_path) {
                     entry.revision = revision;
-                    entry.verified_settled =
-                        entry.verified_cursor == revision.len && parent_revision_settled(&revision);
+                    entry.verified_settled = entry.verified_cursor == revision.len
+                        && parent_revision_settled(&revision, reading);
                 }
                 self.touch(parent_path);
                 (model, receipt)
@@ -227,6 +236,7 @@ impl ParentDispatchIndex {
                     file,
                     ScanCommit {
                         parent_path,
+                        reading,
                         revision,
                         start,
                         reset,
@@ -245,6 +255,7 @@ impl ParentDispatchIndex {
         parent_path: &Path,
         file: &mut File,
         revision: ParentFileRevision,
+        reading: ChangeClockReading,
         agent_id: &str,
     ) -> std::io::Result<(LookupPlan, u64)> {
         let rescan = || {
@@ -277,7 +288,7 @@ impl ParentDispatchIndex {
         if entry.revision.proves_unchanged(revision)
             && verified_cursor == revision.len
             && entry.verified_settled
-            && parent_revision_settled(&revision)
+            && parent_revision_settled(&revision, reading)
         {
             return Ok((LookupPlan::RefreshObserved { model: cached }, 0));
         }
@@ -362,7 +373,9 @@ impl ParentDispatchIndex {
         // unchanged, so the tail itself is the witness.
         if final_revision != scan.revision {
             delta.transient_model = None;
-        } else if delta.transient_model.is_some() && !parent_revision_settled(&final_revision) {
+        } else if delta.transient_model.is_some()
+            && !parent_revision_settled(&final_revision, scan.reading)
+        {
             match tail_witness_matches(&mut delta.file, delta.verified_cursor, delta.tail_witness) {
                 Ok(true) => {}
                 Ok(false) => delta.transient_model = None,
@@ -383,7 +396,7 @@ impl ParentDispatchIndex {
         entry.resume_digest = delta.resume_digest;
         entry.verified_settled = delta.verified_cursor == final_revision.len
             && delta.transient_model.is_none()
-            && parent_revision_settled(&final_revision);
+            && parent_revision_settled(&final_revision, scan.reading);
         let model = entry
             .models
             .get(scan.agent_id)
@@ -739,7 +752,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use tempfile::TempDir;
-    use tracedecay_private_fs::RewriteWitness;
+    use tracedecay_private_fs::{ChangeClockReading, RewriteWitness};
 
     use super::{
         DispatchScanReceipt, ParentDispatchIndex, parent_dispatch_model_for_subagent_with_receipt,
@@ -1199,6 +1212,7 @@ mod tests {
         agent_id: &'a str,
     ) -> (super::ScanCommit<'a>, super::ScanDelta) {
         let file = fs::File::open(parent_path).unwrap();
+        let reading = ChangeClockReading::now();
         let revision = super::parent_file_revision(&file, index.witness)
             .unwrap()
             .unwrap();
@@ -1208,6 +1222,7 @@ mod tests {
         (
             super::ScanCommit {
                 parent_path,
+                reading,
                 revision,
                 start: 0,
                 reset: true,

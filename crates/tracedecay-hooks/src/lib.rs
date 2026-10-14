@@ -28,9 +28,10 @@ pub use capture::{
     NativeHookCaptureOutcomeV1, NativeHookCaptureSourceV1, capture_native_event_for_replay,
 };
 pub use config::{
-    HOOK_CONFIGURATION_SCHEMA_VERSION, HookConfigurationFileReaderV1,
+    HOOK_BINDING_LEASE_MICROS, HOOK_CONFIGURATION_SCHEMA_VERSION, HookConfigurationFileReaderV1,
     HookConfigurationFileWriterV1, HookConfigurationPublisherV1, HookConfigurationReadOutcomeV1,
-    HookConfigurationSnapshotV1, HookConfigurationSubscriberV1, hook_configuration_path,
+    HookConfigurationSnapshotV1, HookConfigurationSubscriberV1, OwnedHookConfigurationV1,
+    hook_configuration_path,
 };
 pub use core_events::{
     DaemonHookEvent, HOOK_EVENT_METHOD, HookEventNotifyOutcomeV1, HookRouteMetadata,

@@ -3,7 +3,10 @@ use std::time::Duration;
 use tracedecay_runtime_core::config::ProfileRoot;
 
 use crate::cli::ProfileStorageAction;
-use tracedecay_contracts::retrieval::{AdminCliResultV1, AdminCliSurfaceRequestV1};
+use tracedecay_contracts::retrieval::{
+    AdminCliResultV1, AdminCliSurfaceRequestV1, SessionDatabaseFileSizeV1, SessionDatabasePagesV1,
+    SessionDatabaseSizeV1, StorageReportRegistryV1,
+};
 use tracedecay_global_db::profile_registry_maintenance::remove_store_directory;
 use tracedecay_runtime_core::lifecycle_lease::{
     ExclusiveLeaseAttempt, try_acquire_exclusive_for_profile,
@@ -375,6 +378,12 @@ fn merge_storage_report_page(
     report.user_sessions_db_bytes = report
         .user_sessions_db_bytes
         .max(page.user_sessions_db_bytes);
+    if report.user_sessions_database.is_none() {
+        report.user_sessions_database = page.user_sessions_database;
+    }
+    if report.registry.is_none() {
+        report.registry = page.registry;
+    }
     report.coverage = page.coverage;
 }
 
@@ -473,17 +482,32 @@ async fn handle_storage_report(
         "  user-sessions.db: {} bytes",
         format_bytes(report.user_sessions_db_bytes)
     );
+    println!("  file sizes are logical bytes, not allocated filesystem bytes");
+    println!("  reusable pages are SQLite capacity, not recovered disk space");
+    if let Some(database) = &report.user_sessions_database {
+        println!("    {}", session_database_text(database));
+    }
+    match &report.registry {
+        Some(StorageReportRegistryV1::Unavailable { reason }) => {
+            println!("  project registry unavailable: {reason}");
+            println!("  registered stores and unregistered directories were not classified");
+        }
+        Some(StorageReportRegistryV1::Missing) => {
+            println!("  project registry missing; project directories were not classified");
+        }
+        _ => {}
+    }
     println!("  registered stores: {}", report.stores.len());
     for store in &report.stores {
         // Free pages are unsampled when the store was busy or unreadable; say
         // so rather than printing a zero that reads as "no bloat".
         let free = match (store.free_bytes, store.free_page_ratio) {
             (Some(free_bytes), Some(ratio)) => format!(
-                "{} free ({:.1}% free pages)",
+                "graph database: {} reusable ({:.1}% free pages)",
                 format_bytes(free_bytes),
                 ratio * 100.0
             ),
-            _ => "free pages not sampled (store busy or unreadable)".to_string(),
+            _ => "graph database page telemetry not sampled".to_string(),
         };
         println!(
             "    {} ({}): {} total, {free}",
@@ -502,6 +526,10 @@ async fn handle_storage_report(
         ] {
             println!("      {family}: {}", format_bytes(bytes));
         }
+        println!(
+            "      sessions.db: {}",
+            session_database_text(&store.sessions_database)
+        );
         if store.unavailable_entry_count > 0 {
             println!(
                 "      not sized: {} unreadable or non-regular entries",
@@ -582,6 +610,132 @@ async fn handle_storage_report(
         );
     }
     Ok(())
+}
+
+fn session_database_text(database: &SessionDatabaseSizeV1) -> String {
+    let file = |size: &SessionDatabaseFileSizeV1| match size {
+        SessionDatabaseFileSizeV1::Observed { logical_bytes } => {
+            format!("{} logical bytes", logical_bytes.get())
+        }
+        SessionDatabaseFileSizeV1::Missing => "missing".to_owned(),
+        SessionDatabaseFileSizeV1::Unavailable { reason } => format!("unavailable ({reason})"),
+    };
+    let pages = match &database.pages {
+        SessionDatabasePagesV1::Observed {
+            sample,
+            reusable_bytes,
+        } => format!(
+            "page size {} bytes, {} pages, {} freelist pages, {} reusable bytes",
+            sample.page_size_bytes,
+            sample.page_count,
+            sample.freelist_pages,
+            reusable_bytes.get(),
+        ),
+        SessionDatabasePagesV1::Missing => "page telemetry missing".to_owned(),
+        SessionDatabasePagesV1::Unavailable { reason } => {
+            format!("page telemetry unavailable ({reason})")
+        }
+    };
+    format!(
+        "main {}, WAL {}, SHM {}; {pages}",
+        file(&database.main),
+        file(&database.wal),
+        file(&database.shm)
+    )
+}
+
+#[cfg(test)]
+mod storage_report_tests {
+    use super::*;
+    use tracedecay_contracts::{StorageByteSizeV1, StoreKeyV1, StoreSizeSampleV1};
+    use tracedecay_domain::UtcMicros;
+    use tracedecay_maintenance::retention::storage_report::{
+        StorageReport, StorageReportCoverage, StoreKindBytesV1, StoreSizeReportEntry,
+    };
+
+    fn session_database(bytes: u64) -> SessionDatabaseSizeV1 {
+        SessionDatabaseSizeV1 {
+            main: SessionDatabaseFileSizeV1::Observed {
+                logical_bytes: StorageByteSizeV1(bytes),
+            },
+            wal: SessionDatabaseFileSizeV1::Missing,
+            shm: SessionDatabaseFileSizeV1::Missing,
+            pages: SessionDatabasePagesV1::Unavailable {
+                reason: "busy".to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn report_pagination_preserves_one_profile_sample_and_every_project_sample() {
+        let mut report = StorageReport::default();
+        for index in 0..3 {
+            let project = format!("proj_{index}");
+            let page = StorageReport {
+                profile_root: "/fixture/profile".to_owned(),
+                user_sessions_database: Some(session_database(100 + index)),
+                stores: vec![StoreSizeReportEntry {
+                    project_id: project.clone(),
+                    canonical_root: format!("/fixture/{project}"),
+                    total_bytes: 10 + index,
+                    kinds: StoreKindBytesV1::default(),
+                    unavailable_entry_count: 0,
+                    free_bytes: Some(0),
+                    free_page_ratio: Some(0.0),
+                    sessions_database: session_database(10 + index),
+                }],
+                ..StorageReport::default()
+            };
+            // The canonical wire result must preserve these fields through
+            // the exact conversion used by the production brokered path.
+            let wire: tracedecay_contracts::retrieval::AdminCliStorageReportV1 =
+                serde_json::from_value(serde_json::to_value(page).unwrap()).unwrap();
+            let page = serde_json::from_value(serde_json::to_value(wire).unwrap()).unwrap();
+            merge_storage_report_page(&mut report, page);
+        }
+        merge_storage_report_page(
+            &mut report,
+            StorageReport {
+                coverage: StorageReportCoverage::default(),
+                ..StorageReport::default()
+            },
+        );
+        assert_eq!(report.user_sessions_database, Some(session_database(100)));
+        assert_eq!(report.stores.len(), 3);
+        for (index, store) in report.stores.iter().enumerate() {
+            assert_eq!(store.sessions_database, session_database(10 + index as u64));
+        }
+    }
+
+    #[test]
+    fn session_text_distinguishes_logical_bytes_reusable_pages_and_unavailability() {
+        let mut database = session_database(40960);
+        database.wal = SessionDatabaseFileSizeV1::Observed {
+            logical_bytes: StorageByteSizeV1(1234),
+        };
+        let unavailable = session_database_text(&database);
+        assert!(
+            unavailable.contains("main 40960 logical bytes, WAL 1234 logical bytes, SHM missing")
+        );
+        assert!(unavailable.contains("page telemetry unavailable (busy)"));
+        assert!(!unavailable.contains("0 pages"));
+        database.pages = SessionDatabasePagesV1::Observed {
+            sample: StoreSizeSampleV1 {
+                store: StoreKeyV1::new("sessions.db").unwrap(),
+                page_size_bytes: 4096,
+                page_count: 10,
+                freelist_pages: 3,
+                observed_at: UtcMicros(1),
+            },
+            reusable_bytes: StorageByteSizeV1(12288),
+        };
+        assert!(
+            session_database_text(&database)
+                .contains("page size 4096 bytes, 10 pages, 3 freelist pages, 12288 reusable bytes")
+        );
+        database.pages = SessionDatabasePagesV1::Missing;
+        assert!(session_database_text(&database).contains("page telemetry missing"));
+    }
 }
 
 #[cfg(test)]

@@ -119,7 +119,13 @@ pub struct GitRepositoryTopologyV1 {
 #[derive(Default)]
 struct CheckoutTopologySlot {
     state: Mutex<CheckoutTopologyState>,
+    /// Insertion order in [`CHECKOUT_TOPOLOGY`], so a full memo evicts its
+    /// oldest entry instead of every root it retains.
+    retained_sequence: u64,
 }
+
+static CHECKOUT_TOPOLOGY_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Default)]
 enum CheckoutTopologyState {
@@ -183,9 +189,10 @@ impl TopologyWalk {
 
 /// Retained checkout-root topologies.
 ///
-/// Bounded by [`MAX_RETAINED_CHECKOUT_TOPOLOGIES`]; a full map is cleared
-/// rather than evicted by age, because every entry is a pure memo that costs
-/// one discovery to rebuild.
+/// Bounded by [`MAX_RETAINED_CHECKOUT_TOPOLOGIES`]; a full map evicts its
+/// oldest entry. Clearing it instead dropped every served root at once, so a
+/// burst of probes for new paths sent a deferred route back to a full walk and
+/// it never converged.
 static CHECKOUT_TOPOLOGY: LazyLock<Mutex<HashMap<PathBuf, Arc<CheckoutTopologySlot>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -194,7 +201,8 @@ static CHECKOUT_TOPOLOGY: LazyLock<Mutex<HashMap<PathBuf, Arc<CheckoutTopologySl
 const MAX_RETAINED_CHECKOUT_TOPOLOGIES: usize = 64;
 
 /// Last branch read from each Git directory's HEAD, keyed by that file's
-/// identity. Bounded and cleared like [`CHECKOUT_TOPOLOGY`].
+/// identity. Bounded by the same limit and cleared when full; a branch read is
+/// cheap to repeat, unlike a topology walk.
 static HEAD_BRANCHES: LazyLock<Mutex<HeadBranchMemo>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -424,10 +432,19 @@ fn checkout_topology_slot(path: &Path) -> Arc<CheckoutTopologySlot> {
     if let Some(slot) = slots.get(path) {
         return Arc::clone(slot);
     }
-    if slots.len() >= MAX_RETAINED_CHECKOUT_TOPOLOGIES {
-        slots.clear();
+    if slots.len() >= MAX_RETAINED_CHECKOUT_TOPOLOGIES
+        && let Some(oldest) = slots
+            .iter()
+            .min_by_key(|(_, slot)| slot.retained_sequence)
+            .map(|(path, _)| path.clone())
+    {
+        slots.remove(&oldest);
     }
-    let slot = Arc::new(CheckoutTopologySlot::default());
+    let slot = Arc::new(CheckoutTopologySlot {
+        state: Mutex::default(),
+        retained_sequence: CHECKOUT_TOPOLOGY_SEQUENCE
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    });
     slots.insert(path.to_path_buf(), Arc::clone(&slot));
     slot
 }

@@ -375,6 +375,7 @@ pub async fn compress(
     storage_root: &Path,
     request: &LcmCompressionRequest,
     payload_rollback: &mut payload::PayloadFileRollback,
+    expected_summary: Option<&LcmSummaryRequest>,
 ) -> Result<LcmCompressionResponse, LcmError> {
     compress_inner(
         conn,
@@ -383,7 +384,7 @@ pub async fn compress(
         storage_root,
         request,
         payload_rollback,
-        None,
+        (None, expected_summary),
     )
     .await
     .map(|bounded| bounded.response)
@@ -401,8 +402,9 @@ pub async fn compress_retained_page(
     storage_root: &Path,
     request: &LcmCompressionRequest,
     payload_rollback: &mut payload::PayloadFileRollback,
-    guard: RetainedCompressionGuard,
+    selection_guard: (RetainedCompressionGuard, Option<&LcmSummaryRequest>),
 ) -> Result<super::summary_convergence::LcmBoundedCompressionResponse, LcmError> {
+    let (retained_scan, expected_summary) = selection_guard;
     compress_inner(
         conn,
         scope,
@@ -410,7 +412,7 @@ pub async fn compress_retained_page(
         storage_root,
         request,
         payload_rollback,
-        Some(guard),
+        (Some(retained_scan), expected_summary),
     )
     .await
 }
@@ -422,8 +424,9 @@ async fn compress_inner(
     storage_root: &Path,
     request: &LcmCompressionRequest,
     payload_rollback: &mut payload::PayloadFileRollback,
-    retained_scan: Option<RetainedCompressionGuard>,
+    selection_guard: (Option<RetainedCompressionGuard>, Option<&LcmSummaryRequest>),
 ) -> Result<super::summary_convergence::LcmBoundedCompressionResponse, LcmError> {
+    let (retained_scan, expected_summary) = selection_guard;
     let assembly_token_cap = compression_decision::effective_assembly_token_cap(AssemblyCapInput {
         max_assembly_tokens: request.max_assembly_tokens,
         context_length: request.context_length,
@@ -503,6 +506,7 @@ async fn compress_inner(
         assembly_token_cap,
         &summarizer,
         retained_scan,
+        expected_summary,
     )
     .await?;
     Ok(super::summary_convergence::LcmBoundedCompressionResponse {
@@ -520,11 +524,16 @@ async fn compress_in_transaction(
     assembly_token_cap: Option<i64>,
     summarizer: &CompressionSummarizerAdapter,
     retained_scan: Option<RetainedCompressionGuard>,
+    expected_summary: Option<&LcmSummaryRequest>,
 ) -> Result<(LcmCompressionResponse, usize, u64, bool), LcmError> {
-    let expected_summary_source_range = retained_scan
-        .as_ref()
-        .and_then(|guard| guard.expected_summary_source_range.as_ref())
-        .cloned();
+    let expected_summary_source_range = expected_summary
+        .map(|summary| &summary.source_range)
+        .cloned()
+        .or_else(|| {
+            retained_scan
+                .as_ref()
+                .and_then(|guard| guard.expected_summary_source_range.clone())
+        });
     let context =
         prepare_compression_context(conn, request, assembly_token_cap, retained_scan).await?;
     if let Some(expected) = &expected_summary_source_range {
@@ -538,6 +547,21 @@ async fn compress_in_transaction(
                 actual_from,
                 actual_to,
             });
+        }
+    }
+    if let Some(expected) = expected_summary {
+        let actual = context.selected_backlog();
+        if actual.len() != expected.source_messages.len()
+            || !actual
+                .iter()
+                .zip(&expected.source_messages)
+                .all(|(actual, expected)| {
+                    actual.store_id == expected.store_id
+                        && actual.role == expected.role
+                        && actual.content == expected.content
+                })
+        {
+            return Err(LcmError::StaleSummarySourceContent);
         }
     }
     let scan = (

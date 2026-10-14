@@ -15,6 +15,7 @@ use tracedecay_maintenance::generation::{
 };
 use tracedecay_maintenance::lease::ProjectStoreMaintenanceLeaseV1;
 use tracedecay_maintenance::loop_run::{MaintenanceWake, run_maintenance_loop};
+use tracedecay_maintenance::retention::registered_store::RegisteredStoreRetentionReportV1;
 use tracedecay_maintenance::store_maintenance::RegisteredProjectStoreV1;
 use tracedecay_maintenance::telemetry::StoreTelemetrySamplingOutcome;
 use tracedecay_maintenance::tick::{
@@ -87,6 +88,18 @@ async fn join_abandoned_maintenance_task(task: Option<JoinHandle<()>>, owner: &'
     }
 }
 
+#[derive(Default)]
+struct ComponentRetentionProgress {
+    pending: bool,
+    failed: bool,
+}
+
+#[derive(Default)]
+struct SessionRetentionProgress {
+    canonical: ComponentRetentionProgress,
+    observations: ComponentRetentionProgress,
+}
+
 #[tracing::instrument(
     name = "daemon.maintenance.registered_store_retention",
     level = "trace",
@@ -95,10 +108,15 @@ async fn join_abandoned_maintenance_task(task: Option<JoinHandle<()>>, owner: &'
 async fn run_registered_store_retention(
     database: &tracedecay_global_db::RegisteredGlobalDb,
     config: &tracedecay_configuration::RetentionConfig,
-) -> bool {
+    progress: &mut SessionRetentionProgress,
+) -> MaintenanceTickOutcome {
     let now = match now_secs_i64() {
         Ok(now) => now,
         Err(failure) => {
+            progress.canonical.pending = true;
+            progress.observations.pending = config.observation.enabled;
+            progress.canonical.failed = true;
+            progress.observations.failed = config.observation.enabled;
             log_daemon_event(
                 "retention_degraded",
                 &[
@@ -106,7 +124,7 @@ async fn run_registered_store_retention(
                     ("failure", failure.to_owned()),
                 ],
             );
-            return false;
+            return MaintenanceTickOutcome::Retry;
         }
     };
     let report =
@@ -117,6 +135,38 @@ async fn run_registered_store_retention(
             now,
         )
         .await;
+    log_registered_store_retention_outcome(&report);
+    progress.canonical.pending = report.canonical_gc.as_ref().map_or(true, |gc| gc.pending);
+    progress.observations.pending = report.observations.as_ref().is_some_and(|result| {
+        result
+            .as_ref()
+            .map_or(true, |observations| observations.pending)
+    });
+    progress.canonical.failed = report.canonical_gc.is_err();
+    progress.observations.failed = report.observations.as_ref().is_some_and(|result| {
+        result
+            .as_ref()
+            .map_or(true, |observations| !observations.errors.is_empty())
+    });
+    let pending = progress.canonical.pending || progress.observations.pending;
+    let mut succeeded = report.succeeded();
+    if let Some(compaction) = &config.compaction {
+        let outcome = tracedecay_maintenance::retention::live_compaction::compact_registered_store(
+            database, compaction,
+        )
+        .await;
+        succeeded &= record_live_compaction_outcome("mounted_sessions", outcome);
+    }
+    if !succeeded {
+        MaintenanceTickOutcome::Retry
+    } else if pending {
+        MaintenanceTickOutcome::Continue(MaintenanceContinuation::SessionContentRetention)
+    } else {
+        MaintenanceTickOutcome::Complete
+    }
+}
+
+fn log_registered_store_retention_outcome(report: &RegisteredStoreRetentionReportV1) {
     match &report.session_lcm {
         Some(Ok(session_lcm)) => {
             let reclaimed = session_lcm.bytes_reclaimed();
@@ -184,15 +234,195 @@ async fn run_registered_store_retention(
         Ok(_) => {}
     }
     log_payload_gc_outcome(&report.payload_gc);
-    let mut succeeded = report.succeeded();
-    if let Some(compaction) = &config.compaction {
-        let outcome = tracedecay_maintenance::retention::live_compaction::compact_registered_store(
-            database, compaction,
-        )
-        .await;
-        succeeded &= record_live_compaction_outcome("mounted_sessions", outcome);
+    log_canonical_gc_outcome(&report.canonical_gc);
+}
+
+async fn run_observation_retention_page(
+    database: &tracedecay_global_db::RegisteredGlobalDb,
+    config: &tracedecay_configuration::RetentionConfig,
+    progress: &mut SessionRetentionProgress,
+) -> MaintenanceTickOutcome {
+    if !config.observation.enabled {
+        progress.observations.pending = false;
+        return MaintenanceTickOutcome::Complete;
     }
-    succeeded
+    let now = match now_secs_i64() {
+        Ok(now) => now,
+        Err(failure) => {
+            progress.observations.pending = true;
+            progress.observations.failed = true;
+            log_daemon_event(
+                "retention_degraded",
+                &[
+                    ("pass", "observation".to_owned()),
+                    ("failure", failure.to_owned()),
+                ],
+            );
+            return MaintenanceTickOutcome::Retry;
+        }
+    };
+    match database
+        .run_observation_retention(
+            None,
+            &config.observation,
+            tracedecay_global_db::observation::retention::RetentionMode::Apply,
+            tracedecay_domain::UtcMicros::from_unix_seconds(now),
+        )
+        .await
+    {
+        Ok(report) => {
+            progress.observations.pending = report.pending;
+            if !report.errors.is_empty() {
+                progress.observations.failed = true;
+                log_daemon_event(
+                    "retention_degraded",
+                    &[
+                        ("pass", "observation".to_owned()),
+                        ("failure", "retention_pass_failed".to_owned()),
+                    ],
+                );
+                MaintenanceTickOutcome::Retry
+            } else if report.pending {
+                MaintenanceTickOutcome::Continue(MaintenanceContinuation::SessionContentRetention)
+            } else {
+                MaintenanceTickOutcome::Complete
+            }
+        }
+        Err(error) => {
+            progress.observations.pending = true;
+            progress.observations.failed = true;
+            log_daemon_event(
+                "retention_degraded",
+                &[
+                    ("pass", "observation".to_owned()),
+                    ("failure", error.to_string()),
+                ],
+            );
+            MaintenanceTickOutcome::Retry
+        }
+    }
+}
+
+async fn run_canonical_content_slice(
+    database: &tracedecay_global_db::RegisteredGlobalDb,
+    cancellation: &tracedecay_runtime_core::cancellation::CancellationToken,
+) -> MaintenanceTickOutcome {
+    run_session_content_slice(
+        database,
+        None,
+        cancellation,
+        &mut SessionRetentionProgress {
+            canonical: ComponentRetentionProgress {
+                pending: true,
+                ..ComponentRetentionProgress::default()
+            },
+            ..SessionRetentionProgress::default()
+        },
+    )
+    .await
+}
+
+async fn run_session_content_slice(
+    database: &tracedecay_global_db::RegisteredGlobalDb,
+    config: Option<&tracedecay_configuration::RetentionConfig>,
+    cancellation: &tracedecay_runtime_core::cancellation::CancellationToken,
+    progress: &mut SessionRetentionProgress,
+) -> MaintenanceTickOutcome {
+    let started = Instant::now();
+    loop {
+        if cancellation.is_cancelled() {
+            return MaintenanceTickOutcome::Retry;
+        }
+        let mut outcome = if progress.canonical.failed || progress.observations.failed {
+            MaintenanceTickOutcome::Retry
+        } else {
+            MaintenanceTickOutcome::Complete
+        };
+        if progress.observations.pending
+            && !progress.observations.failed
+            && let Some(config) = config
+        {
+            let observations = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return MaintenanceTickOutcome::Retry,
+                result = run_observation_retention_page(database, config, progress) => result,
+            };
+            // A policy page can release an owner behind an exhausted content
+            // cursor. Open a new content pass after every successful page.
+            progress.canonical.pending = true;
+            outcome = outcome.combine(observations);
+        }
+        if progress.canonical.pending && !progress.canonical.failed {
+            let result = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return MaintenanceTickOutcome::Retry,
+                result = database.run_canonical_content_gc() => result,
+            }.map_err(|error| {
+                tracedecay_maintenance::retention::registered_store::RegisteredStoreRetentionErrorV1::CanonicalGc {
+                    diagnostic: error.to_string(),
+                }
+            });
+            log_canonical_gc_outcome(&result);
+            match result {
+                Err(_) => {
+                    progress.canonical.failed = true;
+                    outcome = MaintenanceTickOutcome::Retry;
+                }
+                Ok(report) => progress.canonical.pending = report.pending,
+            }
+        }
+        if outcome == MaintenanceTickOutcome::Retry {
+            return outcome;
+        }
+        if !progress.canonical.pending && !progress.observations.pending {
+            return MaintenanceTickOutcome::Complete;
+        }
+        if started.elapsed() >= Duration::from_secs(1) {
+            return MaintenanceTickOutcome::Continue(
+                MaintenanceContinuation::SessionContentRetention,
+            );
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+fn log_canonical_gc_outcome(
+    result: &Result<
+        tracedecay_global_db::observation::canonical_lifecycle::CanonicalContentGcReport,
+        tracedecay_maintenance::retention::registered_store::RegisteredStoreRetentionErrorV1,
+    >,
+) {
+    match result {
+        Ok(gc) if gc.bodies_deleted > 0 || gc.captures_deleted > 0 => log_daemon_event(
+            "retention_canonical_content",
+            &[
+                ("store", "mounted_sessions".to_owned()),
+                ("bodies_deleted", gc.bodies_deleted.to_string()),
+                ("captures_deleted", gc.captures_deleted.to_string()),
+                (
+                    "stored_body_bytes_deleted",
+                    gc.stored_body_bytes_deleted.to_string(),
+                ),
+                (
+                    "decoded_body_bytes_deleted",
+                    gc.decoded_body_bytes_deleted.to_string(),
+                ),
+                (
+                    "stored_capture_bytes_deleted",
+                    gc.stored_capture_bytes_deleted.to_string(),
+                ),
+                ("work_pending", gc.pending.to_string()),
+            ],
+        ),
+        Err(error) => log_daemon_event(
+            "retention_degraded",
+            &[
+                ("pass", "canonical_content".to_owned()),
+                ("failure", error.diagnostic().to_owned()),
+            ],
+        ),
+        Ok(_) => {}
+    }
 }
 
 fn log_payload_gc_outcome(
@@ -327,6 +557,11 @@ pub(super) struct MaintenanceCoordinator {
     /// last store processed. The next tick resumes immediately after it so no
     /// store is starved when the mounted set exceeds `MAINTENANCE_STORE_PAGE_LIMIT`.
     store_cursor: Arc<Mutex<Option<String>>>,
+    /// Content catch-up cannot advance the full-policy fairness frontier.
+    continuation_store_cursor: Arc<Mutex<Option<String>>>,
+    /// Exact mounted session paths with unfinished bounded canonical work.
+    canonical_gc_pending: Arc<Mutex<BTreeSet<PathBuf>>>,
+    observation_retention_pending: Arc<Mutex<BTreeSet<PathBuf>>>,
     /// Instant of the last branch-store GC pass that succeeded for every
     /// mounted project. `None` keeps the daily cadence retry-eligible.
     last_branch_gc: Arc<Mutex<Option<Instant>>>,
@@ -347,6 +582,9 @@ impl Default for MaintenanceCoordinator {
             task: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Mutex::new(MaintenanceMetricsV1::default())),
             store_cursor: Arc::new(Mutex::new(None)),
+            continuation_store_cursor: Arc::new(Mutex::new(None)),
+            canonical_gc_pending: Arc::new(Mutex::new(BTreeSet::new())),
+            observation_retention_pending: Arc::new(Mutex::new(BTreeSet::new())),
             last_branch_gc: Arc::new(Mutex::new(None)),
             resident_memory_sampler: Arc::new(Mutex::new(None)),
             resident_memory_log: Arc::new(std::sync::Mutex::new(
@@ -642,11 +880,49 @@ impl MaintenanceCoordinator {
         administration
             .store_telemetry_sampling()
             .begin_retention_tick_log_window();
-        let session_databases = if continuation.is_none() {
-            administration.mounted_registered_session_databases().await
-        } else {
-            Vec::new()
-        };
+        let (mut session_databases, session_stores_available) =
+            match administration.mounted_registered_session_databases().await {
+                Ok(databases) => (databases, true),
+                Err(error) => {
+                    log_daemon_event(
+                        "retention_degraded",
+                        &[
+                            ("pass", "canonical_content".to_owned()),
+                            (
+                                "failure",
+                                "registered_session_stores_unavailable".to_owned(),
+                            ),
+                            ("error", error.to_string()),
+                        ],
+                    );
+                    (Vec::new(), false)
+                }
+            };
+        let canonical_pending_before = self.canonical_gc_pending.lock().await.clone();
+        let observation_pending_before = self.observation_retention_pending.lock().await.clone();
+        {
+            let mounted_paths = session_databases
+                .iter()
+                .map(|database| database.db_path().to_path_buf())
+                .collect::<BTreeSet<_>>();
+            let mut pending = self.canonical_gc_pending.lock().await;
+            let mut observation_pending = self.observation_retention_pending.lock().await;
+            if session_stores_available {
+                pending.retain(|path| mounted_paths.contains(path));
+                observation_pending.retain(|path| mounted_paths.contains(path));
+            }
+            if continuation.is_none() {
+                if retention.observation.enabled {
+                    observation_pending.extend(mounted_paths.iter().cloned());
+                }
+                pending.extend(mounted_paths);
+            } else {
+                session_databases.retain(|database| {
+                    pending.contains(database.db_path())
+                        || observation_pending.contains(database.db_path())
+                });
+            }
+        }
         let project_graphs = administration.mounted_project_graphs().await;
         let (registered_projects, registry_listed) =
             match registered_project_stores(profile_root, profile_database).await {
@@ -713,7 +989,12 @@ impl MaintenanceCoordinator {
         }
         work.sort_by(|left, right| left.0.cmp(&right.0));
         let keys = work.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
-        let after = self.store_cursor.lock().await.clone();
+        let cursor = if continuation.is_some() {
+            &self.continuation_store_cursor
+        } else {
+            &self.store_cursor
+        };
+        let after = cursor.lock().await.clone();
         let (window, _) =
             select_store_window(&keys, after.as_deref(), MAINTENANCE_STORE_PAGE_LIMIT);
         let mut sampled_telemetry_paths =
@@ -739,9 +1020,9 @@ impl MaintenanceCoordinator {
 
         // Bounded, round-robin slice of mounted stores. Writer admission is
         // per unit so one busy store defers only itself, and the cursor
-        // advances past attempted units even on cancellation. A continuation
-        // omits session stores, but remains phase-scoped over the same bounded
-        // graph window rather than pinning one project.
+        // advances past attempted units even on cancellation. Continuations
+        // run bounded policy and canonical work for pending sessions and code-generation
+        // work for graphs, using the same fair store window.
         let mut attempted = 0usize;
         let mut deferred = 0u64;
         let mut outcome = MaintenanceTickOutcome::Complete;
@@ -750,15 +1031,53 @@ impl MaintenanceCoordinator {
                 outcome = MaintenanceTickOutcome::Retry;
                 break;
             }
+            let mut session_progress = SessionRetentionProgress::default();
             let admitted = administration
                 .try_with_writer(|| async {
                     match &work[index].1 {
                         MaintenanceStoreWork::Session(database) => {
-                            if run_registered_store_retention(database, retention).await {
-                                MaintenanceTickOutcome::Complete
+                            let mut outcome = if continuation.is_none() {
+                                run_registered_store_retention(
+                                    database,
+                                    retention,
+                                    &mut session_progress,
+                                )
+                                .await
                             } else {
-                                MaintenanceTickOutcome::Retry
+                                session_progress.canonical.pending =
+                                    canonical_pending_before.contains(database.db_path());
+                                session_progress.observations.pending =
+                                    observation_pending_before.contains(database.db_path());
+                                MaintenanceTickOutcome::Complete
+                            };
+                            // A retry from an independent owner must not demote this
+                            // store's committed progress to one source page per tick.
+                            if canonical_pending_before.contains(database.db_path())
+                                || observation_pending_before.contains(database.db_path())
+                            {
+                                let content = if session_progress.observations.pending {
+                                    run_session_content_slice(
+                                        database,
+                                        Some(retention),
+                                        &self.cancellation,
+                                        &mut session_progress,
+                                    )
+                                    .await
+                                } else if session_progress.canonical.pending
+                                    && !session_progress.canonical.failed
+                                {
+                                    let canonical =
+                                        run_canonical_content_slice(database, &self.cancellation)
+                                            .await;
+                                    session_progress.canonical.pending =
+                                        canonical != MaintenanceTickOutcome::Complete;
+                                    canonical
+                                } else {
+                                    MaintenanceTickOutcome::Complete
+                                };
+                                outcome = outcome.combine(content);
                             }
+                            outcome
                         }
                         MaintenanceStoreWork::Graph(graph) => {
                             run_project_generation_maintenance(
@@ -767,7 +1086,8 @@ impl MaintenanceCoordinator {
                                 &maintenance_observations,
                                 &self.cancellation,
                                 retention.compaction.as_ref(),
-                                continuation,
+                                continuation
+                                    .map(|_| MaintenanceContinuation::CodeGenerationRetention),
                             )
                             .await
                         }
@@ -786,6 +1106,22 @@ impl MaintenanceCoordinator {
                 })
                 .await;
             attempted = attempted.saturating_add(1);
+            if let MaintenanceStoreWork::Session(database) = &work[index].1 {
+                let mut pending = self.canonical_gc_pending.lock().await;
+                let mut observation_pending = self.observation_retention_pending.lock().await;
+                if admitted.is_some() {
+                    if session_progress.canonical.pending {
+                        pending.insert(database.db_path().to_path_buf());
+                    } else {
+                        pending.remove(database.db_path());
+                    }
+                    if session_progress.observations.pending {
+                        observation_pending.insert(database.db_path().to_path_buf());
+                    } else {
+                        observation_pending.remove(database.db_path());
+                    }
+                }
+            }
             match admitted {
                 Some(unit_outcome) => outcome = outcome.combine(unit_outcome),
                 None => {
@@ -798,10 +1134,17 @@ impl MaintenanceCoordinator {
                 break;
             }
         }
-        *self.store_cursor.lock().await =
+        *cursor.lock().await =
             cursor_after_attempted_units(&keys, &window, attempted, after.as_deref());
-        if !registry_listed {
+        if !registry_listed || !session_stores_available {
             outcome = MaintenanceTickOutcome::Retry;
+        }
+        if !self.canonical_gc_pending.lock().await.is_empty()
+            || !self.observation_retention_pending.lock().await.is_empty()
+        {
+            outcome = outcome.combine(MaintenanceTickOutcome::Continue(
+                MaintenanceContinuation::SessionContentRetention,
+            ));
         }
 
         // Profile-wide maintenance is intentionally excluded from a bounded
@@ -1809,7 +2152,10 @@ mod tests {
             )),
             ..MaintenanceCoordinator::default()
         };
-        let administration = super::StoreAdministration::default();
+        let administration = super::StoreAdministration::default().with_profile_identity(
+            tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root)
+                .expect("canonical profile identity"),
+        );
         let schedulers =
             tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1::new(
                 1,
@@ -1844,6 +2190,561 @@ mod tests {
             .await;
         assert_eq!(continuation, MaintenanceTickOutcome::Complete);
         assert_eq!(generation_files(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn content_continuations_preserve_full_policy_fairness_beyond_store_window() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let profile_root = temporary.path().join("profile");
+        let identity =
+            tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root).unwrap();
+        let administration = super::StoreAdministration::default().with_profile_identity(identity);
+        administration
+            .retain_authenticated_profile_database_scope(&profile_root)
+            .await
+            .unwrap();
+        let profile_database = administration.registered_profile_database().await.unwrap();
+        let mut databases = vec![
+            administration
+                .registered_profile_session_database()
+                .await
+                .unwrap(),
+        ];
+        let registry = administration.registered_runtime_registry().await.unwrap();
+        for index in 0..9 {
+            let checkout = temporary.path().join(format!("project-{index}"));
+            std::fs::create_dir_all(&checkout).unwrap();
+            let project_id =
+                tracedecay_store::ProjectId::new(format!("project.retention-{index}")).unwrap();
+            tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+                &checkout,
+                project_id.as_str(),
+            )
+            .unwrap();
+            databases.push(
+                Box::pin(registry.project_sessions(project_id, [checkout]))
+                    .await
+                    .unwrap(),
+            );
+        }
+        for database in &databases {
+            database
+                .append_observability_event(&tracedecay_global_db::AnalyticsEventInsert {
+                    provider: "tracedecay-observability".to_owned(),
+                    project_id: "scope:fairness".to_owned(),
+                    session_id: None,
+                    timestamp: 0,
+                    event_kind: "retrieval.query.completed.v1".to_owned(),
+                    hook_name: None,
+                    tool_name: None,
+                    tool_category: None,
+                    skill_name: None,
+                    hint_category: None,
+                    hint_id: Some("fairness:event".to_owned()),
+                    outcome: Some("succeeded".to_owned()),
+                    metadata_json: Some(
+                        serde_json::json!({"retention_class":"optional_local_detail30d"})
+                            .to_string(),
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+        let coordinator = MaintenanceCoordinator {
+            background_cpu: Some(Arc::new(
+                tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1::new(
+                    std::num::NonZeroUsize::MIN,
+                ),
+            )),
+            ..MaintenanceCoordinator::default()
+        };
+        let schedulers =
+            tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1::new(
+                1,
+            );
+        let retention = tracedecay_configuration::RetentionConfig::default();
+        let branch_gc = super::BranchStoreGcCadenceV1 { branch_gc_days: 30 };
+        coordinator
+            .run_tick(
+                &profile_root,
+                &profile_database,
+                &administration,
+                &schedulers,
+                &retention,
+                branch_gc,
+                None,
+            )
+            .await;
+        let normal_cursor = coordinator.store_cursor.lock().await.clone();
+        let query = tracedecay_global_db::AnalyticsEventQuery {
+            provider: Some("tracedecay-observability".to_owned()),
+            project_id: Some("scope:fairness".to_owned()),
+            limit: 10,
+            ..tracedecay_global_db::AnalyticsEventQuery::default()
+        };
+        let mut remaining = 0;
+        for database in &databases {
+            remaining += database.query_analytics_events(&query).await.unwrap().len();
+        }
+        assert_eq!(
+            remaining, 2,
+            "the ordinary eight-store window bounds full-policy work"
+        );
+        for _ in 0..3 {
+            let outcome = coordinator
+                .run_tick(
+                    &profile_root,
+                    &profile_database,
+                    &administration,
+                    &schedulers,
+                    &retention,
+                    branch_gc,
+                    Some(MaintenanceContinuation::SessionContentRetention),
+                )
+                .await;
+            if outcome == MaintenanceTickOutcome::Complete {
+                break;
+            }
+        }
+        assert!(coordinator.canonical_gc_pending.lock().await.is_empty());
+        assert_eq!(
+            *coordinator.store_cursor.lock().await,
+            normal_cursor,
+            "content catch-up must not wrap the ordinary policy frontier"
+        );
+        coordinator
+            .run_tick(
+                &profile_root,
+                &profile_database,
+                &administration,
+                &schedulers,
+                &retention,
+                branch_gc,
+                None,
+            )
+            .await;
+        for database in &databases {
+            assert!(
+                database
+                    .query_analytics_events(&query)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "the next ordinary window reaches stores initially outside the budget"
+            );
+        }
+        administration.close_stores_for_shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_content_progress_survives_peer_retry_and_drains_registered_stores() {
+        use tracedecay_runtime_core::db::engine::params;
+        let temporary = tempfile::TempDir::new().unwrap();
+        let profile_root = temporary.path().join("profile");
+        let identity =
+            tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root).unwrap();
+        let administration = super::StoreAdministration::default().with_profile_identity(identity);
+        administration
+            .retain_authenticated_profile_database_scope(&profile_root)
+            .await
+            .unwrap();
+        let profile_database = administration.registered_profile_database().await.unwrap();
+        let failing = administration
+            .registered_profile_session_database()
+            .await
+            .unwrap();
+        let registry = administration.registered_runtime_registry().await.unwrap();
+        let mut stores = Vec::new();
+        let mut generation_root = None;
+        for project_name in ["project.content-first", "project.content-second"] {
+            let checkout = temporary.path().join(project_name);
+            std::fs::create_dir_all(&checkout).unwrap();
+            let checkout = checkout.canonicalize().unwrap();
+            let project_id = tracedecay_store::ProjectId::new(project_name).unwrap();
+            tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+                &checkout,
+                project_id.as_str(),
+            )
+            .unwrap();
+            let project = profile_database
+                .upsert_code_project(project_name, &checkout, None, None, None)
+                .await
+                .unwrap();
+            let database =
+                Box::pin(registry.project_sessions(project_id.clone(), [checkout.clone()]))
+                    .await
+                    .unwrap();
+            let transaction = database.begin_write_transaction().await.unwrap();
+            for index in 0..129 {
+                transaction
+                    .execute(
+                        "INSERT INTO session_canonical_bodies VALUES (?1, 'identity', X'61', 1)",
+                        params![format!("{index:064x}")],
+                    )
+                    .await
+                    .unwrap();
+            }
+            let owner =
+                serde_json::to_string(&tracedecay_domain::FactOwnerV1::Project { project_id })
+                    .unwrap();
+            transaction.execute(
+                "WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n < 257)
+                 INSERT INTO retrieval_anchors(anchor_id, anchor_json, owner_json, projection_generation)
+                 SELECT printf('active-%06d', n), '{}', ?1, 'content-retention' FROM numbers",
+                params![owner.as_str()],
+            ).await.unwrap();
+            transaction.execute(
+                "INSERT INTO retrieval_anchor_dispositions(disposition_id, anchor_id, owner_json, state, reason_class, effective_at, record_json)
+                 SELECT 'disp-' || anchor_id, anchor_id, owner_json, 'active', 'retention', 0, '{}' FROM retrieval_anchors ORDER BY anchor_id",
+                (),
+            ).await.unwrap();
+            transaction.execute(
+                r#"INSERT INTO retrieval_anchors VALUES ('late-release', '{"body":"released evidence"}', ?1, 'content-retention')"#,
+                params![owner.as_str()],
+            ).await.unwrap();
+            transaction.execute(
+                "INSERT INTO retrieval_anchor_dispositions(disposition_id, anchor_id, owner_json, state, reason_class, effective_at, record_json)
+                 VALUES ('late-release-disposition', 'late-release', ?1, 'deleted', 'retention', 0, '{}')",
+                params![owner.as_str()],
+            ).await.unwrap();
+            transaction.commit().await.unwrap();
+            if generation_root.is_none() {
+                let root =
+                    tracedecay_code_index_retention::code_index_generations::code_index_store_root(
+                        &tracedecay_runtime_core::storage::profile_sharded_data_root(
+                            &profile_root,
+                            &project.project_id,
+                        ),
+                        Path::new(&project.canonical_root),
+                    );
+                tracedecay_code_index_retention::code_index_generations::fixture::write_generation_store_fixture(&root, 6);
+                generation_root = Some(root);
+            }
+            stores.push(database);
+        }
+        let transaction = failing.begin_write_transaction().await.unwrap();
+        transaction.execute("INSERT INTO session_canonical_bodies VALUES ('failing-orphan', 'identity', X'61', 1)", ()).await.unwrap();
+        transaction
+            .execute_batch("DROP TRIGGER lcm_raw_canonical_refs_insert")
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        let coordinator = MaintenanceCoordinator {
+            background_cpu: Some(Arc::new(
+                tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1::new(
+                    std::num::NonZeroUsize::MIN,
+                ),
+            )),
+            ..MaintenanceCoordinator::default()
+        };
+        let schedulers =
+            tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1::new(
+                1,
+            );
+        let retention = tracedecay_configuration::RetentionConfig::default();
+        let branch_gc = super::BranchStoreGcCadenceV1 { branch_gc_days: 30 };
+        let first = coordinator
+            .run_tick(
+                &profile_root,
+                &profile_database,
+                &administration,
+                &schedulers,
+                &retention,
+                branch_gc,
+                None,
+            )
+            .await;
+        assert_eq!(
+            first,
+            MaintenanceTickOutcome::Retry,
+            "the damaged peer refuses collection"
+        );
+        assert!(
+            coordinator
+                .canonical_gc_pending
+                .lock()
+                .await
+                .contains(failing.db_path())
+        );
+        assert!(
+            !coordinator
+                .observation_retention_pending
+                .lock()
+                .await
+                .is_empty()
+        );
+        // Retry deliberately discards the enum continuation. Per-store pending
+        // state must still select a useful slice on the next ordinary tick.
+        let retried = coordinator
+            .run_tick(
+                &profile_root,
+                &profile_database,
+                &administration,
+                &schedulers,
+                &retention,
+                branch_gc,
+                first.continuation(),
+            )
+            .await;
+        assert_eq!(retried, MaintenanceTickOutcome::Retry);
+        for database in &stores {
+            let snapshot = database.read_snapshot().await.unwrap();
+            let bodies: i64 = snapshot
+                .query("SELECT COUNT(*) FROM session_canonical_bodies", ())
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            assert_eq!(
+                bodies, 0,
+                "both healthy stores drain across multiple resource pages despite the peer retry"
+            );
+            let payload: String = snapshot
+                .query(
+                    "SELECT anchor_json FROM retrieval_anchors WHERE anchor_id = 'late-release'",
+                    (),
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            assert!(
+                payload.contains("__retention_released"),
+                "ledger progress reaches beyond the initial 128-row pages"
+            );
+            assert!(
+                !coordinator
+                    .canonical_gc_pending
+                    .lock()
+                    .await
+                    .contains(database.db_path())
+            );
+            assert!(
+                !coordinator
+                    .observation_retention_pending
+                    .lock()
+                    .await
+                    .contains(database.db_path())
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(generation_root.unwrap().join("code-generations-v1"))
+                .unwrap()
+                .count(),
+            1,
+            "generation retention progresses alongside pending sessions"
+        );
+        let snapshot = failing.read_snapshot().await.unwrap();
+        let remaining: i64 = snapshot
+            .query("SELECT COUNT(*) FROM session_canonical_bodies", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(
+            remaining, 1,
+            "guard refusal preserves the failing store's content"
+        );
+        drop(snapshot);
+        let transaction = failing.begin_write_transaction().await.unwrap();
+        transaction
+            .execute_batch(
+                tracedecay_store::canonical_body::RAW_CANONICAL_BODY_REFERENCE_TRIGGERS[0].2,
+            )
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        let resumed = coordinator
+            .run_tick(
+                &profile_root,
+                &profile_database,
+                &administration,
+                &schedulers,
+                &retention,
+                branch_gc,
+                Some(MaintenanceContinuation::SessionContentRetention),
+            )
+            .await;
+        assert_eq!(resumed, MaintenanceTickOutcome::Complete);
+        assert!(coordinator.canonical_gc_pending.lock().await.is_empty());
+        assert!(
+            coordinator
+                .observation_retention_pending
+                .lock()
+                .await
+                .is_empty()
+        );
+        // An exhausted continuation must not start another session sweep.
+        let transaction = stores[0].begin_write_transaction().await.unwrap();
+        transaction.execute("INSERT INTO session_canonical_bodies VALUES ('later-orphan', 'identity', X'61', 1)", ()).await.unwrap();
+        transaction.commit().await.unwrap();
+        let idle = coordinator
+            .run_tick(
+                &profile_root,
+                &profile_database,
+                &administration,
+                &schedulers,
+                &retention,
+                branch_gc,
+                Some(MaintenanceContinuation::CodeGenerationRetention),
+            )
+            .await;
+        assert_eq!(idle, MaintenanceTickOutcome::Complete);
+        let snapshot = stores[0].read_snapshot().await.unwrap();
+        let remaining: i64 = snapshot
+            .query("SELECT COUNT(*) FROM session_canonical_bodies", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(remaining, 1);
+        drop(snapshot);
+        administration.close_stores_for_shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn canonical_continuation_drains_multiple_pages_without_running_other_retention() {
+        use tracedecay_runtime_core::db::engine::params;
+        let harness = tracedecay_global_db::tests::harness::RegisteredGlobalDbHarness::open(
+            "daemon-canonical-continuation",
+        )
+        .await;
+        harness
+            .registered
+            .append_observability_event(&tracedecay_global_db::AnalyticsEventInsert {
+                provider: "tracedecay-observability".to_owned(),
+                project_id: "scope:canonical".to_owned(),
+                session_id: None,
+                timestamp: 0,
+                event_kind: "retrieval.query.completed.v1".to_owned(),
+                hook_name: None,
+                tool_name: None,
+                tool_category: None,
+                skill_name: None,
+                hint_category: None,
+                hint_id: Some("canonical:event:1".to_owned()),
+                outcome: Some("succeeded".to_owned()),
+                metadata_json: Some(
+                    serde_json::json!({"retention_class":"optional_local_detail30d"}).to_string(),
+                ),
+            })
+            .await
+            .unwrap();
+        let transaction = harness.registered.begin_write_transaction().await.unwrap();
+        for index in 0..129 {
+            transaction
+                .execute(
+                    "INSERT INTO session_canonical_bodies VALUES (?1, 'identity', X'61', 1)",
+                    params![format!("{index:064x}")],
+                )
+                .await
+                .unwrap();
+        }
+        transaction.commit().await.unwrap();
+        let outcome = super::run_canonical_content_slice(
+            &harness.registered,
+            &tracedecay_runtime_core::cancellation::CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(outcome, MaintenanceTickOutcome::Complete);
+        let snapshot = harness.registered.read_snapshot().await.unwrap();
+        let remaining: i64 = snapshot
+            .query("SELECT COUNT(*) FROM session_canonical_bodies", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "one continuation drains beyond a 64-resource page"
+        );
+        drop(snapshot);
+        let events = harness
+            .registered
+            .query_analytics_events(&tracedecay_global_db::AnalyticsEventQuery {
+                provider: Some("tracedecay-observability".to_owned()),
+                project_id: Some("scope:canonical".to_owned()),
+                limit: 10,
+                ..tracedecay_global_db::AnalyticsEventQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "canonical-only progress leaves other retention authorities alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_continuation_cancellation_preserves_work_for_resume() {
+        let harness = tracedecay_global_db::tests::harness::RegisteredGlobalDbHarness::open(
+            "daemon-canonical-cancellation",
+        )
+        .await;
+        let transaction = harness.registered.begin_write_transaction().await.unwrap();
+        transaction
+            .execute(
+                "INSERT INTO session_canonical_bodies VALUES ('orphan', 'identity', X'61', 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        let blocker = harness.registered.begin_write_transaction().await.unwrap();
+        let cancellation = tracedecay_runtime_core::cancellation::CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let database = harness.registered.clone();
+        let task = tokio::spawn(async move {
+            super::run_canonical_content_slice(&database, &task_cancellation).await
+        });
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        assert_eq!(task.await.unwrap(), MaintenanceTickOutcome::Retry);
+        drop(blocker);
+        let snapshot = harness.registered.read_snapshot().await.unwrap();
+        let remaining: i64 = snapshot
+            .query("SELECT COUNT(*) FROM session_canonical_bodies", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(remaining, 1);
+        drop(snapshot);
+        assert_eq!(
+            super::run_canonical_content_slice(
+                &harness.registered,
+                &tracedecay_runtime_core::cancellation::CancellationToken::new()
+            )
+            .await,
+            MaintenanceTickOutcome::Complete
+        );
     }
 
     #[tokio::test]

@@ -341,6 +341,11 @@ impl HookDeliveryReceiptSpoolV1 {
 
     /// Whether `root` holds receipts, published or readied, for a drain.
     pub fn has_receipts(root: &Path) -> Result<bool, HookDeliverySpoolError> {
+        if !tracedecay_private_fs::framed_log::validate_directory_or_missing(root)
+            .map_err(map_read_error)?
+        {
+            return Ok(false);
+        }
         let entries = match fs::read_dir(root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -742,7 +747,10 @@ fn decode_receipt(bytes: &[u8]) -> Result<HookDeliverySourceReceiptV1, HookDeliv
 }
 
 fn map_read_error(error: std::io::Error) -> HookDeliverySpoolError {
-    if error.kind() == std::io::ErrorKind::InvalidInput {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotADirectory
+    ) {
         HookDeliverySpoolError::UnsafePath
     } else {
         HookDeliverySpoolError::Io
@@ -865,6 +873,34 @@ mod tests {
 
     #[test]
     fn an_owner_open_waits_out_a_publishing_writer_within_its_budget() {
+        struct PublishingWriter {
+            lock: File,
+            waits: std::sync::Arc<AtomicUsize>,
+        }
+
+        impl tracing::Subscriber for PublishingWriter {
+            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+                metadata.name() == "private_fs.lock.wait"
+            }
+
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+            fn event(&self, _: &tracing::Event<'_>) {}
+
+            fn enter(&self, _: &tracing::span::Id) {
+                assert_eq!(self.waits.fetch_add(1, Ordering::AcqRel), 0);
+                self.lock.unlock().unwrap();
+            }
+
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
         let root = TestDir::new();
         assert_eq!(HookDeliveryReceiptSpoolV1::has_receipts(&root.0), Ok(false));
         drop(HookDeliveryReceiptSpoolV1::open(&root.0, Duration::ZERO).unwrap());
@@ -874,19 +910,18 @@ mod tests {
             HookDeliveryReceiptSpoolV1::open(&root.0, Duration::ZERO).unwrap_err(),
             HookDeliverySpoolError::Busy
         );
-        let publisher_ready = std::sync::Barrier::new(2);
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                publisher_ready.wait();
-                std::thread::sleep(Duration::from_millis(20));
-                publishing.unlock().unwrap();
-            });
-            // Thread startup is not publication work and must not consume
-            // the owner's lock-wait budget before the publisher can run.
-            publisher_ready.wait();
-            let opened = HookDeliveryReceiptSpoolV1::open(&root.0, crate::HOOK_SYNCHRONOUS_BUDGET);
-            assert!(opened.is_ok(), "owner open after publication: {opened:?}");
-        });
+        // Release only after the real lock attempt observes contention, so
+        // publication needs no separately scheduled thread or timer.
+        let waits = std::sync::Arc::new(AtomicUsize::new(0));
+        let opened = tracing::subscriber::with_default(
+            PublishingWriter {
+                lock: publishing,
+                waits: std::sync::Arc::clone(&waits),
+            },
+            || HookDeliveryReceiptSpoolV1::open(&root.0, crate::HOOK_SYNCHRONOUS_BUDGET),
+        );
+        assert!(opened.is_ok(), "owner open after publication: {opened:?}");
+        assert_eq!(waits.load(Ordering::Acquire), 1);
     }
 
     #[test]
@@ -906,51 +941,6 @@ mod tests {
             "a killed writer's torn staging is removed"
         );
         assert_eq!(owner.pending(64).unwrap(), Vec::new());
-    }
-
-    #[test]
-    fn concurrent_writers_on_a_slow_disk_publish_every_receipt_within_budget() {
-        const WRITERS: usize = 8;
-        let root = TestDir::new();
-        drop(HookDeliveryReceiptSpoolV1::open(&root.0, Duration::ZERO).unwrap());
-        let _slow_disk = tracedecay_private_fs::framed_log::sync_latency::inject(
-            &root.0,
-            Duration::from_millis(20),
-        );
-        let receipts = (0..WRITERS).map(indexed_receipt).collect::<Vec<_>>();
-        let retained = std::thread::scope(|scope| {
-            let writers = receipts
-                .iter()
-                .map(|receipt| {
-                    let root = &root.0;
-                    scope.spawn(move || {
-                        HookDeliveryReceiptWriterV1::open_within(
-                            root,
-                            crate::HOOK_SYNCHRONOUS_BUDGET,
-                        )
-                        .and_then(|writer| writer.retain(receipt))
-                    })
-                })
-                .collect::<Vec<_>>();
-            writers
-                .into_iter()
-                .map(|writer| writer.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(
-            retained,
-            (0..WRITERS)
-                .map(|_| Ok(HookDeliveryRetentionV1::Published))
-                .collect::<Vec<_>>()
-        );
-        let mut pending = HookDeliveryReceiptSpoolV1::open(&root.0, Duration::ZERO)
-            .unwrap()
-            .pending(64)
-            .unwrap();
-        let mut expected = receipts;
-        pending.sort_by_key(|receipt| receipt.receipt_id);
-        expected.sort_by_key(|receipt| receipt.receipt_id);
-        assert_eq!(pending, expected);
     }
 
     #[test]

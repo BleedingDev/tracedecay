@@ -26,10 +26,11 @@ pub(super) fn usage_by_session(
 pub(super) fn replayable_sessions(
     pending: &[PendingRecordV1],
     now: UtcMicros,
+    scope: Option<([u8; 16], [u8; 16])>,
 ) -> BTreeSet<[u8; 32]> {
     pending
         .iter()
-        .filter(|record| !is_expired(record, now))
+        .filter(|record| !is_expired(record, now) && scope_matches(record, scope))
         .map(|record| record.protected_session_id)
         .collect()
 }
@@ -51,14 +52,15 @@ pub(super) fn batch_for_session(
     pending: &[PendingRecordV1],
     session: [u8; 32],
     now: UtcMicros,
+    scope: Option<([u8; 16], [u8; 16])>,
 ) -> Result<Vec<usize>, HookSpoolError> {
     let mut records = Vec::new();
     let mut bytes = 0u32;
-    for (index, record) in pending
-        .iter()
-        .enumerate()
-        .filter(|(_, record)| record.protected_session_id == session && !is_expired(record, now))
-    {
+    for (index, record) in pending.iter().enumerate().filter(|(_, record)| {
+        record.protected_session_id == session
+            && !is_expired(record, now)
+            && scope_matches(record, scope)
+    }) {
         let next = bytes
             .checked_add(record.framed_len)
             .ok_or(HookSpoolError::ReplayBatchExceeded)?;
@@ -73,4 +75,10 @@ pub(super) fn batch_for_session(
 
 pub(super) fn is_expired(record: &PendingRecordV1, now: UtcMicros) -> bool {
     now.0.saturating_sub(record.queued_at.0) > MAX_SPOOL_AGE_MICROS
+}
+
+fn scope_matches(record: &PendingRecordV1, scope: Option<([u8; 16], [u8; 16])>) -> bool {
+    scope.is_none_or(|(project_id, worktree_id)| {
+        record.project_id != project_id || record.worktree_id == worktree_id
+    })
 }

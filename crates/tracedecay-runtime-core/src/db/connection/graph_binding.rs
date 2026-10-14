@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use super::Database;
 use crate::shard_runtime::{VerifiedGraphRuntimePortV1, VerifiedGraphRuntimeWeakProxyV1};
@@ -87,6 +87,17 @@ impl Database {
                 message: "verified memory graph runtime is already bound".to_owned(),
             })
         }
+    }
+
+    /// Records that no graph runtime will bind to this database: activation
+    /// failed, was refused, or was never admitted. Deferred proxies then stop
+    /// waiting and answer typed unavailable instead of treating the runtime
+    /// as still activating. A runtime bound first wins; the marker never
+    /// replaces it.
+    pub fn mark_memory_graph_runtime_unavailable(&self) {
+        let dead: Weak<dyn VerifiedGraphRuntimePortV1> =
+            Weak::<VerifiedGraphRuntimeWeakProxyV1>::new();
+        let _ = self.inner.memory_graph_runtime.get_or_init(|| dead);
     }
 
     /// Returns a cloneable non-retaining route to the graph runtime bound to

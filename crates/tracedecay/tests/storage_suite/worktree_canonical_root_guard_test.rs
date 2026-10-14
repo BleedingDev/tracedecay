@@ -179,6 +179,90 @@ async fn observation_store_resolver_maps_primary_and_linked_worktree_to_same_sto
 }
 
 #[tokio::test]
+async fn a_warm_primary_registration_enrolls_the_exact_linked_alias_durably() {
+    let fx = build_fixture();
+    let project_id = init_primary(&fx).await;
+    let layout =
+        tracedecay_runtime_core::storage::resolve_persisted_layout(&fx.main, &fx.profile_root)
+            .unwrap()
+            .unwrap();
+    let registry = HostAdmissionTestRuntimeV1::profile(&fx.profile_root)
+        .await
+        .unwrap();
+    assert!(
+        !registry
+            .profile_database_for_test()
+            .try_list_project_alias_paths()
+            .await
+            .unwrap()
+            .contains(&fx.worktree)
+    );
+    // Identical shared-store inputs warm the same digest the linked checkout
+    // reaches. Registering B must still publish its own exact native alias.
+    tracedecay_global_db::register_project_store(
+        registry.profile_database_for_test(),
+        &fx.main,
+        &layout,
+    )
+    .await
+    .unwrap();
+    tracedecay_global_db::register_project_store(
+        registry.profile_database_for_test(),
+        &fx.worktree,
+        &layout,
+    )
+    .await
+    .unwrap();
+    assert!(
+        registry
+            .profile_database_for_test()
+            .try_list_project_alias_paths()
+            .await
+            .unwrap()
+            .contains(&fx.worktree)
+    );
+    registry.checkpoint_profile_database_for_test().await;
+    drop(registry);
+    let registry = HostAdmissionTestRuntimeV1::profile(&fx.profile_root)
+        .await
+        .unwrap();
+    let linked = registry
+        .project_registry_context_by_alias(&fx.worktree)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(linked.project.project_id, project_id);
+    assert_eq!(
+        linked.project.canonical_root,
+        RegisteredGlobalDb::canonical_project_key(&fx.main)
+    );
+    assert!(
+        registry
+            .profile_database_for_test()
+            .try_list_project_alias_paths()
+            .await
+            .unwrap()
+            .contains(&fx.worktree)
+    );
+    // Alternating back to A retains B's enrollment and the shared identity.
+    tracedecay_global_db::register_project_store(
+        registry.profile_database_for_test(),
+        &fx.main,
+        &layout,
+    )
+    .await
+    .unwrap();
+    assert!(
+        registry
+            .profile_database_for_test()
+            .try_list_project_alias_paths()
+            .await
+            .unwrap()
+            .contains(&fx.worktree)
+    );
+}
+
+#[tokio::test]
 async fn opening_from_linked_worktree_keeps_canonical_root_on_primary() {
     let fx = build_fixture();
     let project_id = init_primary(&fx).await;

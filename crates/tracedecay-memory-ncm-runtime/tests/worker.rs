@@ -306,15 +306,64 @@ fn read_reply(stdout: &mut ChildStdout) -> Reply {
         .expect("reply exists")
 }
 
+/// Forced, uncatchable termination on each platform.
+fn force_kill(pid: u32) {
+    let mut kill = if cfg!(windows) {
+        let mut taskkill = Command::new("taskkill");
+        taskkill.args(["/F", "/PID"]);
+        taskkill
+    } else {
+        let mut kill = Command::new("kill");
+        kill.arg("-9");
+        kill
+    };
+    assert!(
+        kill.arg(pid.to_string())
+            .status()
+            .expect("kill command runs")
+            .success(),
+        "force kill of worker {pid}"
+    );
+}
+
 fn process_exists(pid: u32) -> bool {
-    Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    let mut inspection = if cfg!(windows) {
+        let mut powershell = Command::new("powershell.exe");
+        // Only the specific missing-PID result means exited. A failed query,
+        // including access denial, must fail the reaping assertion.
+        powershell.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
+        powershell.arg(format!(
+            "$ErrorActionPreference = 'Stop'; \
+             try {{ $null = Get-Process -Id {pid}; exit 0 }} \
+             catch {{ \
+               if ($_.FullyQualifiedErrorId -eq \
+                 'NoProcessFoundForGivenId,Microsoft.PowerShell.Commands.GetProcessCommand') \
+               {{ exit 3 }}; throw \
+             }}"
+        ));
+        powershell
+    } else {
+        let mut ps = Command::new("ps");
+        ps.args(["-p", &pid.to_string(), "-o", "pid="]);
+        ps
+    };
+    let output = inspection.output().expect("inspect worker process");
+    let absent = if cfg!(windows) { 3 } else { 1 };
+    match output.status.code() {
+        Some(0) => true,
+        Some(code)
+            if code == absent
+                && (cfg!(windows) || (output.stdout.is_empty() && output.stderr.is_empty())) =>
+        {
+            false
+        }
+        _ => panic!(
+            "could not inspect worker {pid}: {}, stdout={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ),
+    }
 }
 
 fn install_trusted_worker_manifest(binary: &Path) {
@@ -1183,14 +1232,7 @@ fn common_maintenance_pages_restart_worker_between_continuations() {
             );
 
             let pid = client.pid().expect("worker pid exists after page");
-            assert!(
-                Command::new("kill")
-                    .arg("-9")
-                    .arg(pid.to_string())
-                    .status()
-                    .expect("kill command runs")
-                    .success()
-            );
+            force_kill(pid);
             let dead = client.call(
                 Request::new(240 + index, 0, Operation::Health, "", json!({})),
                 Duration::from_millis(500),
@@ -2109,14 +2151,7 @@ fn process_death_is_detected_then_lazily_restarted() {
         )
         .expect("initial worker starts");
     let first_pid = client.pid().expect("worker pid exists");
-    assert!(
-        Command::new("kill")
-            .arg("-9")
-            .arg(first_pid.to_string())
-            .status()
-            .expect("kill command runs")
-            .success()
-    );
+    force_kill(first_pid);
     let failed = client.call(
         Request::new(221, 0, Operation::Health, "", json!({})),
         Duration::from_millis(500),
@@ -2191,14 +2226,7 @@ fn recall_after_worker_restart_reproves_namespace_and_recovers_privacy_fence() {
     );
     assert_eq!(fenced.outcome, Outcome::EffectUnknown);
     drop(engine);
-    assert!(
-        Command::new("kill")
-            .arg("-9")
-            .arg(first_pid.to_string())
-            .status()
-            .expect("kill command runs")
-            .success()
-    );
+    force_kill(first_pid);
     let recovered = client
         .call(
             Request::new(
@@ -2352,6 +2380,7 @@ fn client_drop_reaps_worker_and_stdin_eof_exits_zero() {
         )
         .expect("worker starts");
     let pid = client.pid().expect("worker pid exists");
+    assert!(process_exists(pid), "started worker must be observable");
     drop(client);
     let deadline = Instant::now() + Duration::from_millis(300);
     while process_exists(pid) && Instant::now() < deadline {

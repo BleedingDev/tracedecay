@@ -6,7 +6,7 @@
 //! (read-side graph queries), `diagnostics` (branch state), [`facts`]
 //! (session memory), and source-edit orchestration.
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tracedecay_configuration::config::RuntimeTraceDecayConfig;
 use tracedecay_contracts::context_scout::ContextScoutAddressV1;
@@ -48,6 +48,7 @@ pub struct TraceDecay {
     configuration_runtime: Arc<tracedecay_configuration::ProjectConfigurationRuntime>,
     project_root: PathBuf,
     store_layout: StoreLayout,
+    hook_publications: Mutex<Vec<tracedecay_hooks::OwnedHookConfigurationV1>>,
     open_options: TraceDecayOpenOptions,
     /// The active git branch (None if detached HEAD or not a git repo).
     active_branch: Option<String>,
@@ -56,6 +57,12 @@ pub struct TraceDecay {
     /// Set when serving from a fallback (ancestor) DB instead of the exact branch.
     fallback_warning: Option<String>,
     read_only: bool,
+    /// The Context Scout owner a writable open started or reused. The owner
+    /// registry routes lookups to it weakly, so this handle is what keeps the
+    /// owner, and the project database clone it holds, alive.
+    context_scout_owner: Option<
+        Arc<tracedecay_agent_hosts::agents::context_scout::owner::ProjectContextScoutOwnerV1>,
+    >,
     /// The registered test runtime a fixture open went through, kept alive
     /// for as long as the graph is; `None` for every production open.
     #[cfg(any(test, feature = "test-helpers"))]
@@ -98,6 +105,52 @@ impl TraceDecay {
 
     pub fn hook_store_layout(&self) -> &StoreLayout {
         &self.store_layout
+    }
+
+    /// Extend only the exact publications retained by this graph's open.
+    pub fn renew_hook_bindings(
+        &self,
+        now: tracedecay_domain::UtcMicros,
+    ) -> Result<
+        Vec<(
+            tracedecay_domain::NativeHostIdentityV1,
+            tracedecay_hooks::config::HookConfigurationPublicationError,
+        )>,
+    > {
+        let mut publications =
+            self.hook_publications
+                .lock()
+                .map_err(|_| TraceDecayError::Config {
+                    message: "Hook publication ownership is poisoned".to_owned(),
+                })?;
+        if !publications
+            .iter()
+            .any(|publication| publication.renewal_due(now))
+        {
+            return Ok(Vec::new());
+        }
+        let profile = self.open_options.resolved_profile_root()?;
+        let _lease = match tracedecay_runtime_core::lifecycle_lease::try_acquire_shared_for_profile(
+            &profile,
+            "Hook binding renewal",
+        )? {
+            tracedecay_runtime_core::lifecycle_lease::SharedLeaseAttempt::Acquired(lease) => lease,
+            tracedecay_runtime_core::lifecycle_lease::SharedLeaseAttempt::Busy => {
+                return Err(TraceDecayError::Config {
+                    message: "Hook binding renewal is blocked by profile maintenance".to_owned(),
+                });
+            }
+        };
+        let mut failures = Vec::new();
+        for publication in publications
+            .iter_mut()
+            .filter(|publication| publication.renewal_due(now))
+        {
+            if let Err(error) = publication.renew(now) {
+                failures.push((publication.host(), error));
+            }
+        }
+        Ok(failures)
     }
 
     pub fn source_read_context(&self) -> Option<SourceReadContext> {

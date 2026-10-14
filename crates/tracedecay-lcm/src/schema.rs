@@ -4,6 +4,10 @@ use crate::retrieval_content::projected_content_hash;
 use tracedecay_runtime_core::db::engine::{Connection, TransactionBehavior};
 use tracedecay_runtime_core::db::engine::{Executor, QueryExecutor, params};
 use tracedecay_store::CANONICAL_BODIES_TABLE_SQL;
+use tracedecay_store::canonical_body::{
+    CANONICAL_BODY_REFERENCES_INDEX_SQL, CANONICAL_BODY_REFERENCES_TABLE_SQL,
+    RAW_CANONICAL_BODY_REFERENCE_TRIGGERS,
+};
 
 use super::{LcmError, LcmRawMessage, raw};
 
@@ -397,6 +401,7 @@ pub async fn ensure_lcm_schema_in_transaction(
             conn.execute_batch(CANONICAL_BODIES_TABLE_SQL).await?;
             ensure_raw_identity_schema(conn).await?;
             ensure_payload_gc_candidates(conn).await?;
+            ensure_canonical_body_references(conn).await?;
             super::summary_convergence::ensure_schema(conn).await?;
             return Ok(());
         }
@@ -524,6 +529,7 @@ pub async fn ensure_lcm_schema_in_transaction(
     .await?;
     ensure_raw_identity_schema(conn).await?;
     ensure_payload_gc_candidates(conn).await?;
+    ensure_canonical_body_references(conn).await?;
     conn.execute_batch(RAW_FTS_DDL).await?;
     super::summary_convergence::ensure_schema(conn).await?;
     super::summary_convergence::retire_predecessor_range_rewrite(conn).await?;
@@ -536,6 +542,17 @@ pub async fn ensure_lcm_schema_in_transaction(
         params![MIGRATION_NAME, LCM_SCHEMA_VERSION],
     )
     .await?;
+    Ok(())
+}
+
+async fn ensure_canonical_body_references(conn: &(impl Executor + ?Sized)) -> Result<(), LcmError> {
+    conn.execute_batch(CANONICAL_BODY_REFERENCES_TABLE_SQL)
+        .await?;
+    conn.execute_batch(CANONICAL_BODY_REFERENCES_INDEX_SQL)
+        .await?;
+    for (_, _, sql) in RAW_CANONICAL_BODY_REFERENCE_TRIGGERS {
+        conn.execute_batch(sql).await?;
+    }
     Ok(())
 }
 

@@ -177,14 +177,16 @@ enum WindowFollowUp {
 
 fn projection_published_work(report: &SessionTemporalRefreshPassReport) -> bool {
     report.begun > 0
-        || report.joined > 0
         || report.projected_batches > 0
         || report.completed > 0
         || report.failed > 0
+        || report.cancelled > 0
 }
 
 fn projection_still_unpublished(report: &SessionTemporalRefreshPassReport) -> bool {
-    report.backlog.is_some_and(|backlog| backlog > 0) || report.saturated
+    report.backlog.is_some_and(|backlog| backlog > 0)
+        || report.saturated
+        || report.retry_class.is_some()
 }
 
 /// An in-scope Codex window becomes searchable only after its projection
@@ -215,7 +217,6 @@ fn window_follow_up(
     match history {
         HistoryContinuation::Immediate => WindowFollowUp::ContinueHistory,
         HistoryContinuation::AwaitRelease => WindowFollowUp::AwaitHistoryRelease,
-        HistoryContinuation::Settled if holding => WindowFollowUp::ContinueHistory,
         HistoryContinuation::Settled => WindowFollowUp::Settle,
     }
 }
@@ -232,6 +233,8 @@ pub(super) async fn run_session_temporal_refresh_scheduler(
     let mut summary_retry_attempt = 0u32;
     let mut history_priority_passes = 0u32;
     let mut history_release = None;
+    let mut retained_history_outcome = None;
+    let mut deferred_history_request = false;
     let mut granted_history_admission = None;
     let _instrumentation = SessionTemporalRefreshWorkerInstrumentation::new(&state);
     state.mark_running();
@@ -250,6 +253,7 @@ pub(super) async fn run_session_temporal_refresh_scheduler(
             // is the out-of-scope cursor sweep, and it holds this worker until
             // it returns, so the newest day never leaves its building generation.
             if state.history_held_for_projection() {
+                deferred_history_request |= history_requested;
                 history_requested = false;
                 projection_requested = true;
             }
@@ -283,6 +287,7 @@ pub(super) async fn run_session_temporal_refresh_scheduler(
             }
             if let Some(outcome) = &history_outcome {
                 state.record_history_outcome(outcome.clone());
+                retained_history_outcome = Some(outcome.clone());
             }
             if matches!(
                 history_outcome,
@@ -334,17 +339,30 @@ pub(super) async fn run_session_temporal_refresh_scheduler(
             if state.cancelled.load(Ordering::Acquire) {
                 return;
             }
+            let publication_complete =
+                report.backlog == Some(0) && !report.saturated && report.retry_class.is_none();
+            let publication_pending = projection_still_unpublished(&report)
+                || (state.history_held_for_projection() && !publication_complete);
+            if publication_pending {
+                state.hold_history_for_projection();
+            }
             let holding_publication = state.history_held_for_projection();
-            // A projection-only iteration that is finishing the admitted window
-            // must not spend the pass on summary convergence. History did not
-            // run, so the real outcome is `None`, which would otherwise admit
-            // the full page.
-            let convergence_outcome = if holding_publication && history_outcome.is_none() {
+            let resume_deferred_history = holding_publication
+                && publication_complete
+                && std::mem::take(&mut deferred_history_request);
+            // Projection-only passes retain the actual historical continuation:
+            // publishing a blocked window cannot manufacture another ingest.
+            let effective_history_outcome = history_outcome.clone().or_else(|| {
+                holding_publication
+                    .then(|| retained_history_outcome.clone())
+                    .flatten()
+            });
+            let convergence_outcome = if publication_pending || resume_deferred_history {
                 Some(SessionHistoricalIngestOutcome::Pending {
-                    made_progress: true,
+                    made_progress: false,
                 })
             } else {
-                history_outcome.clone()
+                effective_history_outcome.clone()
             };
             let convergence_admission =
                 lcm_convergence_admission(convergence_outcome, &mut history_priority_passes);
@@ -386,6 +404,15 @@ pub(super) async fn run_session_temporal_refresh_scheduler(
                         // semaphore's FIFO queue. Only then advertise idle so an
                         // observer cannot release permits before this worker is
                         // registered to receive one.
+                        if let Some(backlog) = report.backlog {
+                            state.record_pass(
+                                backlog.saturating_add(usize::from(history_needs_another_pass)),
+                                projection_published_work(&report)
+                                    || history_outcome
+                                        .as_ref()
+                                        .is_some_and(SessionHistoricalIngestOutcome::made_progress),
+                            );
+                        }
                         state.mark_worker_idle();
                         state.idle.notify_waiters();
                         let permit = tokio::select! {
@@ -506,11 +533,38 @@ pub(super) async fn run_session_temporal_refresh_scheduler(
                     () = tracing::Instrument::instrument(state.wake.notified(), tracing::trace_span!("daemon.scheduler.session_temporal.wake_wait")) => {}
                     () = tracing::Instrument::instrument(tokio::time::sleep(retry_delay), tracing::trace_span!("daemon.scheduler.session_temporal.retry_wait")) => {}
                 }
+            } else if publication_pending {
+                // This pass owns unpublished projection work even if history
+                // just completed. Publish it before admitting any model work.
+                state.mark_running();
+                state.hold_history_for_projection();
+                if projection_published_work(&report) {
+                    state.requeue_projection();
+                    tokio::task::yield_now().await;
+                } else {
+                    // A retained terminal claim or deferred projector can leave
+                    // backlog without any publication work to retry now. Keep
+                    // models withheld, but use the existing discovery cadence
+                    // instead of spinning through unchanged recoveries.
+                    state.observe_quiescence();
+                    state.mark_worker_idle();
+                    state.idle.notify_waiters();
+                    tokio::select! {
+                        () = tracing::Instrument::instrument(state.wait_for_cancellation(), tracing::trace_span!("daemon.scheduler.session_temporal.publication_idle_cancel")) => return,
+                        () = tracing::Instrument::instrument(state.wake.notified(), tracing::trace_span!("daemon.scheduler.session_temporal.publication_wake_wait")) => {}
+                        () = tracing::Instrument::instrument(tokio::time::sleep(HISTORY_IDLE_RECHECK_INTERVAL), tracing::trace_span!("daemon.scheduler.session_temporal.publication_idle_wait")) => {}
+                    }
+                    state.requeue_projection();
+                }
             } else if history_needs_another_pass {
                 state.mark_running();
                 retry_attempt = 0;
                 match window_follow_up(
-                    history_continuation(history_outcome),
+                    if resume_deferred_history {
+                        HistoryContinuation::Immediate
+                    } else {
+                        history_continuation(effective_history_outcome)
+                    },
                     projection_still_unpublished(&report),
                     projection_published_work(&report),
                     holding_publication,
@@ -1616,6 +1670,7 @@ pub async fn run_session_temporal_refresh_pass(
     projector: &dyn SessionTemporalRefreshProjector,
     policy: SessionTemporalRefreshPolicy,
 ) -> SessionTemporalRefreshPassReport {
+    let _publication = database.session_publication_guard().await;
     let store = SessionTemporalStore::new(database.as_ref());
     let access = SessionTemporalAccess::new(database.as_ref());
     let context = RefreshPassContext {
@@ -1763,6 +1818,7 @@ pub async fn run_session_temporal_refresh_pass(
 
 #[cfg(test)]
 mod tests {
+    use super::super::projector::CanonicalSessionTemporalProjector;
     use super::*;
     use tracedecay_domain::SessionId;
     use tracedecay_global_db::tests::harness::RegisteredGlobalDbHarness;
@@ -1911,6 +1967,118 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn retained_completion_claim_waits_for_a_wake_without_spinning() {
+        let harness = RegisteredGlobalDbHarness::open("refresh-retained-completion-idle").await;
+        let store = SessionTemporalStore::new(harness.registered.as_ref());
+        let session_id = SessionId::new("retained-completion-idle").unwrap();
+        store
+            .begin_or_join_session_refresh(SessionRefreshBeginOrJoinRequestV1::new(
+                session_id.clone(),
+                SessionRefreshFrontierV1::new(0, 0).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let state = Arc::new(SessionTemporalRefreshWakeState::default());
+        let report = run_session_temporal_refresh_pass(
+            &harness.registered,
+            &state,
+            &CanonicalSessionTemporalProjector,
+            SessionTemporalRefreshPolicy::default(),
+        )
+        .await;
+        assert_eq!(report.projected_batches, 1);
+        let recovery = store
+            .session_refresh_recovery(&session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovery.restart_state(),
+            SessionRefreshRestartStateV1::ReadyToComplete
+        );
+        assert!(state.claim_terminal_attempt(&recovery));
+        let mut refused = SessionTemporalRefreshPassReport::default();
+        reject_staged_completion(
+            &store,
+            &state,
+            ClaimedTerminalAttempt::new(&state, recovery.clone()),
+            SessionStoreError::BudgetExceeded { resource: "work" },
+            &mut refused,
+        )
+        .await;
+        assert_eq!(refused.terminal_errors, 1);
+        assert!(!state.claim_terminal_attempt(&recovery));
+        state.requeue_projection();
+        let worker = run_session_temporal_refresh_scheduler(
+            harness.registered.clone(),
+            Arc::clone(&state),
+            Arc::new(CanonicalSessionTemporalProjector),
+            Arc::new(std::sync::RwLock::new(None)),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            SessionTemporalRefreshPolicy::default(),
+        );
+        tokio::pin!(worker);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| {
+                assert!(worker.as_mut().poll(cx).is_pending());
+                if state.is_idle() && state.pass_count.load(Ordering::Acquire) > 0 {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("a retained terminal claim reaches idle");
+        assert!(state.history_held_for_projection());
+        assert_eq!(state.pass_count.load(Ordering::Acquire), 1);
+        // Polling the pending worker cannot start another pass until a real
+        // wake or the existing idle recheck timer releases it.
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(worker.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert_eq!(state.pass_count.load(Ordering::Acquire), 1);
+        let publication = tokio::time::timeout(
+            Duration::from_secs(5),
+            harness.registered.session_publication_guard(),
+        )
+        .await
+        .unwrap();
+        drop(publication);
+        assert_eq!(
+            store.session_refresh_recovery(&session_id).await.unwrap(),
+            Some(recovery.clone())
+        );
+        let handle = state.handle();
+        for _ in 0..2 {
+            let before = state.pass_count.load(Ordering::Acquire);
+            let join = handle.wake_and_wait_until_idle(Duration::from_secs(5));
+            tokio::pin!(join);
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    std::future::poll_fn(|cx| {
+                        // Deliver and register the join's wake before driving its pass.
+                        let joined = join.as_mut().poll(cx);
+                        assert!(worker.as_mut().poll(cx).is_pending());
+                        joined
+                    })
+                )
+                .await
+                .expect("an explicit wake joins the no-progress pass")
+            );
+            assert_eq!(state.pass_count.load(Ordering::Acquire), before + 1);
+            assert!(state.history_held_for_projection());
+            assert!(!state.claim_terminal_attempt(&recovery));
+        }
+        state.cancel();
+        worker.await;
+    }
+
     #[test]
     fn deterministic_storage_refusals_are_not_retryable() {
         // The schema-contract trigger that refused eleven hours of identical
@@ -2053,8 +2221,8 @@ mod tests {
                 projection_published_work(&published),
                 true,
             ),
-            WindowFollowUp::ContinueHistory,
-            "a published window releases the next history window"
+            WindowFollowUp::Settle,
+            "publishing a settled historical window cannot create another ingest"
         );
 
         let stalled = SessionTemporalRefreshPassReport {
@@ -2068,8 +2236,8 @@ mod tests {
                 projection_published_work(&stalled),
                 true,
             ),
-            WindowFollowUp::ContinueHistory,
-            "a projection pass that moves nothing must not spin ahead of history"
+            WindowFollowUp::Settle,
+            "stalled publication cannot invent another settled historical window"
         );
 
         assert_eq!(

@@ -119,7 +119,7 @@ async fn authoritative_summary_journey_owns_the_message_corpus_once() {
     // The planning pass ran and the pending result kept every field the host
     // contract needs, including the summary request it could not satisfy.
     assert_eq!(response.status, "needs_summary");
-    assert_eq!(response.reason, "authoritative_summarizer_unavailable");
+    assert_eq!(response.reason, "codex_app_server_unconfigured");
     assert_eq!(
         response.retry_status.as_deref(),
         Some("needs_authoritative_summary")

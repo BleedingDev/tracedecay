@@ -346,7 +346,14 @@ mod tests {
                 let similarity = encoder.similarity(left, right).unwrap();
                 let prepared = encoder.query_similarity(&query, right).unwrap();
                 assert_eq!(similarity.to_bits(), prepared.to_bits());
-                similarities.push(similarity);
+                // NaN bit patterns are target-specific (x86 generates a
+                // sign-set NaN, aarch64 a positive one), so record only that a
+                // result is NaN.
+                similarities.push(if similarity.is_nan() {
+                    f64::NAN
+                } else {
+                    similarity
+                });
             }
         }
 
@@ -376,7 +383,7 @@ mod tests {
         );
         assert_eq!(
             bits_digest(&similarities),
-            "29466a342b496755893a2ede39286af2a84d6216fa2a47e93852fec9b0eb05bd",
+            "d18ac773b2f338c5c3ef866ddef3470c5dfce55906fa36451bd4779d0ad8e91c",
         );
     }
 

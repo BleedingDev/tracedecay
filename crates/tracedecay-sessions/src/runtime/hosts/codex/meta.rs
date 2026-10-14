@@ -7,7 +7,9 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 
 use serde_json::Value;
 
-use crate::runtime::source::{MAX_JSONL_RECORD_BYTES, RawJsonlFrame, RawJsonlFrameReader};
+use crate::runtime::source::{
+    MAX_JSONL_RECORD_BYTES, RawJsonlFrame, RawJsonlFrameReader, TranscriptMetadataPendingReason,
+};
 
 /// Session metadata read from a rollout's leading `session_meta` line.
 #[derive(Clone)]
@@ -65,6 +67,21 @@ impl CodexMetaWithProvenance {
     }
 }
 
+pub(super) enum CodexMetadataRead {
+    Ready(Box<CodexMetaWithProvenance>),
+    Pending(TranscriptMetadataPendingReason),
+    Invalid,
+}
+
+impl CodexMetadataRead {
+    pub(super) fn ready(self) -> Option<CodexMetaWithProvenance> {
+        match self {
+            Self::Ready(meta) => Some(*meta),
+            Self::Pending(_) | Self::Invalid => None,
+        }
+    }
+}
+
 pub struct CodexTurnContext {
     pub turn_id: Option<String>,
     pub model: Option<String>,
@@ -74,7 +91,7 @@ pub struct CodexTurnContext {
 /// Read the leading `session_meta` line of a rollout for cwd/session-id/model.
 pub(super) fn session_meta(path: &Path) -> Option<CodexMeta> {
     match session_meta_with_provenance(path) {
-        Ok(parsed) => parsed.map(|parsed| parsed.meta),
+        Ok(parsed) => parsed.ready().map(|parsed| parsed.meta),
         Err(error) => {
             tracing::debug!(transcript_path = %path.display(), %error, "Codex metadata unavailable");
             None
@@ -82,9 +99,7 @@ pub(super) fn session_meta(path: &Path) -> Option<CodexMeta> {
     }
 }
 
-pub(super) fn session_meta_with_provenance(
-    path: &Path,
-) -> std::io::Result<Option<CodexMetaWithProvenance>> {
+pub(super) fn session_meta_with_provenance(path: &Path) -> std::io::Result<CodexMetadataRead> {
     #[cfg(test)]
     {
         let reads = SESSION_META_READS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
@@ -105,24 +120,44 @@ pub(super) fn session_meta_with_provenance(
     }
     let file = std::fs::File::open(path)?;
     let mut frames = RawJsonlFrameReader::new(BufReader::new(file), MAX_JSONL_RECORD_BYTES);
+    let mut saw_complete = false;
     for _ in 0..4 {
         match frames.next_frame()? {
-            RawJsonlFrame::Eof => break,
-            RawJsonlFrame::Complete { .. } | RawJsonlFrame::Partial { .. } => {
+            RawJsonlFrame::Eof => {
+                return Ok(if saw_complete {
+                    CodexMetadataRead::Invalid
+                } else {
+                    CodexMetadataRead::Pending(TranscriptMetadataPendingReason::Empty)
+                });
+            }
+            RawJsonlFrame::Partial { .. } => {
+                return Ok(CodexMetadataRead::Pending(
+                    TranscriptMetadataPendingReason::Unterminated,
+                ));
+            }
+            RawJsonlFrame::Complete { .. } => {
+                saw_complete = true;
                 let Ok(value) = serde_json::from_slice::<Value>(frames.record()) else {
                     continue;
                 };
                 if let Some(meta) = session_meta_with_provenance_from_record(&value, path) {
-                    return Ok(Some(CodexMetaWithProvenance {
-                        source_frame_bytes: frames.record().len(),
-                        ..meta
-                    }));
+                    return Ok(CodexMetadataRead::Ready(Box::new(
+                        CodexMetaWithProvenance {
+                            source_frame_bytes: frames.record().len(),
+                            ..meta
+                        },
+                    )));
+                }
+                if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+                    return Ok(CodexMetadataRead::Invalid);
                 }
             }
-            RawJsonlFrame::Oversized { .. } | RawJsonlFrame::BudgetExhausted { .. } => {}
+            RawJsonlFrame::Oversized { .. } | RawJsonlFrame::BudgetExhausted { .. } => {
+                return Ok(CodexMetadataRead::Invalid);
+            }
         }
     }
-    Ok(None)
+    Ok(CodexMetadataRead::Invalid)
 }
 
 #[cfg(test)]
@@ -325,4 +360,52 @@ pub fn turn_context_from_record(record: &Value) -> Option<CodexTurnContext> {
         model,
         cwd,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_metadata_requires_a_complete_frame() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rollout-native.jsonl");
+        std::fs::write(&path, "").unwrap();
+        assert!(matches!(
+            session_meta_with_provenance(&path).unwrap(),
+            CodexMetadataRead::Pending(TranscriptMetadataPendingReason::Empty)
+        ));
+        for contents in [
+            "{\"type\":\"session_meta\",\"payload\":",
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"native\",\"cwd\":\"/fixture/project\"}}",
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            assert!(matches!(
+                session_meta_with_provenance(&path).unwrap(),
+                CodexMetadataRead::Pending(TranscriptMetadataPendingReason::Unterminated)
+            ));
+        }
+        let meta = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"native\",\"cwd\":\"/fixture/project\"}}\n";
+        std::fs::write(&path, meta).unwrap();
+        assert_eq!(
+            session_meta_with_provenance(&path)
+                .unwrap()
+                .ready()
+                .unwrap()
+                .meta
+                .session_id,
+            "native"
+        );
+        for contents in [
+            "{}\n",
+            "{malformed}\n",
+            "{\"type\":\"session_meta\",\"payload\":{}}\n{partial",
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            assert!(matches!(
+                session_meta_with_provenance(&path).unwrap(),
+                CodexMetadataRead::Invalid
+            ));
+        }
+    }
 }

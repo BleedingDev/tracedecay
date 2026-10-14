@@ -719,7 +719,8 @@ async fn broker_ignores_stale_refresh_completion() {
 async fn broker_reuses_warm_lsp_client_between_refreshes() {
     let temp = tempfile::tempdir().unwrap();
     let script_path = temp.path().join("warm_fake_lsp.py");
-    let counter_path = temp.path().join("starts.txt");
+    let counter_path = temp.path().join("starts");
+    std::fs::create_dir(&counter_path).unwrap();
     std::fs::write(
         &script_path,
         fake_lsp_script_that_records_start(&counter_path),
@@ -740,8 +741,7 @@ async fn broker_reuses_warm_lsp_client_between_refreshes() {
         .await
         .unwrap();
 
-    let starts = std::fs::read_to_string(counter_path).unwrap();
-    assert_eq!(starts.lines().count(), 1);
+    assert_eq!(super::start_count(&counter_path), 1);
 }
 
 #[tokio::test]
@@ -824,7 +824,8 @@ async fn broker_drops_warm_client_when_the_admitted_root_disappears() {
 async fn broker_keys_warm_lsp_clients_by_workspace_root() {
     let temp = tempfile::tempdir().unwrap();
     let script_path = temp.path().join("workspace_fake_lsp.py");
-    let counter_path = temp.path().join("starts.txt");
+    let counter_path = temp.path().join("starts");
+    std::fs::create_dir(&counter_path).unwrap();
     std::fs::write(
         &script_path,
         fake_lsp_script_that_records_start(&counter_path),
@@ -864,8 +865,7 @@ async fn broker_keys_warm_lsp_clients_by_workspace_root() {
         .await
         .unwrap();
 
-    let starts = std::fs::read_to_string(counter_path).unwrap();
-    assert_eq!(starts.lines().count(), 2);
+    assert_eq!(super::start_count(&counter_path), 2);
 }
 
 #[tokio::test]
@@ -1017,6 +1017,10 @@ async fn refresh_quiet_window_stays_budget_neutral_and_reuses_live_client() {
     let temp = tempfile::tempdir().unwrap();
     let script_path = temp.path().join("never_publish_lsp.py");
     let starts_path = temp.path().join("starts.txt");
+    // The fake analyzer appends one line per start. The file exists before
+    // the first start so a read after a start the runner killed early still
+    // proves "no further start" rather than failing on a missing file.
+    std::fs::write(&starts_path, "").unwrap();
     let preamble = format!(
         r#"
 with open({starts:?}, "a", encoding="utf-8") as f:
@@ -1119,6 +1123,10 @@ async fn refresh_only_post_initialize_crash_loop_exhausts_restart_budget() {
     let temp = tempfile::tempdir().unwrap();
     let script_path = temp.path().join("exit_after_initialize_lsp.py");
     let starts_path = temp.path().join("starts.txt");
+    // The fake analyzer appends one line per start. The file exists before
+    // the first start so a read after a start the runner killed early still
+    // proves "no further start" rather than failing on a missing file.
+    std::fs::write(&starts_path, "").unwrap();
     let preamble = format!(
         r#"
 with open({starts:?}, "a", encoding="utf-8") as f:
@@ -1217,6 +1225,9 @@ async fn an_exhausted_restart_budget_stops_the_refresh_lane_from_respawning() {
     let temp = tempfile::tempdir().unwrap();
     let script_path = temp.path().join("never_initialize_lsp.py");
     let starts_path = temp.path().join("starts.txt");
+    // A bounded start may be reaped before Python runs its append. Keep the
+    // baseline durable so zero observed starts remains an exact counter value.
+    std::fs::write(&starts_path, "").unwrap();
     std::fs::write(
         &script_path,
         format!(
@@ -1275,7 +1286,20 @@ time.sleep(60)
     let starts_before = std::fs::read_to_string(&starts_path).unwrap();
     assert!(starts_before.lines().count() <= usize::from(tracedecay_lsp::MAX_ANALYZER_RESTARTS));
 
-    std::fs::write(&script_path, fake_lsp_script()).unwrap();
+    std::fs::write(
+        &script_path,
+        fake_lsp_script_with_preamble(
+            &format!(
+                r#"
+with open({:?}, "a", encoding="utf-8") as f:
+    f.write("start\n")
+"#,
+                starts_path.display().to_string(),
+            ),
+            EMPTY_DIAGNOSTIC_PUBLISH,
+        ),
+    )
+    .unwrap();
     let error = broker
         .refresh_documents_with_timeouts(
             FAKE_LANGUAGE,

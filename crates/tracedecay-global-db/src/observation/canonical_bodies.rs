@@ -30,6 +30,12 @@ pub(crate) async fn ensure_canonical_bodies_table(
 ) -> tracedecay_domain::errors::Result<()> {
     conn.execute_batch(CANONICAL_BODIES_TABLE_SQL)
         .await
+        .map_err(|error| global_db_operation_error(OPERATION, error))?;
+    conn.execute_batch(tracedecay_store::canonical_body::CANONICAL_BODY_REFERENCES_TABLE_SQL)
+        .await
+        .map_err(|error| global_db_operation_error(OPERATION, error))?;
+    conn.execute_batch(tracedecay_store::canonical_body::CANONICAL_BODY_REFERENCES_INDEX_SQL)
+        .await
         .map_err(|error| global_db_operation_error(OPERATION, error))
 }
 
@@ -102,15 +108,25 @@ async fn compact_observation_page(
             rewrote: false,
         });
     }
-    let mut rows = conn
-        .query(
-            "SELECT observation_id, observation_json FROM observations
-         WHERE (?1 IS NULL OR observation_id > ?1)
-         ORDER BY observation_id LIMIT ?2",
-            params![after, COMPACT_PAGE],
-        )
-        .await
-        .map_err(|error| global_db_operation_error(OPERATION, error))?;
+    let mut rows = match after {
+        Some(after) => {
+            conn.query(
+                "SELECT observation_id, observation_json FROM observations
+             WHERE observation_id > ?1 ORDER BY observation_id LIMIT ?2",
+                params![after, COMPACT_PAGE],
+            )
+            .await
+        }
+        None => {
+            conn.query(
+                "SELECT observation_id, observation_json FROM observations
+             ORDER BY observation_id LIMIT ?1",
+                params![COMPACT_PAGE],
+            )
+            .await
+        }
+    }
+    .map_err(|error| global_db_operation_error(OPERATION, error))?;
     let mut page = Vec::new();
     while let Some(row) = rows
         .next()
@@ -145,12 +161,13 @@ async fn compact_observation_page(
             if slim != json {
                 conn.execute(
                     "UPDATE observations SET observation_json = ?1 WHERE observation_id = ?2",
-                    params![slim, id.as_str()],
+                    params![slim.as_str(), id.as_str()],
                 )
                 .await
                 .map_err(|error| global_db_operation_error(OPERATION, error))?;
                 rewrote = true;
             }
+            super::canonical_lifecycle::replace_observation_references(conn, &id, &slim).await?;
         }
         next = Some(id);
     }
@@ -525,6 +542,58 @@ mod tests {
             conn.execute("UPDATE observations SET observation_json = '{}'", ())
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_compaction_vm_work_does_not_grow_with_scanned_prefix() {
+        let harness =
+            crate::tests::harness::RegisteredGlobalDbHarness::open("canonical-compaction-keyset")
+                .await;
+        let database = &harness.registered;
+        let transaction = database.begin_write_transaction().await.unwrap();
+        transaction
+            .execute(
+                "DELETE FROM global_schema_migrations WHERE migration = ?1",
+                params![CANONICAL_BODY_MIGRATION],
+            )
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for index in 0..1024 {
+            let (observation, cursor) =
+                crate::schema_contract::invariants::test_fixture::authority_fixture(
+                    index, "keyset",
+                );
+            let receipt = observation.receipt();
+            transaction.execute("INSERT INTO sanitization_receipts (receipt_id, sanitizer_version, payload_digest, receipt_json) VALUES (?1, ?2, ?3, ?4)", params![receipt.receipt().receipt_id().as_str(), receipt.receipt().sanitizer_version().as_str(), observation.payload_reference().digest().as_str(), serde_json::to_string(receipt).unwrap()]).await.unwrap();
+            transaction.execute("INSERT INTO observations (observation_id, payload_digest, receipt_id, observation_json, committed_cursor_json) VALUES (?1, ?2, ?3, ?4, ?5)", params![observation.observation_id().as_str(), observation.payload_reference().digest().as_str(), receipt.receipt().receipt_id().as_str(), serde_json::to_string(&observation).unwrap(), serde_json::to_string(&cursor).unwrap()]).await.unwrap();
+            ids.push(observation.observation_id().as_str().to_owned());
+        }
+        transaction.commit().await.unwrap();
+        ids.sort();
+        let mut costs = Vec::new();
+        for after in [&ids[255], &ids[767]] {
+            let before = crate::tests::harness::writer_telemetry(database)
+                .sqlite_vm
+                .vm_steps;
+            let transaction = database.begin_write_transaction().await.unwrap();
+            let page = compact_observation_page(&transaction, Some(after))
+                .await
+                .unwrap();
+            assert!(page.next.is_some());
+            transaction.commit().await.unwrap();
+            costs.push(
+                crate::tests::harness::writer_telemetry(database)
+                    .sqlite_vm
+                    .vm_steps
+                    - before,
+            );
+        }
+        assert!(costs[0] > 0);
+        assert!(
+            costs[1] <= costs[0] + 256,
+            "indexed continuation work must stay constant as the prior prefix triples: {costs:?}"
         );
     }
 

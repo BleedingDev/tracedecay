@@ -372,6 +372,7 @@ async fn begin_portable_project_open(
     canonical_project_path: PathBuf,
     route: ProjectRouteKey,
     initialize_request: Option<JsonRpcRequest>,
+    hook_recovery: Option<Arc<Vec<tracedecay_hooks::HookConfigurationSnapshotV1>>>,
     #[cfg(test)] project_open_attempts: Option<Arc<AtomicUsize>>,
 ) -> ProjectOpenTaskClaim {
     let tasks = project_open_tasks(project_open_gates.as_ref()).await;
@@ -393,7 +394,8 @@ async fn begin_portable_project_open(
                 &handshake,
                 ProductionProjectCompositionRuntime::Portable {
                     startup_catch_up: true,
-                },
+                }
+                .with_hook_recovery(hook_recovery),
                 &cancellation,
                 #[cfg(test)]
                 project_open_attempts.as_ref(),
@@ -421,6 +423,34 @@ pub(super) async fn schedule_portable_project_server_warmup(
     initialize_request: Option<JsonRpcRequest>,
     #[cfg(test)] project_open_attempts: Option<Arc<AtomicUsize>>,
 ) -> Result<()> {
+    schedule_portable_project_server_warmup_with_hook_recovery(
+        lifecycle,
+        store_administration,
+        project_open_gates,
+        invocation,
+        http_application_registry,
+        handshake,
+        initialize_request,
+        None,
+        #[cfg(test)]
+        project_open_attempts,
+    )
+    .await
+}
+
+#[cfg(any(not(unix), test))]
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn schedule_portable_project_server_warmup_with_hook_recovery(
+    lifecycle: DaemonLifecycle,
+    store_administration: StoreAdministration,
+    project_open_gates: Arc<tokio::sync::Mutex<ProjectOpenGates>>,
+    invocation: DaemonInvocationState,
+    http_application_registry: http_application::DaemonHttpApplicationRegistry,
+    handshake: DaemonHandshake,
+    initialize_request: Option<JsonRpcRequest>,
+    hook_recovery: Option<Arc<Vec<tracedecay_hooks::HookConfigurationSnapshotV1>>>,
+    #[cfg(test)] project_open_attempts: Option<Arc<AtomicUsize>>,
+) -> Result<()> {
     let (canonical_project_path, route) =
         project_route_for_handshake(&handshake, store_administration.owner_home()?)?;
     if portable_cached_project_server(
@@ -444,6 +474,7 @@ pub(super) async fn schedule_portable_project_server_warmup(
         canonical_project_path,
         route,
         initialize_request,
+        hook_recovery,
         #[cfg(test)]
         project_open_attempts,
     ))
@@ -500,6 +531,7 @@ pub(super) async fn portable_project_server_for_request(
             handshake.clone(),
             canonical_project_path.clone(),
             route.clone(),
+            None,
             None,
             #[cfg(test)]
             project_open_attempts.clone(),

@@ -98,8 +98,8 @@ fn awaited_sizes() -> Vec<(&'static str, usize)> {
             future_size(ensure_registered_project_route),
         ),
         (
-            "open_project_for_handshake",
-            future_size(open_project_for_handshake),
+            "open_project_for_handshake_with_hook_recovery",
+            future_size(open_project_for_handshake_with_hook_recovery),
         ),
         (
             "TraceDecay::register_project_store_in_global_registry",

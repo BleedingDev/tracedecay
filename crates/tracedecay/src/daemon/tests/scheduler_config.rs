@@ -190,11 +190,12 @@ async fn daemon_scheduler_discovery_without_work_does_not_wait_for_writer_gate()
         "scheduler-discovery-writer-gate-test",
     );
     let cg = Arc::new(
-        super::super::open_project_for_handshake(
+        super::super::open_project_for_handshake_with_hook_recovery(
             &project,
             &handshake,
             &engine.store_administration,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect("open scheduler discovery fixture through daemon authority"),

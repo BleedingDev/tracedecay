@@ -41,6 +41,7 @@ fn admit_until(
                 if remaining.is_zero() {
                     return Err(LockAdmissionError::TimedOut);
                 }
+                let _wait = tracing::trace_span!("private_fs.lock.wait").entered();
                 std::thread::sleep(remaining.min(LOCK_POLL_INTERVAL));
                 if Instant::now() >= deadline {
                     return Err(LockAdmissionError::TimedOut);

@@ -587,3 +587,440 @@ async fn unchanged_codex_contract_failure_stays_blocked_without_reopening() {
         "the changed rollout must be opened again"
     );
 }
+
+struct PendingCodexFixture {
+    home: tempfile::TempDir,
+    project: PathBuf,
+    directory: PathBuf,
+    project_id: ProjectId,
+    scope: ObservationScopeV1,
+    admission: MemoryHostAdmission,
+    cancellation: ObservationCancellation,
+}
+
+impl PendingCodexFixture {
+    fn new() -> Self {
+        install_test_shared_jsonl_preparation_authority();
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join("project");
+        let directory = home.path().join(".codex/sessions/2026/10/14");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        let project_id = ProjectId::new("pending-codex-fixture").unwrap();
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            &project,
+            project_id.as_str(),
+        )
+        .unwrap();
+        let scope = ObservationScopeV1::Project {
+            project_id: project_id.clone(),
+        };
+        Self {
+            home,
+            project,
+            directory,
+            project_id,
+            scope,
+            admission: MemoryHostAdmission::default(),
+            cancellation: ObservationCancellation::default(),
+        }
+    }
+
+    fn hub(&self) -> codex::CodexDiscoveryHub {
+        let hub = codex::CodexDiscoveryHub::default();
+        hub.register("fixture", Some(self.home.path()));
+        hub
+    }
+
+    fn metadata(&self, session: &str) -> String {
+        serde_json::json!({
+            "timestamp": "2026-10-14T10:00:00Z", "type": "session_meta",
+            "payload": { "id": session, "cwd": self.project },
+        })
+        .to_string()
+    }
+
+    fn rollout(&self, session: &str) -> String {
+        format!(
+            "{}\n{}\n",
+            self.metadata(session),
+            serde_json::json!({
+                "timestamp": "2026-10-14T10:00:01Z", "type": "event_msg",
+                "payload": { "type": "user_message", "message": format!("fixture {session}") },
+            })
+        )
+    }
+
+    async fn project_run(
+        &self,
+        hub: &codex::CodexDiscoveryHub,
+    ) -> super::failure::ProviderRunOutcome {
+        with_transcript_source_profile(
+            ProfileRoot::under_home(self.home.path()),
+            ProjectProviderRun {
+                project_root: &self.project,
+                project_id: &self.project_id,
+                facade: &self.admission,
+                scope: &self.scope,
+                candidate: SessionProvider::Codex,
+                max_new_bytes: 1 << 20,
+                cancellation: &self.cancellation,
+                codex_discovery: Some((hub, "fixture")),
+            }
+            .run_codex(),
+        )
+        .await
+    }
+
+    async fn coverage(&self) -> Option<source::HostProviderCoverage> {
+        source::read_host_provider_coverage(&self.admission, &self.scope, "codex")
+            .await
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn pending_codex_sources_allow_valid_peers_beyond_the_discovery_page() {
+    let fixture = PendingCodexFixture::new();
+    let hub = fixture.hub();
+    for index in 0..19 {
+        std::fs::write(
+            fixture
+                .directory
+                .join(format!("rollout-{index:02}-empty.jsonl")),
+            "",
+        )
+        .unwrap();
+    }
+    let older = fixture.home.path().join(".codex/sessions/2026/10/13");
+    std::fs::create_dir_all(&older).unwrap();
+    let valid = older.join("rollout-ready.jsonl");
+    std::fs::write(&valid, fixture.rollout("ready-peer")).unwrap();
+    source::spin_until_jsonl_change_settled(&valid);
+    // Deliver a real bounded discovery page before driving the production loop.
+    // Empty structural pages are dispositioned without reading source bytes.
+    let native_source = codex::CodexSource::with_home(fixture.home.path());
+    for _ in 0..32 {
+        let delivery = hub
+            .discover(
+                "fixture",
+                &native_source,
+                source::TranscriptDiscoveryBounds::from_discovered_units(3),
+                codex::CodexDiscoveryFrontier::initial(),
+            )
+            .await
+            .unwrap();
+        let codex::CodexDiscoveryDelivery::Ready(pass) = delivery else {
+            panic!("no concurrent scanner");
+        };
+        if !pass.report.paths.is_empty() {
+            assert!(!pass.report.paths.contains(&valid));
+            break;
+        }
+        hub.acknowledge("fixture");
+    }
+    let first = fixture.project_run(&hub).await;
+    assert!(fixture.admission.observations().is_empty());
+    assert!(first.failures.iter().any(|failure| failure.reason_code
+        == "transcript_source_metadata_pending"
+        && failure.retryable));
+    for _ in 0..32 {
+        fixture.project_run(&hub).await;
+        if !fixture.admission.observations().is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        fixture.admission.observations().len(),
+        2,
+        "the valid peer must be admitted past pending sources"
+    );
+    assert_eq!(
+        fixture.coverage().await,
+        Some(source::HostProviderCoverage::Partial)
+    );
+    let before = fixture.admission.observations().len();
+    fixture.project_run(&hub).await;
+    assert_eq!(
+        fixture.admission.observations().len(),
+        before,
+        "replay must stay idempotent"
+    );
+    assert_eq!(
+        fixture.coverage().await,
+        Some(source::HostProviderCoverage::Partial)
+    );
+}
+
+#[tokio::test]
+async fn pending_codex_metadata_retries_after_append_and_survives_restart() {
+    let fixture = PendingCodexFixture::new();
+    let path = fixture.directory.join("rollout-partial.jsonl");
+    std::fs::write(&path, fixture.metadata("append-peer")).unwrap();
+    let settled = source::spin_until_jsonl_change_settled(&path);
+    let hub = fixture.hub();
+    let first = fixture.project_run(&hub).await;
+    assert!(
+        first
+            .failures
+            .iter()
+            .any(|failure| failure.reason_code == "transcript_source_metadata_pending")
+    );
+    assert!(
+        fixture.admission.observations().is_empty(),
+        "an unterminated valid JSON object is not durable metadata"
+    );
+    let reads = session_meta_read_count_for_test(&path);
+    fixture.project_run(&hub).await;
+    if settled {
+        assert_eq!(session_meta_read_count_for_test(&path), reads);
+    }
+    let restarted = fixture.hub();
+    fixture.project_run(&restarted).await;
+    assert_eq!(
+        fixture.coverage().await,
+        Some(source::HostProviderCoverage::Partial)
+    );
+    assert!(
+        session_meta_read_count_for_test(&path) > reads,
+        "restart must rediscover pending metadata"
+    );
+    std::fs::write(&path, fixture.rollout("append-peer")).unwrap();
+    source::spin_until_jsonl_change_settled(&path);
+    for _ in 0..32 {
+        fixture.project_run(&restarted).await;
+        if fixture.coverage().await == Some(source::HostProviderCoverage::Complete) {
+            break;
+        }
+    }
+    assert_eq!(fixture.admission.observations().len(), 2);
+    assert_eq!(
+        fixture.coverage().await,
+        Some(source::HostProviderCoverage::Complete)
+    );
+    fixture.project_run(&restarted).await;
+    assert_eq!(fixture.admission.observations().len(), 2);
+}
+
+#[tokio::test]
+async fn pending_codex_metadata_becomes_invalid_and_disappearance_releases_coverage() {
+    let fixture = PendingCodexFixture::new();
+    let path = fixture.directory.join("rollout-empty.jsonl");
+    std::fs::write(&path, "").unwrap();
+    source::spin_until_jsonl_change_settled(&path);
+    let hub = fixture.hub();
+    fixture.project_run(&hub).await;
+    std::fs::write(&path, "{}\n").unwrap();
+    source::spin_until_jsonl_change_settled(&path);
+    let invalid = fixture.project_run(&hub).await;
+    assert!(invalid.failures.iter().any(|failure| failure.reason_code
+        == "transcript_source_contract_invalid"
+        && !failure.retryable));
+    assert!(
+        !invalid
+            .failures
+            .iter()
+            .any(|failure| failure.reason_code == "transcript_source_metadata_pending")
+    );
+    assert_eq!(
+        fixture.coverage().await,
+        Some(source::HostProviderCoverage::Partial)
+    );
+    std::fs::remove_file(&path).unwrap();
+    for _ in 0..32 {
+        fixture.project_run(&hub).await;
+        if fixture.coverage().await == Some(source::HostProviderCoverage::Complete) {
+            break;
+        }
+    }
+    assert!(hub.retained_source_failures("fixture").is_empty());
+    assert_eq!(
+        fixture.coverage().await,
+        Some(source::HostProviderCoverage::Complete)
+    );
+}
+
+#[tokio::test]
+async fn profile_codex_pending_metadata_dispositions_are_committable_but_partial() {
+    let fixture = PendingCodexFixture::new();
+    let path = fixture.directory.join("rollout-empty.jsonl");
+    std::fs::write(&path, "").unwrap();
+    source::spin_until_jsonl_change_settled(&path);
+    let hub = fixture.hub();
+    let result = with_transcript_source_profile(
+        ProfileRoot::under_home(fixture.home.path()),
+        super::user::try_ingest_user_codex_sessions_rotated(
+            fixture.home.path(),
+            None,
+            Vec::new(),
+            &fixture.admission,
+            Some(1 << 20),
+            &fixture.cancellation,
+            codex::CodexDiscoveryFrontier::initial(),
+            Some((&hub, "fixture")),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(
+        result.committable_frontier.is_some(),
+        "pending metadata has a known source-local disposition"
+    );
+    assert!(result.outcome.deferred_by_byte_cap);
+    assert!(
+        result
+            .failures
+            .iter()
+            .any(|failure| failure.reason_code == "transcript_source_metadata_pending")
+    );
+    assert!(fixture.admission.observations().is_empty());
+}
+
+#[tokio::test]
+async fn uncertain_codex_coverage_write_keeps_the_discovery_page_unacknowledged() {
+    use crate::admission::{HostAdmissionOutcome, HostAdmissionStatus};
+    let fixture = PendingCodexFixture::new();
+    let path = fixture.directory.join("rollout-empty.jsonl");
+    std::fs::write(&path, "").unwrap();
+    source::spin_until_jsonl_change_settled(&path);
+    let hub = fixture.hub();
+    fixture.admission.fail_next_parse_offset_write(
+        HostAdmissionOutcome {
+            status: HostAdmissionStatus::Unknown,
+            retryable: true,
+            reason_code: Some("parse_offset_write_unknown"),
+            recovery: None,
+            cause: None,
+        },
+        true,
+    );
+    let first = fixture.project_run(&hub).await;
+    assert!(
+        first.failures.iter().any(
+            |failure| failure.reason_code == "parse_offset_write_unknown" && failure.retryable
+        )
+    );
+    let frontier = source::read_codex_history_frontier(&fixture.admission, &fixture.scope)
+        .await
+        .unwrap();
+    assert_eq!(frontier, codex::CodexDiscoveryFrontier::initial());
+    assert_eq!(
+        fixture.coverage().await,
+        Some(source::HostProviderCoverage::Partial)
+    );
+    let next = hub
+        .discover(
+            "fixture",
+            &codex::CodexSource::with_home(fixture.home.path()),
+            source::TranscriptDiscoveryBounds::default_walk(),
+            frontier,
+        )
+        .await
+        .unwrap();
+    let codex::CodexDiscoveryDelivery::Ready(page) = next else {
+        panic!("retained page must be ready");
+    };
+    assert!(
+        page.report.paths.contains(&path),
+        "uncertain coverage persistence must replay the source disposition page"
+    );
+    std::fs::remove_file(&path).unwrap();
+    let retry = fixture.project_run(&hub).await;
+    assert!(
+        !retry
+            .failures
+            .iter()
+            .any(|failure| failure.reason_code == "parse_offset_write_unknown")
+    );
+    assert_eq!(
+        fixture.coverage().await,
+        Some(source::HostProviderCoverage::Complete)
+    );
+}
+
+#[tokio::test]
+async fn nonempty_codex_failure_work_is_bounded_and_valid_peers_eventually_progress() {
+    let fixture = PendingCodexFixture::new();
+    let failures = (0..19)
+        .map(|index| {
+            let path = fixture
+                .directory
+                .join(format!("rollout-{index:02}-unready.jsonl"));
+            let contents = if index % 2 == 0 {
+                "{}\n".to_owned()
+            } else {
+                fixture.metadata(&format!("partial-{index}"))
+            };
+            std::fs::write(&path, contents).unwrap();
+            path
+        })
+        .collect::<Vec<_>>();
+    let older = fixture.home.path().join(".codex/sessions/2026/10/13");
+    std::fs::create_dir_all(&older).unwrap();
+    let valid = older.join("rollout-valid.jsonl");
+    std::fs::write(&valid, fixture.rollout("valid-after-failures")).unwrap();
+    let settled = source::spin_until_jsonl_change_settled(&valid);
+    let hub = fixture.hub();
+    let before = failures
+        .iter()
+        .map(|path| session_meta_read_count_for_test(path))
+        .sum::<usize>();
+    fixture.project_run(&hub).await;
+    let after = failures
+        .iter()
+        .map(|path| session_meta_read_count_for_test(path))
+        .sum::<usize>();
+    assert!(after > before);
+    assert!(
+        after - before <= super::failure::MAX_CODEX_SOURCE_FAILURES_PER_PASS,
+        "one tick must bound newly parsed nonempty failure work"
+    );
+    assert!(fixture.admission.observations().is_empty());
+    assert_eq!(
+        fixture.coverage().await,
+        Some(source::HostProviderCoverage::Partial)
+    );
+    // A fresh consumer reconstructs partial truth from the native corpus and
+    // then skips its own settled failure prefix on subsequent bounded ticks.
+    let restarted = fixture.hub();
+    for _ in 0..32 {
+        let before = failures
+            .iter()
+            .map(|path| session_meta_read_count_for_test(path))
+            .sum::<usize>();
+        fixture.project_run(&restarted).await;
+        let after = failures
+            .iter()
+            .map(|path| session_meta_read_count_for_test(path))
+            .sum::<usize>();
+        assert!(after - before <= super::failure::MAX_CODEX_SOURCE_FAILURES_PER_PASS);
+        if !fixture.admission.observations().is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        fixture.admission.observations().len(),
+        2,
+        "unchanged invalid and pending prefixes must not starve a later valid rollout"
+    );
+    assert_eq!(
+        fixture.coverage().await,
+        Some(source::HostProviderCoverage::Partial)
+    );
+    let before = failures
+        .iter()
+        .map(|path| session_meta_read_count_for_test(path))
+        .sum::<usize>();
+    fixture.project_run(&restarted).await;
+    assert_eq!(fixture.admission.observations().len(), 2);
+    if settled {
+        let after = failures
+            .iter()
+            .map(|path| session_meta_read_count_for_test(path))
+            .sum::<usize>();
+        assert_eq!(
+            after, before,
+            "settled failure replay must retain the immutable cache"
+        );
+    }
+}

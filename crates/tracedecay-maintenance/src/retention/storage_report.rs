@@ -1,39 +1,25 @@
-//! Read-only, cheap-to-query storage observability (plan 38 §7): per-store
-//! size and free-page ratio for every registered profile-sharded store under
-//! a profile root, plus an unregistered-directory backlog summary reachable
-//! from `tracedecay storage report` without a live daemon or any
-//! [`tracedecay_global_db::RegisteredGlobalDb`] writer authority.
+//! Read-only storage observability for registered profile stores, reachable
+//! from `tracedecay storage report` through the retained daemon authority or
+//! offline filesystem metadata. Filesystem metadata reports logical file bytes,
+//! not allocated filesystem bytes. Graph free-page fields apply only to the
+//! graph database; session database families have their own typed samples.
 //!
-//! # Why this does not snapshot stores in place
-//!
-//! The registry read does, because it is one small file and needs a
-//! consistent view of `code_projects`. The *per-store size sampling*
-//! deliberately does not. [`tracedecay_runtime_core::sqlite_read_snapshot`] freezes a database
-//! family by reflinking it, falling back to a **full byte copy** when the
-//! filesystem cannot reflink, and any graph database a live daemon has open
-//! is WAL-backed and therefore takes that path. Running this report over the
-//! profile it was written for would have copied every registered store to
-//! read three pragmas off it. The owner's profile was 91GB, on a command
-//! whose entire promise is being cheap enough to run on a full profile.
-//!
-//! So sizes come from filesystem metadata (exact, no locks, no I/O beyond
-//! `stat`) and free-page counts from a short read-only connection. The one
-//! registry snapshot uses an OS-temporary scratch directory, never a child of
-//! the profile it inspects. If a free-page connection fails because the store
-//! is busy, corrupt, or a WAL database with no `-shm` to map read-only, its
-//! fields are `None` rather than guessed at, and the store still reports its
-//! size.
+//! Reports never copy database families, migrate stores, hydrate transcripts,
+//! or reclaim disk space. Missing and unavailable telemetry stays explicit.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+use tracedecay_contracts::retrieval::{
+    SessionDatabaseFileSizeV1, SessionDatabasePagesV1, SessionDatabaseSizeV1,
+    StorageReportRegistryV1,
+};
+use tracedecay_contracts::{StorageByteSizeV1, StoreKeyV1, StoreSizeSampleV1, now_micros};
 
 use tracedecay_domain::errors::TraceDecayError;
 use tracedecay_domain::{
-    CodeGenerationId, CursorBindingMismatchV1, CursorBindingV1, decode_bound_cursor,
+    CodeGenerationId, CursorBindingMismatchV1, CursorBindingV1, ProjectId, decode_bound_cursor,
     encode_bound_cursor,
-};
-use tracedecay_runtime_core::sqlite_read_snapshot::{
-    BOUNDED_PROBE_BUSY_TIMEOUT, open_read_only_probe, pragma_u64,
 };
 
 use tracedecay_code_index_retention::code_index_generations::{
@@ -43,10 +29,12 @@ use tracedecay_code_index_retention::code_index_generations::{
 };
 use tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1;
 use tracedecay_runtime_core::storage::SESSIONS_DB_FILENAME;
+use tracedecay_store::{StoreRuntimeBindingV1, StoreShardScopeV1};
 
 use crate::store_maintenance::{CodeGenerationProtectionUnavailableV1, code_generation_protection};
 
 const GLOBAL_DB_FILENAME: &str = "global.db";
+const STORAGE_TELEMETRY_READER_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
 const USER_SESSIONS_DB_FILENAME: &str = "user-sessions.db";
 pub const MAX_STORAGE_REPORT_PAGE_LIMIT: usize = 64;
 const CODE_GENERATION_RETENTION_DIGEST_SCAN_MAX_BYTES: u64 = 32 * 1024 * 1024;
@@ -58,6 +46,45 @@ const GRAPH_REPLAY_POOL_DIRECTORY: &str = "tracedecay.graph-replay";
 /// retention dry run.
 pub const RETENTION_PROTECTION_UNRESOLVED: &str =
     "generation_retention_graph_inventory_unavailable";
+
+type SessionTelemetryHandles =
+    BTreeMap<PathBuf, Result<tracedecay_runtime_core::db::DatabaseStorageTelemetryHandle, String>>;
+
+fn session_telemetry_handles(
+    databases: &[&tracedecay_global_db::RegisteredGlobalDb],
+    requests: &[(PathBuf, StoreShardScopeV1)],
+    profile_binding: &StoreRuntimeBindingV1,
+) -> SessionTelemetryHandles {
+    let mut handles = SessionTelemetryHandles::new();
+    for (path, expected_scope) in requests {
+        match path.canonicalize() {
+            Ok(canonical) => {
+                if let Some(database) = databases
+                    .iter()
+                    .find(|database| database.db_path() == canonical)
+                {
+                    let binding = database.binding();
+                    let handle = if binding.shard_id.profile_id
+                        != profile_binding.shard_id.profile_id
+                        || &binding.shard_id.scope != expected_scope
+                    {
+                        Err("session_database_identity_mismatch".to_owned())
+                    } else {
+                        database
+                            .storage_telemetry_handle()
+                            .map_err(|error| error.to_string())
+                    };
+                    handles.insert(path.clone(), handle);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                handles.insert(path.clone(), Err(error.to_string()));
+            }
+        }
+    }
+    handles
+}
 
 /// The protection set a retention dry run plans against, or why it could not
 /// be resolved.
@@ -76,11 +103,14 @@ pub struct StoreSizeReportEntry {
     /// Entries under the store that could not be read or are neither regular
     /// files nor directories. Non-zero makes `total_bytes` a floor.
     pub unavailable_entry_count: usize,
-    /// Reclaimable free-page bytes of the graph database, or `None` when it
+    /// Reusable free-page bytes of the graph database only, or `None` when it
     /// could not be sampled without waiting on a live writer.
     pub free_bytes: Option<u64>,
-    /// Free pages as a fraction of total pages, or `None` when unsampled.
+    /// Graph free pages as a fraction of graph pages, or `None` when unsampled.
     pub free_page_ratio: Option<f64>,
+    /// Session main/WAL/SHM logical sizes and bounded page telemetry,
+    /// independent of the graph database's free-page fields.
+    pub sessions_database: SessionDatabaseSizeV1,
 }
 
 /// On-disk bytes of one project store, by family.
@@ -173,6 +203,10 @@ pub struct StorageReport {
     /// project store; omitted from older reports.
     #[serde(default)]
     pub user_sessions_db_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_sessions_database: Option<SessionDatabaseSizeV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<StorageReportRegistryV1>,
     /// A direct, read-only census of every regular file under the profile
     /// root. The daemon's bounded per-page response leaves this absent; the
     /// explicit `storage report` command attaches it after paging completes.
@@ -359,11 +393,11 @@ pub struct CodeGenerationRetentionAvailabilityEntry {
     pub reason: Option<String>,
 }
 
-/// Builds the report by reading `global.db`'s `code_projects` table and every
-/// registered project's graph database, then scanning `projects/` bottom-up
-/// for directories with no matching registry row. Read-only throughout.
+/// Sizes an offline profile without opening any SQLite family. Registry
+/// inventory and page telemetry are explicitly unavailable without retained
+/// runtime authority; the full logical filesystem census remains available.
 ///
-/// Filesystem sizing, `SQLite` family copy, and per-store probes run on the
+/// Filesystem sizing, registry reads, and per-store probes run on the
 /// blocking pool so this CLI path matches the daemon-paged sibling and does
 /// not stall the async runtime.
 #[tracing::instrument(name = "maintenance.storage_report.build", level = "trace", skip_all)]
@@ -371,7 +405,7 @@ pub async fn build_storage_report(
     profile_root: &Path,
 ) -> tracedecay_domain::errors::Result<StorageReport> {
     let global_db_path = profile_root.join(GLOBAL_DB_FILENAME);
-    // Capture the profile's physical footprint before opening any SQLite
+    // Capture the profile's logical footprint before opening any SQLite
     // readers. A report must describe the profile supplied by its caller, not
     // implementation-dependent SQLite sidecar churn caused while collecting
     // the remaining diagnostic fields.
@@ -380,144 +414,39 @@ pub async fn build_storage_report(
         tokio::task::spawn_blocking(move || scan_full_profile_size(&full_profile_root))
             .await
             .map_err(|error| report_error("join full profile size scan", error))?;
-    let registered_projects = if global_db_path.exists() {
-        load_registered_project_rows(profile_root, &global_db_path).await?
-    } else {
-        Vec::new()
+    let registry = match std::fs::symlink_metadata(&global_db_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            StorageReportRegistryV1::Missing
+        }
+        Err(error) => StorageReportRegistryV1::Unavailable {
+            reason: error.to_string(),
+        },
+        Ok(_) => StorageReportRegistryV1::Unavailable {
+            reason: "registered_database_authority_unavailable".to_owned(),
+        },
     };
-    let profile_root_buf = profile_root.to_path_buf();
-    let sampled = tokio::task::spawn_blocking(move || {
-        sample_registered_storage(&profile_root_buf, &global_db_path, registered_projects)
-    })
-    .await
-    .map_err(|error| report_error("join storage report sample", error))??;
-
+    let sample_root = profile_root.to_path_buf();
+    let (global_db_bytes, user_sessions_db_bytes, user_sessions_database) =
+        tokio::task::spawn_blocking(move || {
+            (
+                database_family_bytes(&global_db_path),
+                user_sessions_family_bytes(&sample_root),
+                sample_session_database(
+                    &sample_root.join(USER_SESSIONS_DB_FILENAME),
+                    USER_SESSIONS_DB_FILENAME,
+                ),
+            )
+        })
+        .await
+        .map_err(|error| report_error("join offline file size sample", error))?;
     Ok(StorageReport {
         profile_root: profile_root.display().to_string(),
-        stores: sampled.stores,
-        code_generation_retention: sampled.code_generation_retention,
-        code_generation_retention_availability: sampled.code_generation_retention_availability,
-        unregistered_dir_count: sampled.unregistered_dir_count,
-        unregistered_bytes: sampled.unregistered_bytes,
-        global_db_bytes: sampled.global_db_bytes,
-        user_sessions_db_bytes: sampled.user_sessions_db_bytes,
+        global_db_bytes,
+        user_sessions_db_bytes,
+        user_sessions_database: Some(user_sessions_database),
+        registry: Some(registry),
         full_profile_size: Some(full_profile_size),
-        coverage: StorageReportCoverage::default(),
-    })
-}
-
-struct SampledRegisteredStorage {
-    stores: Vec<StoreSizeReportEntry>,
-    code_generation_retention: Vec<CodeGenerationRetentionDryRunEntry>,
-    code_generation_retention_availability: Vec<CodeGenerationRetentionAvailabilityEntry>,
-    unregistered_dir_count: usize,
-    unregistered_bytes: u64,
-    global_db_bytes: u64,
-    user_sessions_db_bytes: u64,
-}
-
-/// Copies `global.db` off-profile on the blocking pool, then lists registered
-/// project rows over the async snapshot reader.
-async fn load_registered_project_rows(
-    profile_root: &Path,
-    global_db_path: &Path,
-) -> tracedecay_domain::errors::Result<Vec<(String, String)>> {
-    let profile_root = profile_root.to_path_buf();
-    let global_db_path = global_db_path.to_path_buf();
-    let (scratch, snapshot_source) = tokio::task::spawn_blocking(move || {
-        let scratch = tempfile::tempdir()
-            .map_err(|error| report_error("create external read-snapshot scratch", error))?;
-        validate_external_scratch(&profile_root, scratch.path())
-            .map_err(|error| report_error("validate read-snapshot scratch placement", error))?;
-        // The live family stays untouched: a read-only SQLite open against a
-        // WAL database can still materialize a missing SHM sidecar, and any
-        // snapshot lock or scratch must stay outside the profile being
-        // reported. The copy is a private throwaway, not a managed TraceDecay
-        // database, so Foreign/read-only snapshot policy is the truthful
-        // authority: Owned would demand managed-daemon or exclusive-maintenance
-        // on a path that can never hold either.
-        let snapshot_source = scratch.path().join(GLOBAL_DB_FILENAME);
-        copy_sqlite_family(&global_db_path, &snapshot_source)
-            .map_err(|error| report_error("copy global.db family for read-only report", error))?;
-        Ok::<_, tracedecay_domain::errors::TraceDecayError>((scratch, snapshot_source))
-    })
-    .await
-    .map_err(|error| report_error("join global.db family copy", error))??;
-    // This clone has no live writer holding its copied SHM. Normalize only
-    // the owned scratch family before snapshot validation: a SQLite reader
-    // would otherwise rebuild that transient SHM and invalidate its own read.
-    tracedecay_runtime_core::sqlite_read_snapshot::materialize(
-        &snapshot_source,
-        tracedecay_runtime_core::sqlite_read_snapshot::SnapshotReadControl::unlimited(),
-    )
-    .await
-    .map_err(|error| report_error("materialize private global.db family", error))?;
-    let snapshot = tracedecay_runtime_core::sqlite_read_snapshot::open_foreign_in(
-        &snapshot_source,
-        scratch.path(),
-        tracedecay_runtime_core::sqlite_read_snapshot::SnapshotReadControl::unlimited(),
-    )
-    .await
-    .map_err(|error| report_error("open global.db read snapshot", error))?;
-    let connection = snapshot.connection();
-    let mut rows = connection
-        .query(
-            "SELECT project_id, canonical_root FROM code_projects ORDER BY project_id",
-            (),
-        )
-        .await
-        .map_err(|error| report_error("list registered projects", error))?;
-    let mut projects = Vec::new();
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|error| report_error("read registered project row", error))?
-    {
-        let project_id: String = row
-            .get::<String>(0)
-            .map_err(|error| report_error("decode project id", error))?;
-        let canonical_root: String = row
-            .get::<String>(1)
-            .map_err(|error| report_error("decode canonical root", error))?;
-        projects.push((project_id, canonical_root));
-    }
-    Ok(projects)
-}
-
-fn sample_registered_storage(
-    profile_root: &Path,
-    global_db_path: &Path,
-    registered_projects: Vec<(String, String)>,
-) -> tracedecay_domain::errors::Result<SampledRegisteredStorage> {
-    let mut registered_ids = HashSet::new();
-    let mut stores = Vec::new();
-    let mut code_generation_retention = Vec::new();
-    let mut code_generation_retention_availability = Vec::new();
-    for (project_id, canonical_root) in registered_projects {
-        registered_ids.insert(project_id.clone());
-        // Offline reports have no mounted scheduler identity authority, so
-        // the retention protection set is unavailable rather than inferred
-        // from a path.
-        append_project_report(
-            profile_root,
-            &project_id,
-            &canonical_root,
-            Err(RETENTION_PROTECTION_UNRESOLVED),
-            &mut stores,
-            &mut code_generation_retention,
-            &mut code_generation_retention_availability,
-        )?;
-    }
-    let (unregistered_dir_count, unregistered_bytes) =
-        scan_unregistered_dirs(profile_root, &registered_ids);
-    Ok(SampledRegisteredStorage {
-        stores,
-        code_generation_retention,
-        code_generation_retention_availability,
-        unregistered_dir_count,
-        unregistered_bytes,
-        global_db_bytes: database_family_bytes(global_db_path),
-        user_sessions_db_bytes: user_sessions_family_bytes(profile_root),
+        ..StorageReport::default()
     })
 }
 
@@ -568,10 +497,33 @@ pub async fn build_storage_report_page_from_registered_global_db(
     code_index_schedulers: Option<&CodeIndexSchedulerRegistryV1>,
     cursor: Option<&str>,
     limit: usize,
+    session_databases: &[&tracedecay_global_db::RegisteredGlobalDb],
 ) -> tracedecay_domain::errors::Result<StorageReport> {
     let limit = limit.clamp(1, MAX_STORAGE_REPORT_PAGE_LIMIT);
     let global_db_bytes = database_family_bytes(&profile_root.join(GLOBAL_DB_FILENAME));
     let user_sessions_db_bytes = user_sessions_family_bytes(profile_root);
+    let user_sessions_database = if cursor.is_none() {
+        let database_path = profile_root.join(USER_SESSIONS_DB_FILENAME);
+        let handle = session_telemetry_handles(
+            session_databases,
+            &[(database_path.clone(), StoreShardScopeV1::ProfileSessions)],
+            global_db.binding(),
+        )
+        .remove(&database_path);
+        Some(
+            tokio::task::spawn_blocking(move || {
+                sample_session_database_with_handle(
+                    &database_path,
+                    USER_SESSIONS_DB_FILENAME,
+                    handle.as_ref(),
+                )
+            })
+            .await
+            .map_err(|error| report_error("join user session size probe", error))?,
+        )
+    } else {
+        None
+    };
     let binding = storage_report_binding(limit)?;
     let position = match cursor {
         Some(cursor) => decode_bound_cursor::<StorageReportPosition>(&binding, cursor)
@@ -592,6 +544,8 @@ pub async fn build_storage_report_page_from_registered_global_db(
                 limit,
                 global_db_bytes,
                 user_sessions_db_bytes,
+                user_sessions_database,
+                session_databases,
             )
             .await;
         }
@@ -641,6 +595,8 @@ pub async fn build_storage_report_page_from_registered_global_db(
         unregistered_bytes,
         global_db_bytes,
         user_sessions_db_bytes,
+        user_sessions_database,
+        registry: Some(StorageReportRegistryV1::Available),
         coverage: next_cursor.map_or_else(
             StorageReportCoverage::default,
             StorageReportCoverage::partial,
@@ -658,12 +614,30 @@ async fn project_storage_report_page(
     limit: usize,
     global_db_bytes: u64,
     user_sessions_db_bytes: u64,
+    user_sessions_database: Option<SessionDatabaseSizeV1>,
+    session_databases: &[&tracedecay_global_db::RegisteredGlobalDb],
 ) -> tracedecay_domain::errors::Result<StorageReport> {
     let mut projects = global_db
         .list_code_projects_after(after_project_id, limit.saturating_add(1))
         .await?;
     let has_more = projects.len() > limit;
     projects.truncate(limit);
+    let requests = projects
+        .iter()
+        .map(|project| {
+            let project_id = ProjectId::new(project.project_id.clone())
+                .map_err(|error| report_error("validate storage report project identity", error))?;
+            Ok((
+                profile_root
+                    .join("projects")
+                    .join(&project.project_id)
+                    .join(SESSIONS_DB_FILENAME),
+                StoreShardScopeV1::ProjectSessions { project_id },
+            ))
+        })
+        .collect::<tracedecay_domain::errors::Result<Vec<_>>>()?;
+    let session_handles =
+        session_telemetry_handles(session_databases, &requests, global_db.binding());
     let next_position = if has_more {
         let Some(last_project) = projects.last() else {
             return Err(tracedecay_domain::errors::TraceDecayError::Config {
@@ -694,6 +668,8 @@ async fn project_storage_report_page(
             profile_root: profile_root.display().to_string(),
             global_db_bytes,
             user_sessions_db_bytes,
+            user_sessions_database,
+            registry: Some(StorageReportRegistryV1::Available),
             coverage: StorageReportCoverage::partial(next_cursor),
             ..StorageReport::default()
         };
@@ -706,6 +682,7 @@ async fn project_storage_report_page(
                 &mut report.stores,
                 &mut report.code_generation_retention,
                 &mut report.code_generation_retention_availability,
+                &session_handles,
             )?;
         }
         Ok(report)
@@ -787,14 +764,57 @@ pub async fn build_project_storage_report_from_daemon(
     canonical_root: &Path,
     global_db: &tracedecay_global_db::RegisteredGlobalDb,
     code_index_schedulers: Option<&CodeIndexSchedulerRegistryV1>,
+    session_databases: &[&tracedecay_global_db::RegisteredGlobalDb],
 ) -> tracedecay_domain::errors::Result<StorageReport> {
+    let Some(registered) = global_db.get_code_project(project_id).await? else {
+        return Err(TraceDecayError::project_route(
+            "project_not_registered",
+            false,
+            "storage report project is not registered",
+        ));
+    };
+    let canonical_root = canonical_root
+        .canonicalize()
+        .map_err(|error| report_error("resolve storage report project root", error))?;
+    if Path::new(&registered.canonical_root) != canonical_root {
+        return Err(TraceDecayError::project_route(
+            "project_identity_mismatch",
+            false,
+            "storage report project root does not match its registered identity",
+        ));
+    }
+    let project_scope_id = ProjectId::new(project_id)
+        .map_err(|error| report_error("validate storage report project identity", error))?;
+    let requests = [
+        (
+            profile_root.join(USER_SESSIONS_DB_FILENAME),
+            StoreShardScopeV1::ProfileSessions,
+        ),
+        (
+            profile_root
+                .join("projects")
+                .join(project_id)
+                .join(SESSIONS_DB_FILENAME),
+            StoreShardScopeV1::ProjectSessions {
+                project_id: project_scope_id,
+            },
+        ),
+    ];
+    let session_handles =
+        session_telemetry_handles(session_databases, &requests, global_db.binding());
     let protection =
-        resolve_retention_protection(code_index_schedulers, global_db, canonical_root).await;
+        resolve_retention_protection(code_index_schedulers, global_db, &canonical_root).await;
     let profile_root = profile_root.to_path_buf();
     let project_id = project_id.to_owned();
-    let canonical_root = canonical_root.to_path_buf();
+    let canonical_root = canonical_root.clone();
     tokio::task::spawn_blocking(move || {
-        build_project_storage_report(&profile_root, &project_id, &canonical_root, protection)
+        build_project_storage_report_with_handles(
+            &profile_root,
+            &project_id,
+            &canonical_root,
+            protection,
+            &session_handles,
+        )
     })
     .await
     .map_err(|error| report_error("join daemon-backed project storage report", error))?
@@ -829,6 +849,22 @@ pub fn build_project_storage_report(
     canonical_root: &Path,
     vector_readable_sources: Result<BTreeSet<CodeGenerationId>, &'static str>,
 ) -> tracedecay_domain::errors::Result<StorageReport> {
+    build_project_storage_report_with_handles(
+        profile_root,
+        project_id,
+        canonical_root,
+        vector_readable_sources,
+        &SessionTelemetryHandles::new(),
+    )
+}
+
+fn build_project_storage_report_with_handles(
+    profile_root: &Path,
+    project_id: &str,
+    canonical_root: &Path,
+    vector_readable_sources: RetentionProtection,
+    session_handles: &SessionTelemetryHandles,
+) -> tracedecay_domain::errors::Result<StorageReport> {
     tracedecay_runtime_core::storage::validate_project_id(project_id).map_err(|message| {
         tracedecay_domain::errors::TraceDecayError::Config {
             message: message.to_owned(),
@@ -845,6 +881,7 @@ pub fn build_project_storage_report(
         &mut stores,
         &mut code_generation_retention,
         &mut code_generation_retention_availability,
+        session_handles,
     )?;
     let global_db_path = profile_root.join(GLOBAL_DB_FILENAME);
     Ok(StorageReport {
@@ -856,7 +893,13 @@ pub fn build_project_storage_report(
         unregistered_bytes: 0,
         global_db_bytes: database_family_bytes(&global_db_path),
         user_sessions_db_bytes: user_sessions_family_bytes(profile_root),
+        user_sessions_database: Some(sample_session_database_with_handle(
+            &profile_root.join(USER_SESSIONS_DB_FILENAME),
+            USER_SESSIONS_DB_FILENAME,
+            session_handles.get(&profile_root.join(USER_SESSIONS_DB_FILENAME)),
+        )),
         full_profile_size: None,
+        registry: None,
         coverage: StorageReportCoverage::default(),
     })
 }
@@ -869,20 +912,18 @@ fn append_project_report(
     stores: &mut Vec<StoreSizeReportEntry>,
     code_generation_retention: &mut Vec<CodeGenerationRetentionDryRunEntry>,
     code_generation_retention_availability: &mut Vec<CodeGenerationRetentionAvailabilityEntry>,
+    session_handles: &SessionTelemetryHandles,
 ) -> tracedecay_domain::errors::Result<()> {
     let data_root = profile_root.join("projects").join(project_id);
-    if data_root.is_dir() {
+    {
         let mut kinds = StoreKindBytesV1::default();
         let unavailable_entry_count = walk_regular_files(&data_root, &mut |path, bytes| {
             if let Ok(relative) = path.strip_prefix(&data_root) {
                 kinds.add(relative, bytes);
             }
         });
-        let (free_bytes, free_page_ratio) =
-            sample_free_pages(&data_root.join(tracedecay_runtime_core::config::DB_FILENAME))
-                .map_or((None, None), |(free_bytes, ratio)| {
-                    (Some(free_bytes), Some(ratio))
-                });
+        // Session runtime authority cannot authorize graph telemetry.
+        let (free_bytes, free_page_ratio) = (None, None);
         stores.push(StoreSizeReportEntry {
             project_id: project_id.to_owned(),
             canonical_root: canonical_root.to_owned(),
@@ -891,6 +932,11 @@ fn append_project_report(
             unavailable_entry_count,
             free_bytes,
             free_page_ratio,
+            sessions_database: sample_session_database_with_handle(
+                &data_root.join(SESSIONS_DB_FILENAME),
+                &format!("projects/{project_id}/{SESSIONS_DB_FILENAME}"),
+                session_handles.get(&data_root.join(SESSIONS_DB_FILENAME)),
+            ),
         });
     }
     let code_index_store_root =
@@ -1032,38 +1078,13 @@ fn user_sessions_family_bytes(profile_root: &Path) -> u64 {
 fn database_family_bytes(database_path: &Path) -> u64 {
     let mut total_bytes = 0u64;
     for suffix in ["", "-wal", "-shm"] {
-        if let Ok(metadata) = std::fs::metadata(sqlite_family_member(database_path, suffix)) {
+        if let Ok(metadata) = std::fs::symlink_metadata(sqlite_family_member(database_path, suffix))
+            && metadata.is_file()
+        {
             total_bytes = total_bytes.saturating_add(metadata.len());
         }
     }
     total_bytes
-}
-
-/// Copies a `SQLite` main/WAL/SHM family without opening the source path. The
-/// caller opens only `destination`, which prevents reporting from creating
-/// sidecars under the profile it is inspecting.
-fn copy_sqlite_family(source: &Path, destination: &Path) -> std::io::Result<()> {
-    let generation =
-        tracedecay_runtime_core::sqlite_read_snapshot::SourceGeneration::capture(source)?;
-    for suffix in ["", "-wal", "-shm"] {
-        let source_member = sqlite_family_member(source, suffix);
-        if !source_member.is_file() {
-            continue;
-        }
-        std::fs::copy(&source_member, sqlite_family_member(destination, suffix))?;
-    }
-    generation.validate()
-}
-
-fn validate_external_scratch(profile_root: &Path, scratch_root: &Path) -> std::io::Result<()> {
-    let profile = profile_root.canonicalize()?;
-    let scratch = scratch_root.canonicalize()?;
-    if scratch.starts_with(profile) {
-        return Err(std::io::Error::other(
-            "read-snapshot scratch must be outside the inspected profile",
-        ));
-    }
-    Ok(())
 }
 
 fn sqlite_family_member(database_path: &Path, suffix: &str) -> PathBuf {
@@ -1076,52 +1097,91 @@ fn sqlite_family_member(database_path: &Path, suffix: &str) -> PathBuf {
     }
 }
 
-/// Reads the free-page pragmas over the shared bounded read-only probe.
-/// Returns `None` on any failure, a store held by a busy writer, a corrupt
-/// file, or a WAL database whose `-shm` cannot be mapped read-only. A report
-/// must degrade, never block and never repair.
-fn sample_free_pages(graph_db_path: &Path) -> Option<(u64, f64)> {
-    let connection = open_read_only_probe(graph_db_path, BOUNDED_PROBE_BUSY_TIMEOUT).ok()?;
-    let page_size = pragma_u64(&connection, "page_size")?;
-    let page_count = pragma_u64(&connection, "page_count")?;
-    let freelist = pragma_u64(&connection, "freelist_count")?;
-    if page_size == 0 || page_count == 0 {
-        return None;
+fn session_file_size(path: &Path) -> SessionDatabaseFileSizeV1 {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => SessionDatabaseFileSizeV1::Observed {
+            logical_bytes: StorageByteSizeV1(metadata.len()),
+        },
+        Ok(_) => SessionDatabaseFileSizeV1::Unavailable {
+            reason: "not_regular_file".to_owned(),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            SessionDatabaseFileSizeV1::Missing
+        }
+        Err(error) => SessionDatabaseFileSizeV1::Unavailable {
+            reason: error.to_string(),
+        },
     }
-    let free_bytes = page_size.saturating_mul(freelist);
-    #[allow(clippy::cast_precision_loss)]
-    let free_page_ratio = freelist as f64 / page_count as f64;
-    Some((free_bytes, free_page_ratio))
 }
 
-fn scan_unregistered_dirs(profile_root: &Path, registered_ids: &HashSet<String>) -> (usize, u64) {
-    let projects_dir = profile_root.join("projects");
-    let Ok(entries) = std::fs::read_dir(&projects_dir) else {
-        return (0, 0);
+fn sample_session_database(path: &Path, store_key: &str) -> SessionDatabaseSizeV1 {
+    sample_session_database_with_handle(path, store_key, None)
+}
+
+#[tracing::instrument(
+    name = "maintenance.storage_report.session_size",
+    level = "trace",
+    skip_all
+)]
+fn sample_session_database_with_handle(
+    path: &Path,
+    store_key: &str,
+    handle: Option<&Result<tracedecay_runtime_core::db::DatabaseStorageTelemetryHandle, String>>,
+) -> SessionDatabaseSizeV1 {
+    // Capture sizes before attempting SQLite access. Failures preserve these
+    // independent measurements and never become an observed zero page count.
+    let main = session_file_size(path);
+    let wal = session_file_size(&sqlite_family_member(path, "-wal"));
+    let shm = session_file_size(&sqlite_family_member(path, "-shm"));
+    let pages = match &main {
+        SessionDatabaseFileSizeV1::Missing => SessionDatabasePagesV1::Missing,
+        SessionDatabaseFileSizeV1::Unavailable { reason } => SessionDatabasePagesV1::Unavailable {
+            reason: reason.clone(),
+        },
+        SessionDatabaseFileSizeV1::Observed { .. } => {
+            let sample = match handle {
+                Some(Err(reason)) => Err(reason.clone()),
+                Some(Ok(handle)) => read_session_page_sample(store_key, Some(handle)),
+                None => read_session_page_sample(store_key, None),
+            };
+            match sample {
+                Ok(sample) => SessionDatabasePagesV1::Observed {
+                    reusable_bytes: sample.free_bytes(),
+                    sample,
+                },
+                Err(reason) => SessionDatabasePagesV1::Unavailable { reason },
+            }
+        }
     };
-    let mut count = 0usize;
-    let mut bytes = 0u64;
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-        let Ok(name) = entry.file_name().into_string() else {
-            continue;
-        };
-        if tracedecay_runtime_core::storage::validate_project_id(&name).is_err()
-            || registered_ids.contains(&name)
-        {
-            continue;
-        }
-        count += 1;
-        // Shares the orphan sweep's walker so the bytes this report shows for
-        // a backlog directory are the same bytes that sweep would reclaim.
-        bytes = bytes.saturating_add(super::orphan_stores::dir_size_bytes(&entry.path()));
+    SessionDatabaseSizeV1 {
+        main,
+        wal,
+        shm,
+        pages,
     }
-    (count, bytes)
+}
+
+fn read_session_page_sample(
+    store_key: &str,
+    handle: Option<&tracedecay_runtime_core::db::DatabaseStorageTelemetryHandle>,
+) -> Result<StoreSizeSampleV1, String> {
+    let Some(handle) = handle else {
+        return Err("registered_database_authority_unavailable".to_owned());
+    };
+    let size = handle
+        .store_size_telemetry(STORAGE_TELEMETRY_READER_WAIT, || None)
+        .map_err(|error| format!("session_page_telemetry_unavailable: {error:?}"))?;
+    let (page_size_bytes, page_count, freelist_pages) =
+        (size.page_size_bytes, size.page_count, size.freelist_pages);
+    let sample = StoreSizeSampleV1 {
+        store: StoreKeyV1::new(store_key).map_err(|error| error.to_string())?,
+        page_size_bytes,
+        page_count,
+        freelist_pages,
+        observed_at: now_micros(),
+    };
+    sample.validate().map_err(|error| error.to_string())?;
+    Ok(sample)
 }
 
 /// Visit every regular file under `root` with its byte length, without
@@ -1205,10 +1265,10 @@ fn report_error(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::fmt::Write;
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use tracedecay_runtime_core::db::engine::TestConnection;
 
     fn store(project_id: &str, total_bytes: u64) -> StoreSizeReportEntry {
         StoreSizeReportEntry {
@@ -1219,6 +1279,12 @@ mod tests {
             unavailable_entry_count: 0,
             free_bytes: None,
             free_page_ratio: None,
+            sessions_database: SessionDatabaseSizeV1 {
+                main: SessionDatabaseFileSizeV1::Missing,
+                wal: SessionDatabaseFileSizeV1::Missing,
+                shm: SessionDatabaseFileSizeV1::Missing,
+                pages: SessionDatabasePagesV1::Missing,
+            },
         }
     }
 
@@ -1303,22 +1369,20 @@ mod tests {
         assert_eq!(total.accounted_bytes, u64::MAX);
     }
 
-    async fn seed_global_db(profile_root: &Path, projects: &[(&str, &str)]) {
-        let conn = TestConnection::open(&profile_root.join(GLOBAL_DB_FILENAME));
+    fn seed_global_db(profile_root: &Path, projects: &[(&str, &str)]) {
+        let conn = rusqlite::Connection::open(profile_root.join(GLOBAL_DB_FILENAME)).unwrap();
         conn.execute_batch(
             "CREATE TABLE code_projects (
                 project_id TEXT PRIMARY KEY,
                 canonical_root TEXT NOT NULL
              );",
         )
-        .await
         .unwrap();
         for (project_id, canonical_root) in projects {
             conn.execute(
                 "INSERT INTO code_projects (project_id, canonical_root) VALUES (?1, ?2)",
-                tracedecay_runtime_core::db::engine::params![*project_id, *canonical_root],
+                rusqlite::params![*project_id, *canonical_root],
             )
-            .await
             .unwrap();
         }
     }
@@ -1333,6 +1397,301 @@ mod tests {
         connection
             .execute_batch("CREATE TABLE fixture (id INTEGER PRIMARY KEY);")
             .unwrap();
+    }
+
+    fn seed_session_pages(path: &Path, remaining_rows: i64) -> rusqlite::Connection {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA auto_vacuum = NONE;
+             CREATE TABLE bodies (id INTEGER PRIMARY KEY, body BLOB NOT NULL);",
+            )
+            .unwrap();
+        for _ in 0..32 {
+            connection
+                .execute("INSERT INTO bodies (body) VALUES (zeroblob(8192))", [])
+                .unwrap();
+        }
+        connection
+            .execute("DELETE FROM bodies WHERE id > ?1", [remaining_rows])
+            .unwrap();
+        connection
+    }
+
+    fn observed_pages(database: &SessionDatabaseSizeV1) -> &StoreSizeSampleV1 {
+        match &database.pages {
+            SessionDatabasePagesV1::Observed {
+                sample,
+                reusable_bytes,
+            } => {
+                assert_eq!(*reusable_bytes, sample.free_bytes());
+                sample
+            }
+            other => panic!("expected observed pages, got {other:?}"),
+        }
+    }
+
+    fn session_family_inventory(
+        path: &Path,
+    ) -> BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)> {
+        ["", "-wal", "-shm"]
+            .into_iter()
+            .filter_map(|suffix| {
+                let member = sqlite_family_member(path, suffix);
+                let metadata = std::fs::metadata(&member).ok()?;
+                Some((
+                    member.clone(),
+                    (
+                        std::fs::read(&member).unwrap(),
+                        metadata.modified().unwrap(),
+                    ),
+                ))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn storage_report_samples_user_and_project_sessions_independently_of_graph() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("profile");
+        let checkout = temp.path().join("checkout");
+        let identity =
+            tracedecay_daemon_identity::profile_identity::load_or_create(&profile).unwrap();
+        let runtime = tracedecay_global_db::tests::harness::RegisteredGlobalDbTestRuntime::project_for_profile_identity(
+            &profile,
+            &checkout,
+            tracedecay_domain::ProjectId::new("proj_a").unwrap(),
+            tracedecay_runtime_core::db::TestRuntimeProfileIdentityV1::new(
+                identity.brain_id().clone(),
+                identity.profile_id().clone(),
+            ),
+        )
+        .await
+        .unwrap();
+        let user = runtime.profile_database_arc();
+        let project = runtime.project_database_arc().unwrap();
+        user.upsert_code_project("proj_a", &checkout, None, None, None)
+            .await
+            .unwrap();
+        let missing_root = temp.path().join("missing-checkout");
+        std::fs::create_dir_all(&missing_root).unwrap();
+        user.upsert_code_project("proj_missing", &missing_root, None, None, None)
+            .await
+            .unwrap();
+        seed_graph_db(&profile, "proj_a");
+        for (database, remaining) in [(&*user, 4), (&*project, 20)] {
+            let mut sql =
+                "CREATE TABLE report_fixture_bodies (id INTEGER PRIMARY KEY, body BLOB NOT NULL);"
+                    .to_owned();
+            for _ in 0..32 {
+                sql.push_str("INSERT INTO report_fixture_bodies(body) VALUES (zeroblob(8192));");
+            }
+            write!(
+                sql,
+                "DELETE FROM report_fixture_bodies WHERE id > {remaining};"
+            )
+            .unwrap();
+            database
+                .writer_connection()
+                .unwrap()
+                .execute_batch(&sql)
+                .await
+                .unwrap();
+        }
+        let user_path = user.db_path();
+        let project_path = project.db_path();
+        let user_before = session_family_inventory(user_path);
+        let project_before = session_family_inventory(project_path);
+        let report = build_storage_report_page_from_registered_global_db(
+            &profile,
+            &user,
+            None,
+            None,
+            8,
+            &[&user, &project],
+        )
+        .await
+        .unwrap();
+        let user_sample = observed_pages(report.user_sessions_database.as_ref().unwrap());
+        let project_sample = observed_pages(&report.stores[0].sessions_database);
+        assert!(user_sample.freelist_pages > project_sample.freelist_pages);
+        assert!(project_sample.freelist_pages > 0);
+        assert_eq!(user_sample.store.as_str(), USER_SESSIONS_DB_FILENAME);
+        assert_eq!(project_sample.store.as_str(), "projects/proj_a/sessions.db");
+        let graph =
+            rusqlite::Connection::open(profile.join("projects/proj_a/tracedecay.db")).unwrap();
+        let graph_freelist = graph
+            .query_row("PRAGMA freelist_count", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(u64::try_from(graph_freelist).unwrap(), 0);
+        assert_eq!(
+            report.stores[0].free_bytes, None,
+            "session authority cannot sample graph pages"
+        );
+        assert_eq!(report.stores[1].project_id, "proj_missing");
+        assert_eq!(
+            report.stores[1].sessions_database.pages,
+            SessionDatabasePagesV1::Missing
+        );
+        assert_eq!(session_family_inventory(user_path), user_before);
+        assert_eq!(session_family_inventory(project_path), project_before);
+        let cursor = report.coverage.next_cursor.as_deref().unwrap();
+        let next = build_storage_report_page_from_registered_global_db(
+            &profile,
+            &user,
+            None,
+            Some(cursor),
+            8,
+            &[&user, &project],
+        )
+        .await
+        .unwrap();
+        assert!(
+            next.user_sessions_database.is_none(),
+            "profile sample appears once"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn storage_report_rejects_another_project_runtime_through_a_store_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("profile");
+        let checkout_b = temp.path().join("checkout-b");
+        let identity =
+            tracedecay_daemon_identity::profile_identity::load_or_create(&profile).unwrap();
+        let runtime = tracedecay_global_db::tests::harness::RegisteredGlobalDbTestRuntime::project_for_profile_identity(
+            &profile,
+            &checkout_b,
+            ProjectId::new("proj_b").unwrap(),
+            tracedecay_runtime_core::db::TestRuntimeProfileIdentityV1::new(
+                identity.brain_id().clone(),
+                identity.profile_id().clone(),
+            ),
+        )
+        .await
+        .unwrap();
+        let registry = runtime.profile_database_arc();
+        let project_b = runtime.project_database_arc().unwrap();
+        let checkout_a = temp.path().join("checkout-a");
+        std::fs::create_dir_all(&checkout_a).unwrap();
+        registry
+            .upsert_code_project("proj_a", &checkout_a, None, None, None)
+            .await
+            .unwrap();
+        registry
+            .upsert_code_project("proj_b", &checkout_b, None, None, None)
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(
+            profile.join("projects/proj_b"),
+            profile.join("projects/proj_a"),
+        )
+        .unwrap();
+        let report = build_storage_report_page_from_registered_global_db(
+            &profile,
+            &registry,
+            None,
+            None,
+            8,
+            &[&registry, &project_b],
+        )
+        .await
+        .unwrap();
+        let aliased = report
+            .stores
+            .iter()
+            .find(|store| store.project_id == "proj_a")
+            .unwrap();
+        assert_eq!(
+            aliased.sessions_database.pages,
+            SessionDatabasePagesV1::Unavailable {
+                reason: "session_database_identity_mismatch".to_owned(),
+            }
+        );
+        let owned = report
+            .stores
+            .iter()
+            .find(|store| store.project_id == "proj_b")
+            .unwrap();
+        assert!(
+            matches!(&owned.sessions_database.pages, SessionDatabasePagesV1::Observed { sample, .. }
+            if sample.store.as_str() == "projects/proj_b/sessions.db")
+        );
+    }
+
+    #[test]
+    fn session_sampling_preserves_sizes_when_missing_corrupt_or_busy() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = sample_session_database(&temp.path().join("missing.db"), "sessions.db");
+        assert_eq!(missing.main, SessionDatabaseFileSizeV1::Missing);
+        assert_eq!(missing.pages, SessionDatabasePagesV1::Missing);
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+
+        let corrupt_path = temp.path().join("corrupt.db");
+        std::fs::write(&corrupt_path, b"invalid sqlite bytes").unwrap();
+        let before = session_family_inventory(&corrupt_path);
+        let corrupt = sample_session_database(&corrupt_path, "sessions.db");
+        assert_eq!(
+            corrupt.main,
+            SessionDatabaseFileSizeV1::Observed {
+                logical_bytes: StorageByteSizeV1(20)
+            }
+        );
+        assert!(matches!(
+            corrupt.pages,
+            SessionDatabasePagesV1::Unavailable { .. }
+        ));
+        assert_eq!(session_family_inventory(&corrupt_path), before);
+
+        let busy_path = temp.path().join("busy.db");
+        let writer = seed_session_pages(&busy_path, 4);
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let before = session_family_inventory(&busy_path);
+        let busy = sample_session_database(&busy_path, "sessions.db");
+        assert_eq!(busy.main, session_file_size(&busy_path));
+        assert!(matches!(
+            busy.pages,
+            SessionDatabasePagesV1::Unavailable { .. }
+        ));
+        assert_eq!(session_family_inventory(&busy_path), before);
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn session_sampling_reports_wal_and_shm_without_changing_the_live_family() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("sessions.db");
+        let writer = seed_session_pages(&path, 4);
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;
+             INSERT INTO bodies (body) VALUES (zeroblob(8192));",
+            )
+            .unwrap();
+        let before = session_family_inventory(&path);
+        let sample = sample_session_database(&path, "sessions.db");
+        for (suffix, size) in [
+            ("", &sample.main),
+            ("-wal", &sample.wal),
+            ("-shm", &sample.shm),
+        ] {
+            assert_eq!(
+                *size,
+                SessionDatabaseFileSizeV1::Observed {
+                    logical_bytes: StorageByteSizeV1(
+                        before[&sqlite_family_member(&path, suffix)].0.len() as u64
+                    ),
+                }
+            );
+        }
+        assert!(matches!(
+            sample.pages,
+            SessionDatabasePagesV1::Unavailable { .. }
+        ));
+        assert_eq!(session_family_inventory(&path), before);
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 3);
     }
 
     /// Inventory positions survive directory mutation without repeating records.
@@ -1456,10 +1815,16 @@ mod tests {
             std::fs::create_dir_all(&project).unwrap();
             std::fs::write(project.join("payload"), b"1234").unwrap();
         }
-        let registry =
-            build_storage_report_page_from_registered_global_db(profile_root, &db, None, None, 1)
-                .await
-                .unwrap();
+        let registry = build_storage_report_page_from_registered_global_db(
+            profile_root,
+            &db,
+            None,
+            None,
+            1,
+            &[],
+        )
+        .await
+        .unwrap();
         assert_eq!(registry.stores.len(), 0);
         let directories = registry.coverage.next_cursor.unwrap();
         assert!(directories.starts_with("bc1."), "{directories}");
@@ -1469,6 +1834,7 @@ mod tests {
             None,
             Some(&directories),
             1,
+            &[],
         )
         .await
         .unwrap();
@@ -1483,6 +1849,7 @@ mod tests {
             None,
             Some(&cursor),
             1,
+            &[],
         )
         .await
         .unwrap();
@@ -1492,6 +1859,7 @@ mod tests {
             None,
             Some(&cursor),
             1,
+            &[],
         )
         .await
         .unwrap();
@@ -1522,6 +1890,7 @@ mod tests {
                 None,
                 Some(presented),
                 limit,
+                &[],
             )
             .await
             .unwrap_err();
@@ -1536,6 +1905,7 @@ mod tests {
             None,
             second.coverage.next_cursor.as_deref(),
             1,
+            &[],
         )
         .await
         .unwrap();
@@ -1549,6 +1919,7 @@ mod tests {
             None,
             third.coverage.next_cursor.as_deref(),
             1,
+            &[],
         )
         .await
         .unwrap();
@@ -1675,7 +2046,18 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let profile_root = tmp.path().join("profile");
         std::fs::create_dir_all(&profile_root).unwrap();
-        seed_global_db(&profile_root, &[("proj_a", "/repos/a")]).await;
+        let checkout = tmp.path().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let runtime = tracedecay_global_db::tests::harness::RegisteredGlobalDbTestRuntime::profile(
+            &profile_root,
+        )
+        .await
+        .unwrap();
+        let registry = runtime.profile_database_arc();
+        let project = registry
+            .upsert_code_project("proj_a", &checkout, None, None, None)
+            .await
+            .unwrap();
         seed_graph_db(&profile_root, "proj_a");
 
         // An unregistered leaf directory under `projects/`.
@@ -1683,11 +2065,32 @@ mod tests {
         std::fs::create_dir_all(&ghost).unwrap();
         std::fs::write(ghost.join("payload.bin"), vec![0u8; 2048]).unwrap();
 
-        let report = build_storage_report(&profile_root).await.unwrap();
+        let mut report = build_storage_report_page_from_registered_global_db(
+            &profile_root,
+            &registry,
+            None,
+            None,
+            8,
+            &[&registry],
+        )
+        .await
+        .unwrap();
+        let directories = build_storage_report_page_from_registered_global_db(
+            &profile_root,
+            &registry,
+            None,
+            report.coverage.next_cursor.as_deref(),
+            8,
+            &[],
+        )
+        .await
+        .unwrap();
+        report.unregistered_dir_count = directories.unregistered_dir_count;
+        report.unregistered_bytes = directories.unregistered_bytes;
 
         assert_eq!(report.stores.len(), 1);
         assert_eq!(report.stores[0].project_id, "proj_a");
-        assert_eq!(report.stores[0].canonical_root, "/repos/a");
+        assert_eq!(report.stores[0].canonical_root, project.canonical_root);
         assert!(report.stores[0].total_bytes > 0);
         assert_eq!(report.unregistered_dir_count, 1);
         assert!(report.unregistered_bytes >= 2048);
@@ -1698,7 +2101,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let profile_root = tmp.path().join("profile");
         std::fs::create_dir_all(&profile_root).unwrap();
-        seed_global_db(&profile_root, &[]).await;
+        seed_global_db(&profile_root, &[]);
         std::fs::write(
             profile_root.join(USER_SESSIONS_DB_FILENAME),
             vec![1u8; 4_096],
@@ -1722,7 +2125,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let profile_root = tmp.path().join("profile");
         std::fs::create_dir_all(&profile_root).unwrap();
-        seed_global_db(&profile_root, &[("proj_a", "/repos/a")]).await;
+        seed_global_db(&profile_root, &[("proj_a", "/repos/a")]);
         seed_graph_db(&profile_root, "proj_a");
 
         std::fs::write(profile_root.join("sessions.db"), vec![1u8; 2_048]).unwrap();
@@ -1779,9 +2182,22 @@ mod tests {
 
             let report = build_storage_report(&profile_root).await.unwrap();
 
-            assert_eq!(report.stores.len(), 1);
-            assert_eq!(report.stores[0].project_id, "proj_a");
-            assert_eq!(report.stores[0].canonical_root, "/repos/a");
+            assert_eq!(
+                report.stores.len(),
+                0,
+                "unexpected stores: {:?}",
+                report.stores
+            );
+            assert!(matches!(
+                report.registry,
+                Some(StorageReportRegistryV1::Unavailable { .. })
+            ));
+            assert_eq!(
+                report.unregistered_dir_count, 0,
+                "an unavailable registry cannot classify stores"
+            );
+            assert!(report.user_sessions_database.is_some());
+            assert!(report.full_profile_size.is_some());
             assert_eq!(
                 sqlite_family_bytes(&global_db),
                 before,
@@ -1792,27 +2208,12 @@ mod tests {
             assert!(!sqlite_family_member(&global_db, "-wal").exists());
             assert!(!sqlite_family_member(&global_db, "-shm").exists());
             let report = build_storage_report(&profile_root).await.unwrap();
-            assert_eq!(report.stores.len(), 1);
+            assert!(matches!(
+                report.registry,
+                Some(StorageReportRegistryV1::Unavailable { .. })
+            ));
             assert_eq!(sqlite_family_bytes(&global_db), closed);
         }
-    }
-
-    #[test]
-    fn scratch_validation_rejects_a_transient_directory_inside_the_profile() {
-        let root = tempfile::tempdir().unwrap();
-        let profile = root.path().join("profile");
-        let transient = profile.join("transient");
-        std::fs::create_dir_all(&transient).unwrap();
-
-        let rejected = validate_external_scratch(&profile, &transient).unwrap_err();
-        assert_eq!(rejected.kind(), std::io::ErrorKind::Other);
-        assert_eq!(
-            rejected.to_string(),
-            "read-snapshot scratch must be outside the inspected profile"
-        );
-        let outside = root.path().join("outside");
-        std::fs::create_dir_all(&outside).unwrap();
-        assert_eq!(validate_external_scratch(&profile, &outside).unwrap(), ());
     }
 
     /// The report must never freeze a store family to size it: a snapshot
@@ -1823,7 +2224,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let profile_root = tmp.path().join("profile");
         std::fs::create_dir_all(&profile_root).unwrap();
-        seed_global_db(&profile_root, &[("proj_a", "/repos/a")]).await;
+        seed_global_db(&profile_root, &[("proj_a", "/repos/a")]);
         seed_graph_db(&profile_root, "proj_a");
 
         let graph_db = profile_root
@@ -1832,7 +2233,13 @@ mod tests {
             .join(tracedecay_runtime_core::config::DB_FILENAME);
         let before = std::fs::metadata(&graph_db).unwrap().modified().unwrap();
 
-        let report = build_storage_report(&profile_root).await.unwrap();
+        let report = build_project_storage_report(
+            &profile_root,
+            "proj_a",
+            Path::new("/repos/a"),
+            Err(RETENTION_PROTECTION_UNRESOLVED),
+        )
+        .unwrap();
 
         assert_eq!(report.stores.len(), 1);
         assert_eq!(
@@ -1840,9 +2247,9 @@ mod tests {
             std::fs::metadata(&graph_db).unwrap().len(),
             "size must come from filesystem metadata"
         );
-        assert!(
-            report.stores[0].free_page_ratio.is_some(),
-            "an idle store must sample its free pages"
+        assert_eq!(
+            report.stores[0].free_page_ratio, None,
+            "unmounted graph telemetry is unavailable"
         );
         assert_eq!(
             std::fs::metadata(&graph_db).unwrap().modified().unwrap(),
@@ -1867,7 +2274,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let profile_root = tmp.path().join("profile");
         std::fs::create_dir_all(&profile_root).unwrap();
-        seed_global_db(&profile_root, &[("proj_a", "/repos/a")]).await;
+        seed_global_db(&profile_root, &[("proj_a", "/repos/a")]);
 
         let data_root = profile_root.join("projects").join("proj_a");
         std::fs::create_dir_all(&data_root).unwrap();
@@ -1878,7 +2285,13 @@ mod tests {
         )
         .unwrap();
 
-        let report = build_storage_report(&profile_root).await.unwrap();
+        let report = build_project_storage_report(
+            &profile_root,
+            "proj_a",
+            Path::new("/repos/a"),
+            Err(RETENTION_PROTECTION_UNRESOLVED),
+        )
+        .unwrap();
 
         assert_eq!(report.stores.len(), 1);
         assert_eq!(report.stores[0].total_bytes, 4096);
@@ -1895,7 +2308,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let profile_root = tmp.path().join("profile");
         std::fs::create_dir_all(&profile_root).unwrap();
-        seed_global_db(&profile_root, &[]).await;
+        seed_global_db(&profile_root, &[]);
 
         let ghost = profile_root.join("projects").join("proj_ghost");
         std::fs::create_dir_all(&ghost).unwrap();
@@ -1910,10 +2323,14 @@ mod tests {
 
         let report = build_storage_report(&profile_root).await.unwrap();
 
-        assert_eq!(report.unregistered_dir_count, 1);
+        assert_eq!(report.unregistered_dir_count, 0);
+        assert!(matches!(
+            report.registry,
+            Some(StorageReportRegistryV1::Unavailable { .. })
+        ));
         assert_eq!(
-            report.unregistered_bytes, 2048,
-            "only the store's own bytes count"
+            report.full_profile_size.unwrap().total_bytes,
+            profile_tree_bytes(&profile_root)
         );
     }
 
@@ -2039,6 +2456,7 @@ mod tests {
             Some(&schedulers),
             None,
             8,
+            &[],
         )
         .await
         .unwrap();
@@ -2077,10 +2495,16 @@ mod tests {
             StorageReportAvailabilityState::Available
         );
 
-        let without_authority =
-            build_storage_report_page_from_registered_global_db(&profile_root, &db, None, None, 8)
-                .await
-                .unwrap();
+        let without_authority = build_storage_report_page_from_registered_global_db(
+            &profile_root,
+            &db,
+            None,
+            None,
+            8,
+            &[],
+        )
+        .await
+        .unwrap();
         assert_eq!(without_authority.code_generation_retention.len(), 0);
         assert_eq!(
             without_authority.code_generation_retention_availability[0]

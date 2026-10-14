@@ -72,8 +72,8 @@
 //!
 //! Each pass discovers candidates from the disposition ledger past its own
 //! durable cursor (`session_backfill_meta`), then reads only the evidence rows
-//! those anchors govern. A tick with nothing newly due reads one ledger page,
-//! never the evidence tables.
+//! those anchors govern. Each pass examines at most one appended page and one
+//! aged page, including rows that cannot release any payload.
 //!
 //! The daemon reaches this engine through
 //! [`crate::RegisteredGlobalDb::run_observation_retention`].
@@ -257,6 +257,10 @@ pub struct ObservationRetentionReport {
     /// Projection-generation scope (`None` spans every generation).
     pub generation: Option<String>,
     pub applied: bool,
+    /// An applied run needs another bounded tick to finish examining its
+    /// ledger pages or retry an unfinished release batch. False in dry runs.
+    #[serde(default)]
+    pub pending: bool,
     pub started_at: UtcMicros,
     pub ended_at: UtcMicros,
     pub anchors_released: ObservationRetentionPhaseReport,
@@ -371,23 +375,26 @@ impl LedgerCursor {
     }
 }
 
-async fn write_ledger_cursors(database: &Database, cursors: &[(&str, LedgerCursor)]) -> Result<()> {
-    let txn = database
-        .begin_write_transaction("record observation retention ledger cursors")
-        .await
-        .map_err(db_error)?;
-    for (pass, cursor) in cursors {
+/// Advances only the cursor this pass actually adopted. A concurrent pass may
+/// already have committed newer progress while this pass selected its rows.
+async fn write_ledger_cursor(
+    txn: &DatabaseWriteTransaction<'_>,
+    pass: &str,
+    expected: LedgerCursor,
+    next: LedgerCursor,
+) -> Result<()> {
+    if LedgerCursor::read(txn, pass).await? == expected {
         txn.execute(
             "INSERT INTO session_backfill_meta(key, value, updated_at)
              VALUES (?1, ?2, unixepoch())
              ON CONFLICT(key) DO UPDATE SET
                 value = excluded.value, updated_at = excluded.updated_at",
-            params![LedgerCursor::key(pass), cursor.encode()],
+            params![LedgerCursor::key(pass), next.encode()],
         )
         .await
         .map_err(db_error)?;
     }
-    commit_transaction(txn).await
+    Ok(())
 }
 
 /// Ledger rows one disposition page reads.
@@ -399,18 +406,19 @@ const LATEST_DISPOSITION_SQL: &str = "(SELECT MAX(latest.sequence)
     FROM retrieval_anchor_dispositions latest
     WHERE latest.anchor_id = d.anchor_id AND latest.owner_json = d.owner_json)";
 
-/// Anchors whose current disposition was released before `cutoff` and became
-/// releasable since `cursor`, at most `limit` of them, and the cursor past
-/// every ledger row examined. The release statements re-check each anchor.
+/// Examines at most one bounded page from each ledger source. Both sources get
+/// a page even when appended releases fill the payload batch, so aging cannot
+/// starve behind a continuous append stream. The release statements re-check
+/// each anchor, and an overflowing payload batch retains the old cursor.
 async fn released_anchors_since(
     database: &Database,
     cursor: LedgerCursor,
     cutoff: UtcMicros,
     limit: usize,
-) -> Result<(Vec<String>, LedgerCursor)> {
+) -> Result<(Vec<String>, LedgerCursor, bool)> {
     let reader = database.read_connection();
     let mut anchors = BTreeSet::new();
-    let appended_through = released_anchors_appended(
+    let (appended_through, appended_pending) = released_anchors_appended(
         &reader,
         cursor.appended_through,
         cutoff,
@@ -422,67 +430,72 @@ async fn released_anchors_since(
         appended_through,
         ..cursor
     };
-    let remaining = limit.saturating_sub(anchors.len());
-    if remaining > 0 {
-        next.aged_through = released_anchors_aged(
-            &reader,
-            cursor.aged_through,
-            cutoff,
-            remaining,
-            &mut anchors,
-        )
-        .await?;
-    }
-    Ok((anchors.into_iter().collect(), next))
+    let (aged_through, aged_pending) =
+        released_anchors_aged(&reader, cursor.aged_through, cutoff, limit, &mut anchors).await?;
+    next.aged_through = aged_through;
+    Ok((
+        anchors.into_iter().collect(),
+        next,
+        appended_pending || aged_pending,
+    ))
 }
 
 /// Adds the anchors whose released disposition was appended after `after`
-/// already past the window, up to `limit` anchors in total, and returns the
-/// sequence examined through. A released row not yet due is left for the aged
-/// scan of the run that finds it past the window.
+/// already past the window, examining at most `limit` rows in one page, and
+/// returns the sequence examined through. A released row not yet due is left
+/// for the aged scan of the run that finds it past the window.
 async fn released_anchors_appended(
     reader: &(impl QueryExecutor + ?Sized),
     after: i64,
     cutoff: UtcMicros,
     limit: usize,
     anchors: &mut BTreeSet<String>,
-) -> Result<i64> {
+) -> Result<(i64, bool)> {
     let mut examined = after;
-    loop {
-        let mut rows = reader
-            .query(
-                &format!(
-                    "SELECT d.sequence, d.anchor_id, d.state, d.effective_at,
+    let mut page_rows = 0_i64;
+    let mut rows = reader
+        .query(
+            &format!(
+                "SELECT d.sequence, d.anchor_id, d.state, d.effective_at,
                             {LATEST_DISPOSITION_SQL}
                      FROM retrieval_anchor_dispositions d
                      WHERE d.sequence > ?1
                      ORDER BY d.sequence
                      LIMIT ?2"
-                ),
-                params![examined, DISPOSITION_SCAN_PAGE_ROWS],
-            )
-            .await
-            .map_err(db_error)?;
-        let mut page_rows = 0_i64;
-        while let Some(row) = rows.next().await.map_err(db_error)? {
-            page_rows += 1;
-            let sequence = row.get::<i64>(0).map_err(db_error)?;
-            let state = row.get::<String>(2).map_err(db_error)?;
-            if matches!(state.as_str(), "superseded" | "deleted")
-                && UtcMicros(row.get::<i64>(3).map_err(db_error)?) < cutoff
-                && row.get::<i64>(4).map_err(db_error)? == sequence
-            {
-                anchors.insert(row.get::<String>(1).map_err(db_error)?);
-            }
-            examined = sequence;
-            if anchors.len() >= limit {
-                return Ok(examined);
-            }
+            ),
+            params![examined, scan_limit(limit)],
+        )
+        .await
+        .map_err(db_error)?;
+    while let Some(row) = rows.next().await.map_err(db_error)? {
+        page_rows += 1;
+        let sequence = row.get::<i64>(0).map_err(db_error)?;
+        let state = row.get::<String>(2).map_err(db_error)?;
+        if matches!(state.as_str(), "superseded" | "deleted")
+            && UtcMicros(row.get::<i64>(3).map_err(db_error)?) < cutoff
+            && row.get::<i64>(4).map_err(db_error)? == sequence
+        {
+            anchors.insert(row.get::<String>(1).map_err(db_error)?);
         }
-        if page_rows < DISPOSITION_SCAN_PAGE_ROWS {
-            return Ok(examined);
-        }
+        examined = sequence;
     }
+    Ok((examined, page_rows == scan_limit(limit)))
+}
+
+fn scan_limit(limit: usize) -> i64 {
+    limit.min(DISPOSITION_SCAN_PAGE_ROWS as usize) as i64
+}
+
+fn aged_dispositions_sql() -> String {
+    format!(
+        "SELECT d.sequence, d.anchor_id, d.effective_at, {LATEST_DISPOSITION_SQL}
+         FROM retrieval_anchor_dispositions d
+         WHERE d.state IN ('superseded', 'deleted')
+           AND d.effective_at < ?1
+           AND (d.effective_at, d.sequence) > (?2, ?3)
+         ORDER BY d.effective_at, d.sequence
+         LIMIT ?4"
+    )
 }
 
 /// Adds up to `remaining` anchors whose released disposition aged past the
@@ -494,20 +507,12 @@ async fn released_anchors_aged(
     cutoff: UtcMicros,
     remaining: usize,
     anchors: &mut BTreeSet<String>,
-) -> Result<(i64, i64)> {
+) -> Result<((i64, i64), bool)> {
     let (aged_effective_at, aged_sequence) = aged_through;
-    let remaining = i64::try_from(remaining).unwrap_or(i64::MAX);
+    let remaining = scan_limit(remaining);
     let mut rows = reader
         .query(
-            &format!(
-                "SELECT d.sequence, d.anchor_id, d.effective_at, {LATEST_DISPOSITION_SQL}
-                 FROM retrieval_anchor_dispositions d
-                 WHERE d.state IN ('superseded', 'deleted')
-                   AND d.effective_at < ?1
-                   AND (d.effective_at > ?2 OR (d.effective_at = ?2 AND d.sequence > ?3))
-                 ORDER BY d.effective_at, d.sequence
-                 LIMIT ?4"
-            ),
+            &aged_dispositions_sql(),
             params![cutoff.0, aged_effective_at, aged_sequence, remaining],
         )
         .await
@@ -522,11 +527,12 @@ async fn released_anchors_aged(
             anchors.insert(row.get::<String>(1).map_err(db_error)?);
         }
     }
-    Ok(match last_aged {
+    let next = match last_aged {
         Some(last) if aged == remaining => last,
         // Every released row older than the cutoff has been examined.
         _ => (cutoff.0.saturating_sub(1), i64::MAX),
-    })
+    };
+    Ok((next, aged == remaining))
 }
 
 /// `generation` scopes every pass to a single `projection_generation` (`None`
@@ -547,6 +553,7 @@ pub async fn run_observation_retention(
     let mut report = ObservationRetentionReport {
         generation: generation.map(str::to_string),
         applied: mode.is_apply(),
+        pending: false,
         started_at: now,
         ended_at: now,
         anchors_released: ObservationRetentionPhaseReport::default(),
@@ -572,18 +579,15 @@ pub async fn run_observation_retention(
         config,
         mode,
         errors: &mut report.errors,
-        cursors: Vec::new(),
+        pending: false,
     };
     let anchors_released = run_anchor_pass(&mut pass, now).await?;
     let observations_released = run_observation_pass(&mut pass, now).await?;
     let provenance_released = run_provenance_pass(&mut pass, now).await?;
-    let cursors = pass.cursors;
+    report.pending = mode.is_apply() && pass.pending;
     report.anchors_released = anchors_released;
     report.observations_released = observations_released;
     report.provenance_released = provenance_released;
-    if !cursors.is_empty() {
-        write_ledger_cursors(database, &cursors).await?;
-    }
 
     report.ended_at = now;
     let reader = database.read_connection();
@@ -621,6 +625,12 @@ struct ReleaseTarget {
     id: String,
     original_len: u64,
     effective_at: UtcMicros,
+}
+
+struct LedgerCheckpoint {
+    pass: String,
+    expected: LedgerCursor,
+    next: LedgerCursor,
 }
 
 /// The in-place payload rewrite one pass applies to its selected batch.
@@ -661,16 +671,26 @@ async fn select_release_targets(
 /// Selects a pass's bounded batch and, in apply mode, releases it.
 async fn run_release_pass(
     database: &Database,
-    selection: (&str, Params),
+    selection: Option<(&str, Params)>,
     release: PayloadRelease,
     mode: RetentionMode,
     errors: &mut Vec<String>,
-) -> Result<ObservationRetentionPhaseReport> {
+    batch_limit: usize,
+    checkpoint: Option<LedgerCheckpoint>,
+) -> Result<(ObservationRetentionPhaseReport, bool)> {
     let mut report = ObservationRetentionPhaseReport {
         window_days: release.window_days,
         ..ObservationRetentionPhaseReport::default()
     };
-    let targets = select_release_targets(database, selection.0, selection.1).await?;
+    let mut targets = match selection {
+        Some((sql, query_params)) => select_release_targets(database, sql, query_params).await?,
+        None => Vec::new(),
+    };
+    // The two ledger pages can contribute more eligible payloads than fit in
+    // one release batch. Keep both pages retryable until their payloads drain.
+    let overflow = targets.len() > batch_limit;
+    let checkpoint = checkpoint.filter(|_| !overflow);
+    targets.truncate(batch_limit);
     report.eligible = targets.len() as u64;
     report.oldest_eligible_at = targets.iter().map(|target| target.effective_at).min();
     if !mode.is_apply() {
@@ -678,12 +698,21 @@ async fn run_release_pass(
             .iter()
             .map(|target| reclaimed_bytes(target.original_len, release.marker))
             .sum();
-        return Ok(report);
+        return Ok((report, false));
     }
-    if !targets.is_empty() {
-        release_payload_batch(database, &release, &targets, &mut report, errors).await?;
+    let errors_before = errors.len();
+    if !targets.is_empty() || checkpoint.is_some() {
+        release_payload_batch(
+            database,
+            &release,
+            &targets,
+            &mut report,
+            errors,
+            checkpoint,
+        )
+        .await?;
     }
-    Ok(report)
+    Ok((report, overflow || errors.len() > errors_before))
 }
 
 /// Rewrites a selected batch's payload column to its released marker in one
@@ -698,12 +727,15 @@ async fn release_payload_batch(
     targets: &[ReleaseTarget],
     report: &mut ObservationRetentionPhaseReport,
     errors: &mut Vec<String>,
+    checkpoint: Option<LedgerCheckpoint>,
 ) -> Result<()> {
     let txn = database
         .begin_write_transaction(release.intent)
         .await
         .map_err(db_error)?;
-    execute_required(&txn, release.drop_trigger).await?;
+    if !targets.is_empty() {
+        execute_required(&txn, release.drop_trigger).await?;
+    }
     for chunk in targets.chunks(RETENTION_DML_CHUNK) {
         let ids = (0..chunk.len())
             .map(|index| format!("?{}", index + 3))
@@ -717,17 +749,24 @@ async fn release_payload_batch(
         let mut rows = match txn.query(&sql, values).await {
             Ok(rows) => rows,
             Err(err) => {
-                errors.push(format!(
-                    "release {} batch ({} ids starting {}): {err}",
-                    release.label,
-                    chunk.len(),
-                    chunk[0].id
-                ));
-                continue;
+                record_release_error(release, chunk, err, report, errors);
+                // Drop the transaction, including earlier chunks and trigger
+                // changes. The cursor and all payloads remain retryable.
+                return Ok(());
             }
         };
         let mut released = std::collections::BTreeSet::new();
-        while let Some(row) = rows.next().await.map_err(db_error)? {
+        loop {
+            let row = match rows.next().await {
+                Ok(row) => row,
+                Err(err) => {
+                    record_release_error(release, chunk, err, report, errors);
+                    return Ok(());
+                }
+            };
+            let Some(row) = row else {
+                break;
+            };
             released.insert(row.get::<String>(0).map_err(db_error)?);
         }
         drop(rows);
@@ -740,19 +779,41 @@ async fn release_payload_batch(
                 .sum(),
         );
     }
-    execute_required(&txn, release.create_trigger).await?;
+    if !targets.is_empty() {
+        execute_required(&txn, release.create_trigger).await?;
+    }
+    if let Some(checkpoint) = checkpoint {
+        write_ledger_cursor(&txn, &checkpoint.pass, checkpoint.expected, checkpoint.next).await?;
+    }
     commit_transaction(txn).await
 }
 
+fn record_release_error(
+    release: &PayloadRelease,
+    chunk: &[ReleaseTarget],
+    error: impl std::fmt::Display,
+    report: &mut ObservationRetentionPhaseReport,
+    errors: &mut Vec<String>,
+) {
+    errors.push(format!(
+        "release {} batch ({} ids starting {}): {error}",
+        release.label,
+        chunk.len(),
+        chunk[0].id
+    ));
+    report.acted = 0;
+    report.bytes_reclaimed = 0;
+}
+
 /// Shared inputs of the three ledger-driven release passes, and the ledger
-/// cursors an applied, unscoped run advances once its releases committed.
+/// cursors an applied pass commits with its releases.
 struct LedgerPass<'a> {
     database: &'a Database,
     generation: Option<&'a str>,
     config: &'a ObservationRetentionConfig,
     mode: RetentionMode,
     errors: &'a mut Vec<String>,
-    cursors: Vec<(&'static str, LedgerCursor)>,
+    pending: bool,
 }
 
 impl LedgerPass<'_> {
@@ -766,48 +827,52 @@ impl LedgerPass<'_> {
         release: PayloadRelease,
     ) -> Result<ObservationRetentionPhaseReport> {
         let reader = self.database.read_connection();
-        let cursor = LedgerCursor::read(&reader, pass).await?;
-        let (anchors, next) = released_anchors_since(
+        let cursor_pass = match self.generation {
+            Some(generation) => format!(
+                "scoped.{}",
+                serde_json::to_string(&(pass, generation)).map_err(db_error)?
+            ),
+            None => pass.to_owned(),
+        };
+        let cursor = LedgerCursor::read(&reader, &cursor_pass).await?;
+        let (anchors, next, ledger_pending) = released_anchors_since(
             self.database,
             cursor,
             cutoff,
             self.config.max_batch_size.max(1),
         )
         .await?;
-        let errors_before = self.errors.len();
-        let report = if anchors.is_empty() {
-            ObservationRetentionPhaseReport {
-                window_days: release.window_days,
-                ..ObservationRetentionPhaseReport::default()
-            }
+        // Each generation has independent progress. A scoped pass must never
+        // skip another generation's evidence by advancing its global cursor.
+        let checkpoint = (self.mode.is_apply() && next != cursor).then_some(LedgerCheckpoint {
+            pass: cursor_pass,
+            expected: cursor,
+            next,
+        });
+        let selection = if anchors.is_empty() {
+            None
         } else {
-            let anchors = serde_json::to_string(&anchors).map_err(db_error)?;
-            run_release_pass(
-                self.database,
-                (
-                    sql,
-                    params![
-                        opt_text(self.generation),
-                        cutoff.0,
-                        self.config.batch_limit(),
-                        anchors
-                    ],
-                ),
-                release,
-                self.mode,
-                self.errors,
-            )
-            .await?
+            Some((
+                sql,
+                params![
+                    opt_text(self.generation),
+                    cutoff.0,
+                    self.config.batch_limit().saturating_add(1),
+                    serde_json::to_string(&anchors).map_err(db_error)?
+                ],
+            ))
         };
-        // A generation-scoped run examined only its generation's rows, and a
-        // failed release stays behind the cursor so the next run retries it.
-        if self.mode.is_apply()
-            && self.generation.is_none()
-            && next != cursor
-            && self.errors.len() == errors_before
-        {
-            self.cursors.push((pass, next));
-        }
+        let (report, release_pending) = run_release_pass(
+            self.database,
+            selection,
+            release,
+            self.mode,
+            self.errors,
+            self.config.max_batch_size.max(1),
+            checkpoint,
+        )
+        .await?;
+        self.pending |= ledger_pending || release_pending;
         Ok(report)
     }
 }

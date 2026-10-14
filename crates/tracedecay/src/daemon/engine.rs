@@ -244,8 +244,8 @@ impl DaemonEngine {
                 + 'a,
         >,
     > {
-        // Erase the deeply nested future before it reaches the measured
-        // wrapper so every profiling feature can compute its layout.
+        // Erase the deeply nested project-open future so profiling features
+        // can compute its layout without retaining every nested frame.
         Box::pin(async move {
             self.store_administration
                 .execute_branch_admin_for_handshake(
@@ -377,45 +377,36 @@ impl DaemonEngine {
         handshake: &DaemonHandshake,
     ) -> Result<Arc<crate::mcp::McpServer>> {
         let cancellation = CancellationToken::new();
-        self.project_server_until_cancelled(handshake, &cancellation)
+        self.project_server_until_cancelled(handshake, &cancellation, None)
             .await
     }
 
-    #[tracing::instrument(
-        name = "daemon.engine.project_server_until_cancelled",
-        level = "trace",
-        skip_all
-    )]
-    async fn project_server_until_cancelled(
-        &self,
-        handshake: &DaemonHandshake,
-        cancellation: &CancellationToken,
-    ) -> Result<Arc<crate::mcp::McpServer>> {
-        self.project_server_until_cancelled_inner(handshake, cancellation)
-            .await
-    }
-
-    fn project_server_until_cancelled_inner<'a>(
+    fn project_server_until_cancelled<'a>(
         &'a self,
         handshake: &'a DaemonHandshake,
         cancellation: &'a CancellationToken,
+        hook_recovery: Option<Arc<Vec<tracedecay_hooks::HookConfigurationSnapshotV1>>>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Arc<crate::mcp::McpServer>>> + Send + 'a>,
     > {
-        // Erase the deeply nested future before it reaches the measured
-        // wrapper so every profiling feature can compute its layout.
-        Box::pin(async move {
+        // Erase the deeply nested project-open future so profiling features
+        // can compute its layout without retaining every nested frame.
+        let open = async move {
             if let Some(server) = self.cached_project_server(handshake).await? {
                 return Ok(server);
             }
 
             let cached = self
-                .open_project_server_until_cancelled(handshake, cancellation)
+                .open_project_server_until_cancelled(handshake, cancellation, hook_recovery)
                 .await?;
             let (_key, project_path, server, _inserted) = cached;
             project_open_cancellation_checkpoint(cancellation)?;
             Ok(self.activate_project_server(project_path, server).await)
-        })
+        };
+        Box::pin(tracing::Instrument::instrument(
+            open,
+            tracing::trace_span!("daemon.engine.project_server_until_cancelled"),
+        ))
     }
 
     pub(super) async fn cached_project_server(
@@ -445,8 +436,8 @@ impl DaemonEngine {
         handshake: &'a DaemonHandshake,
         requirement: ProjectServerRequirement,
     ) -> CachedProjectServerFutureV1<'a> {
-        // Erase the deeply nested future before it reaches the measured
-        // wrapper so every profiling feature can compute its layout.
+        // Erase the deeply nested project-open future so profiling features
+        // can compute its layout without retaining every nested frame.
         Box::pin(async move {
             let (project_path, route) = self.project_route(handshake)?;
             // A route-alias hit returns the mounted server without re-running
@@ -528,7 +519,16 @@ impl DaemonEngine {
         handshake: DaemonHandshake,
         initialize_request: Option<JsonRpcRequest>,
     ) -> Result<ProjectOpenTaskClaim> {
-        self.begin_project_open_inner(handshake, initialize_request)
+        self.begin_project_open_inner(handshake, initialize_request, None)
+            .await
+    }
+
+    pub(super) async fn begin_project_open_for_hook_replay(
+        &self,
+        handshake: DaemonHandshake,
+        publications: Arc<Vec<tracedecay_hooks::HookConfigurationSnapshotV1>>,
+    ) -> Result<ProjectOpenTaskClaim> {
+        self.begin_project_open_inner(handshake, None, Some(publications))
             .await
     }
 
@@ -536,11 +536,12 @@ impl DaemonEngine {
         &self,
         handshake: DaemonHandshake,
         initialize_request: Option<JsonRpcRequest>,
+        hook_recovery: Option<Arc<Vec<tracedecay_hooks::HookConfigurationSnapshotV1>>>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<ProjectOpenTaskClaim>> + Send + '_>,
     > {
-        // Erase the deeply nested future before it reaches the measured
-        // wrapper so every profiling feature can compute its layout.
+        // Erase the deeply nested project-open future so profiling features
+        // can compute its layout without retaining every nested frame.
         Box::pin(async move {
             let (project_path, route) = self.project_route(&handshake)?;
             // Admission before warm-up: an ambient, unenrolled directory must be
@@ -559,7 +560,11 @@ impl DaemonEngine {
                 initialize_request,
                 move |cancellation| async move {
                     engine
-                        .project_server_until_cancelled(&open_handshake, &cancellation)
+                        .project_server_until_cancelled(
+                            &open_handshake,
+                            &cancellation,
+                            hook_recovery,
+                        )
                         .await
                 },
             ))
@@ -597,8 +602,8 @@ impl DaemonEngine {
         handshake: DaemonHandshake,
         initialize_request: Option<JsonRpcRequest>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>> {
-        // Erase the deeply nested future before it reaches the measured
-        // wrapper so every profiling feature can compute its layout.
+        // Erase the deeply nested project-open future so profiling features
+        // can compute its layout without retaining every nested frame.
         Box::pin(async move {
             if self.cached_project_server(&handshake).await?.is_some() {
                 return Ok(());
@@ -632,8 +637,8 @@ impl DaemonEngine {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Arc<crate::mcp::McpServer>>> + Send + 'a>,
     > {
-        // Erase the deeply nested future before it reaches the measured
-        // wrapper so every profiling feature can compute its layout.
+        // Erase the deeply nested project-open future so profiling features
+        // can compute its layout without retaining every nested frame.
         Box::pin(async move {
             if let Some(server) = self
                 .cached_project_server_for_requirement(handshake, requirement)
@@ -768,28 +773,19 @@ impl DaemonEngine {
         handshake: &DaemonHandshake,
     ) -> Result<(ProjectServerKey, PathBuf, Arc<crate::mcp::McpServer>, bool)> {
         let cancellation = CancellationToken::new();
-        self.open_project_server_until_cancelled(handshake, &cancellation)
+        self.open_project_server_until_cancelled(handshake, &cancellation, None)
             .await
     }
 
-    #[tracing::instrument(name = "daemon.engine.open_project_server", level = "trace", skip_all)]
-    pub(super) async fn open_project_server_until_cancelled(
-        &self,
-        handshake: &DaemonHandshake,
-        cancellation: &CancellationToken,
-    ) -> Result<(ProjectServerKey, PathBuf, Arc<crate::mcp::McpServer>, bool)> {
-        self.open_project_server_until_cancelled_inner(handshake, cancellation)
-            .await
-    }
-
-    fn open_project_server_until_cancelled_inner<'a>(
+    pub(super) fn open_project_server_until_cancelled<'a>(
         &'a self,
         handshake: &'a DaemonHandshake,
         cancellation: &'a CancellationToken,
+        hook_recovery: Option<Arc<Vec<tracedecay_hooks::HookConfigurationSnapshotV1>>>,
     ) -> OpenProjectServerFutureV1<'a> {
-        // Erase the deeply nested future before it reaches the measured
-        // wrapper so every profiling feature can compute its layout.
-        Box::pin(async move {
+        // Erase the deeply nested project-open future so profiling features
+        // can compute its layout without retaining every nested frame.
+        let open = async move {
             let Some(project_path) = handshake.project_path.as_ref() else {
                 return Err(TraceDecayError::Config {
                     message: "project server requested without project_path".to_string(),
@@ -808,7 +804,8 @@ impl DaemonEngine {
                 &self.http_application_registry,
                 &canonical_project_path,
                 handshake,
-                ProductionProjectCompositionRuntime::Unix(Box::new(self.clone())),
+                ProductionProjectCompositionRuntime::Unix(Box::new(self.clone()))
+                    .with_hook_recovery(hook_recovery),
                 cancellation,
                 #[cfg(test)]
                 Some(&self.project_open_attempts),
@@ -828,7 +825,11 @@ impl DaemonEngine {
                 composition.server,
                 composition.inserted,
             ))
-        })
+        };
+        Box::pin(tracing::Instrument::instrument(
+            open,
+            tracing::trace_span!("daemon.engine.open_project_server"),
+        ))
     }
 
     pub(super) fn project_route(
@@ -858,8 +859,8 @@ impl DaemonEngine {
         server: Arc<crate::mcp::McpServer>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Arc<crate::mcp::McpServer>> + Send + '_>>
     {
-        // Erase the deeply nested future before it reaches the measured
-        // wrapper so every profiling feature can compute its layout.
+        // Erase the deeply nested project-open future so profiling features
+        // can compute its layout without retaining every nested frame.
         Box::pin(async move {
             // A freshly-handshaken project should be watched even on a cache hit
             // (the watcher may have started after this server was cached).
@@ -968,8 +969,8 @@ impl DaemonEngine {
         acquire_new: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = MaintenanceRekeyOutcome> + Send + 'a>>
     {
-        // Erase the deeply nested future before it reaches the measured
-        // wrapper so every profiling feature can compute its layout.
+        // Erase the deeply nested project-open future so profiling features
+        // can compute its layout without retaining every nested frame.
         Box::pin(async move {
             let transition = self.maintenance_transition_gate(old_key).await;
             let _transition = transition.lock().await;

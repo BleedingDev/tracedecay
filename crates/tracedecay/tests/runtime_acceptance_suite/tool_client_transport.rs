@@ -318,10 +318,18 @@ fn generic_tool_accepts_slow_byte_stream() {
         &project,
         1,
         |mut stream, request, scope| {
-            for byte in response_bytes(&request, scope, "slow-ok") {
+            // Pace bytes against a fixed schedule rather than sleeping a fixed
+            // gap after each one: platforms with coarse sleep granularity
+            // (macOS) would otherwise stretch the stream by every oversleep.
+            let started = Instant::now();
+            for (sent, byte) in response_bytes(&request, scope, "slow-ok")
+                .into_iter()
+                .enumerate()
+            {
                 stream.write_all(&[byte]).expect("write slow byte");
                 stream.flush().expect("flush slow byte");
-                std::thread::sleep(Duration::from_millis(2));
+                let next = started + Duration::from_millis(2) * (sent as u32 + 1);
+                std::thread::sleep(next.saturating_duration_since(Instant::now()));
             }
         },
     );

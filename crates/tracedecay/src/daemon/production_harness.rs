@@ -1280,11 +1280,31 @@ impl Drop for ProductionProjectCompositionHarnessV1 {
         let Some(resources) = self.resources.take() else {
             return;
         };
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(tracing::Instrument::instrument(
-                shutdown_production_project_harness(resources),
-                tracing::trace_span!("daemon.harness.shutdown"),
-            ));
+        // Run the shutdown to completion on its own runtime. The caller's
+        // runtime is usually a test's, which ends right after this drop and
+        // would cancel a shutdown spawned onto it midway; the store owners it
+        // never reached then kept their SQLite worker threads, files, and
+        // runtimes alive for the rest of the process (macOS refused every
+        // later spawn once descriptors passed OPEN_MAX). Not joined: a
+        // current-thread caller could not drive its own tasks while blocked
+        // here, and those tasks resolve as cancelled once it ends.
+        let shutdown = tracing::Instrument::instrument(
+            shutdown_production_project_harness(resources),
+            tracing::trace_span!("daemon.harness.shutdown"),
+        );
+        let spawned = std::thread::Builder::new()
+            .name("tracedecay-harness-shutdown".to_owned())
+            .spawn(move || {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime.block_on(shutdown),
+                    Err(error) => tracing::warn!(%error, "harness shutdown runtime unavailable"),
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, "harness shutdown thread unavailable");
         }
     }
 }

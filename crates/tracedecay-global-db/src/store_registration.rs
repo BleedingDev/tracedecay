@@ -10,6 +10,7 @@ use tracedecay_runtime_core::branch_meta;
 use tracedecay_runtime_core::storage::{self, StoreLayout};
 use tracedecay_runtime_core::tracedecay::current_timestamp;
 
+use crate::project_registry::ProjectIdentityAliasKind;
 use crate::{GraphScopeUpsert, RegisteredGlobalDb, StoreArtifactUpsert, StoreInstanceUpsert};
 
 /// Cheap fingerprint of everything that would change what
@@ -57,13 +58,15 @@ fn registration_digest_matches(
 /// this process registered exactly this digest once, not that the registry
 /// still holds it, a sibling process, the CLI, or any out-of-band upsert can
 /// re-pin `canonical_root` afterwards. One indexed point-read keeps the skip
-/// honest before it bypasses the stale-canonical-root repair below; the skip
+/// honest before it bypasses the stale-canonical-root repair below. An exact
+/// checkout alias lookup also proves this path was durably enrolled; the skip
 /// still avoids the registry write lock and every upsert.
 async fn cached_registration_is_current(
     global_db: &RegisteredGlobalDb,
     project_id: &str,
     digest: &RegistrationDigest,
     registration_root: &Path,
+    project_root: &Path,
 ) -> Result<bool> {
     {
         let cache = LAST_REGISTERED_DIGEST
@@ -77,8 +80,18 @@ async fn cached_registration_is_current(
         .get_code_project(project_id)
         .await?
         .map(|record| record.canonical_root);
-    Ok(registered_root.as_deref()
-        == Some(RegisteredGlobalDb::canonical_project_key(registration_root).as_str()))
+    if registered_root.as_deref()
+        != Some(RegisteredGlobalDb::canonical_project_key(registration_root).as_str())
+    {
+        return Ok(false);
+    }
+    // The shared-store digest does not prove this exact checkout was enrolled.
+    // A warmed primary must not bypass a linked checkout's durable path alias.
+    Ok(global_db
+        .project_id_by_path_alias(project_root, ProjectIdentityAliasKind::ProjectRoot)
+        .await?
+        .as_deref()
+        == Some(project_id))
 }
 
 fn artifact_mtime(path: &Path) -> Option<SystemTime> {
@@ -154,14 +167,30 @@ pub async fn register_project_store(
     let default_branch = meta.as_ref().map(|meta| meta.default_branch.as_str());
     let registration_root = primary_root.as_deref().unwrap_or(project_root);
 
-    if cached_registration_is_current(global_db, project_id, &digest, registration_root).await? {
+    if cached_registration_is_current(
+        global_db,
+        project_id,
+        &digest,
+        registration_root,
+        project_root,
+    )
+    .await?
+    {
         return Ok(());
     }
 
     let _registry_write = REGISTRY_WRITE_LOCK.lock().await;
     // Re-check under the write lock: a concurrent writable open may have
     // just registered the same digest while we were computing ours.
-    if cached_registration_is_current(global_db, project_id, &digest, registration_root).await? {
+    if cached_registration_is_current(
+        global_db,
+        project_id,
+        &digest,
+        registration_root,
+        project_root,
+    )
+    .await?
+    {
         return Ok(());
     }
 

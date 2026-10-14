@@ -27,7 +27,7 @@ const MAX_CHECKPOINT_BYTES: usize = (MAX_SPOOL_BYTES_PER_HOST as usize) * 4;
 const MAX_TRANSITION_BYTES: usize = 16 * 1024;
 pub(super) const CHECKPOINT_MAGIC: &[u8; 4] = b"TDHC";
 pub(super) const CHECKPOINT_HEADER_BYTES: usize = 4 + 2 + 8;
-pub(super) const CHECKPOINT_ENTRY_BYTES: usize = 100;
+pub(super) const CHECKPOINT_ENTRY_BYTES: usize = 132;
 // Bound suffix validation by both ordinary frame count and unusually large
 // payload bytes while amortizing each full checkpoint publication.
 pub(super) const CHECKPOINT_REWRITE_FRAME_THRESHOLD: u32 = 64;
@@ -579,6 +579,8 @@ fn encode_checkpoint_entry(record: &PendingRecordV1, output: &mut Vec<u8>) {
     output.extend_from_slice(&record.protected_session_id);
     output.extend_from_slice(&record.event_id);
     output.extend_from_slice(&record.checksum);
+    output.extend_from_slice(&record.project_id);
+    output.extend_from_slice(&record.worktree_id);
 }
 
 fn decode_checkpoint_entry(bytes: &[u8], file_offset: u64) -> Option<PendingRecordV1> {
@@ -593,6 +595,8 @@ fn decode_checkpoint_entry(bytes: &[u8], file_offset: u64) -> Option<PendingReco
         file_offset,
         event_id: bytes[52..68].try_into().ok()?,
         checksum: bytes[68..100].try_into().ok()?,
+        project_id: bytes[100..116].try_into().ok()?,
+        worktree_id: bytes[116..132].try_into().ok()?,
         envelope: None,
         native_lifecycle: None,
     })

@@ -11,7 +11,6 @@ use std::os::unix::fs::MetadataExt;
 
 use sha2::{Digest, Sha256};
 use tracedecay_domain::{ObservationOrderingDomainV1, ObservationSourceCursorV1};
-#[cfg(test)]
 use tracedecay_private_fs::ChangeClockReading;
 use tracedecay_private_fs::RewriteWitness;
 
@@ -191,6 +190,22 @@ pub(in crate::runtime) fn jsonl_change_token_settled(token: JsonlFileChangeToken
     token
         .changed_nanos
         .is_some_and(tracedecay_private_fs::change_time_settled)
+}
+
+/// Whether `token` had already fallen behind the change clock at `reading`.
+///
+/// Take `reading` before the stat that produced `token` and before reading
+/// the bytes it is to vouch for. Settling against a reading taken after those
+/// reads proves nothing: a same-length rewrite inside the stamp's quantum can
+/// land between the read and the reading, share the stamp, and then look
+/// settled once the clock ticks.
+pub(in crate::runtime) fn jsonl_change_token_settled_at(
+    token: JsonlFileChangeToken,
+    reading: ChangeClockReading,
+) -> bool {
+    token
+        .changed_nanos
+        .is_some_and(|changed_at| reading.settles(changed_at))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

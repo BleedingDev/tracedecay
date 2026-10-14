@@ -32,6 +32,7 @@ use tracedecay_session_temporal_store::SessionTemporalAccess;
 
 mod mount;
 mod receipt;
+use super::lcm_summary_convergence::error_code;
 pub use mount::{
     LCM_MAX_BYTES, LCM_MAX_RESULTS, LCM_MAX_WORK_UNITS, MountedLcmAuthorityPort,
     mount_registered_lcm_authority,
@@ -495,12 +496,16 @@ impl DaemonLcmAuthority {
                 None,
                 None,
             ),
-            Ok(Err(_)) => terminal_failure(
-                context,
-                LcmAuthorityOperation::Compact,
-                started_at,
-                "daemon compaction failed",
-            ),
+            Ok(Err(error)) => {
+                let reason_code = error_code(&error);
+                tracing::warn!(reason_code, "daemon compaction failed");
+                terminal_failure(
+                    context,
+                    LcmAuthorityOperation::Compact,
+                    started_at,
+                    reason_code,
+                )
+            }
             Err(interruption) => terminal_interruption(
                 context,
                 LcmAuthorityOperation::Compact,

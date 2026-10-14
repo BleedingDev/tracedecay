@@ -29,6 +29,7 @@ use tracedecay_domain::{
     ObservationSourceCursorV1, ObservationSourceGenerationV1, ObservationSourceIdentityV1,
     ObservationSourceRangeV1, ProjectId, ProviderId, RetentionClass, SessionId,
 };
+use tracedecay_global_db::observation::canonical_lifecycle::CanonicalContentGcState;
 use tracedecay_global_db::observation::retention::ObservationRetentionConfig;
 use tracedecay_global_db::tests::harness::{HostAdmissionTestRuntimeV1, writer_telemetry};
 use tracedecay_global_db::{RegisteredGlobalDb, RegisteredGlobalDbLeaseV1};
@@ -754,6 +755,31 @@ pub async fn retention_writer_steps(database: &RegisteredGlobalDb) -> u64 {
         "every retention transaction must commit"
     );
     steps_after - steps_before
+}
+
+/// Completes historical reconstruction through the same bounded retention
+/// authority as the measured tick, before comparing ordinary steady-state work.
+pub async fn settle_retention(database: &RegisteredGlobalDb) {
+    for _ in 0..MAX_REFRESH_PASSES {
+        let report = run_registered_store_retention(
+            database,
+            &LcmRetentionConfig::default(),
+            &ObservationRetentionConfig::default(),
+            RETENTION_NOW,
+        )
+        .await;
+        assert!(report.succeeded(), "historical retention must succeed");
+        let canonical = report.canonical_gc.unwrap();
+        if canonical.state == CanonicalContentGcState::Ready
+            && !canonical.pending
+            && report
+                .observations
+                .is_none_or(|result| !result.unwrap().pending)
+        {
+            return;
+        }
+    }
+    panic!("bounded historical retention did not settle");
 }
 
 /// Measures one retention tick between ordered writer round trips. A periodic WAL

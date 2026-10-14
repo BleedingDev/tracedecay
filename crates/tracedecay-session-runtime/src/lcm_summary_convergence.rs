@@ -2,6 +2,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use tracedecay_contracts::automation::AgentTaskFailureClass;
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 use tracedecay_lcm::summary_convergence::{
     LcmSummaryConvergenceCandidate, LcmSummaryConvergenceQueueState,
@@ -171,7 +172,7 @@ async fn backfill_queue(
 async fn requeue_parked_sessions(
     database: &RegisteredGlobalDbLeaseV1,
 ) -> Result<tracedecay_lcm::summary_convergence::LcmParkedRequeuePage, LcmError> {
-    let binding = crate::lcm_summarization::summarizer_binding_identity(database)?;
+    let binding = crate::lcm_summarization::summarizer_binding_identity(database).await?;
     let snapshot = database
         .read_connection()
         .background()
@@ -451,7 +452,11 @@ async fn record_candidate_error(
     let (state, disposition, failure_count, next_attempt_at_ms) = if is_retryable(&error) {
         let failure_count = candidate.failure_count.saturating_add(1);
         let class = match error {
-            LcmError::DeadlineExceeded => SessionTemporalRefreshRetryClass::Deadline,
+            LcmError::DeadlineExceeded
+            | LcmError::SummarizerFailed {
+                class: AgentTaskFailureClass::Timeout,
+                ..
+            } => SessionTemporalRefreshRetryClass::Deadline,
             _ => SessionTemporalRefreshRetryClass::Storage,
         };
         let delay = session_refresh_retry_delay(class, failure_count);
@@ -497,6 +502,9 @@ async fn record_candidate_error(
 }
 
 fn is_retryable(error: &LcmError) -> bool {
+    if let LcmError::SummarizerFailed { class, .. } = error {
+        return class.is_retryable();
+    }
     matches!(
         error,
         LcmError::Db(_)
@@ -505,12 +513,13 @@ fn is_retryable(error: &LcmError) -> bool {
             | LcmError::StaleSummaryGeneration { .. }
             | LcmError::StaleRawRevision { .. }
             | LcmError::StaleRawProtectionSource { .. }
+            | LcmError::StaleSummarySourceContent
             | LcmError::StaleSummarySourceRange { .. }
             | LcmError::LifecycleStateNotFound
     )
 }
 
-fn error_code(error: &LcmError) -> &'static str {
+pub(super) fn error_code(error: &LcmError) -> &'static str {
     match error {
         LcmError::ProfileResetRequired { .. } => "profile_reset_required",
         LcmError::InvalidPayloadRef => "invalid_payload_ref",
@@ -532,12 +541,14 @@ fn error_code(error: &LcmError) -> &'static str {
         LcmError::StaleSummaryGeneration { .. } => "stale_summary_generation",
         LcmError::StaleRawRevision { .. } => "stale_raw_revision",
         LcmError::StaleRawProtectionSource { .. } => "stale_raw_protection_source",
+        LcmError::StaleSummarySourceContent => "stale_summary_source_content",
         LcmError::StaleSummarySourceRange { .. } => "stale_summary_source_range",
         LcmError::LifecycleStateNotFound => "lifecycle_state_not_found",
         LcmError::NotASessionStore => "not_a_session_store",
         LcmError::Cancelled => "cancelled",
         LcmError::DeadlineExceeded => "deadline_exceeded",
         LcmError::BudgetExhausted => "budget_exhausted",
+        LcmError::SummarizerFailed { reason, .. } => reason,
         LcmError::SanitizationRefused { .. } => "sanitization_refused",
         LcmError::Db(_) => "storage_unavailable",
         LcmError::Io(_) => "io_unavailable",
@@ -634,6 +645,7 @@ fn duration_millis(duration: Duration) -> Result<i64, LcmError> {
 #[cfg(test)]
 mod tests {
     use super::{is_retryable, load_candidate};
+    use tracedecay_contracts::automation::AgentTaskFailureClass;
     use tracedecay_global_db::tests::harness::RegisteredGlobalDbHarness;
     use tracedecay_lcm::LcmError;
     use tracedecay_runtime_core::db::engine::{Error as EngineError, params};
@@ -674,6 +686,35 @@ mod tests {
             snapshot.commit().await.unwrap();
         }
         assert!(load_candidate(database, 0).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn configured_executor_failure_keeps_its_retry_classification() {
+        for class in [
+            AgentTaskFailureClass::Retryable,
+            AgentTaskFailureClass::Timeout,
+            AgentTaskFailureClass::Unavailable,
+            AgentTaskFailureClass::Disconnected,
+        ] {
+            assert!(is_retryable(&LcmError::SummarizerFailed {
+                class,
+                reason: "codex_app_server_unavailable"
+            }));
+        }
+        for class in [
+            AgentTaskFailureClass::Permanent,
+            AgentTaskFailureClass::Denied,
+            AgentTaskFailureClass::MalformedOutput,
+            AgentTaskFailureClass::InputTooLarge,
+        ] {
+            assert!(!is_retryable(&LcmError::SummarizerFailed {
+                class,
+                reason: "codex_app_server_denied"
+            }));
+        }
+        assert!(!is_retryable(&LcmError::ImmutableSummaryConflict {
+            summary_id: "immutable".to_owned()
+        }));
     }
 
     #[test]

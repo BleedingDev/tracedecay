@@ -73,6 +73,10 @@ lang-markdown = ["dep:markdown-grammar"]
 [dependencies]
 dart-grammar = { path = "dart-grammar", optional = true }
 markdown-grammar = { path = "markdown-grammar", optional = true }
+
+# Standalone: a temp root inside a checkout (Bazel on Windows) must not be
+# claimed by the enclosing workspace.
+[workspace]
 """
 
 EXTRACTION_BUILD_LIB = """#[cfg(feature = "lang-dart")]

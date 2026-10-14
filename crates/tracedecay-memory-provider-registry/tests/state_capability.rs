@@ -151,8 +151,15 @@ fn an_unusable_state_root_is_refused_at_configuration() {
         );
     }
     let base = scratch("root-with-dot-segment");
+    // Spelled as text: `PathBuf::join` resolves `..` against a Windows
+    // verbatim (`\\?\`) base, which would leave no parent segment to refuse.
+    let mut escaping = base.clone().into_os_string();
+    escaping.push(format!(
+        "{sep}..{sep}elsewhere",
+        sep = std::path::MAIN_SEPARATOR
+    ));
     assert!(
-        ProviderStateAuthorityV1::new(base.join("..").join("elsewhere")).is_err(),
+        ProviderStateAuthorityV1::new(PathBuf::from(escaping)).is_err(),
         "a root carrying a parent segment must be refused"
     );
     assert!(ProviderStateAuthorityV1::new(base.join("provider-state")).is_ok());

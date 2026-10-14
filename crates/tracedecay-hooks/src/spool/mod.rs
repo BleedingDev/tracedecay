@@ -71,7 +71,9 @@ const SPOOL_MAGIC: &[u8; 4] = b"TDH2";
 const SPOOL_FORMAT_VERSION: u16 = 1;
 const SPOOL_META_VERSION: u16 = 1;
 // Member filenames retain the spool layout generation; this header version owns the body shape.
-const CHECKPOINT_FORMAT_VERSION: u16 = 3;
+// The checkpoint is derived from the sole records authority. Older indexes
+// lack scope metadata and are rebuilt through the existing full-scan path.
+const CHECKPOINT_FORMAT_VERSION: u16 = 4;
 const FRAME_LENGTH_BYTES: usize = 4;
 const FRAME_HEADER_BYTES: usize = 4 + 2 + 8 + 8 + 32 + 4;
 const FRAME_CHECKSUM_BYTES: usize = framed_log::CHECKSUM_BYTES;
@@ -144,6 +146,12 @@ impl HookSpoolV1 {
     /// that every physical record is still pending; opening under the writer
     /// lease remains the authority for acknowledgement and recovery state.
     pub fn has_records(root: &Path) -> Result<bool, HookSpoolError> {
+        if !tracedecay_private_fs::framed_log::validate_directory_or_missing(root)
+            .map_err(|_| HookSpoolError::UnsafePath)?
+        {
+            return Ok(false);
+        }
+        ensure_existing_private_root(root)?;
         let path = records_path(root);
         if !validate_regular_or_missing(&path)? {
             return Ok(false);
@@ -645,19 +653,30 @@ impl HookSpoolV1 {
         now: UtcMicros,
         requested_sessions: usize,
     ) -> Result<Vec<HookReplayBatchV1>, HookSpoolError> {
+        self.claim_replay_batches_in_scope(now, requested_sessions, None)
+    }
+
+    /// Scope selection precedes the fair session bound. A sibling cannot
+    /// consume this worktree's slots or rotate its cursor past all owned work.
+    pub fn claim_replay_batches_in_scope(
+        &mut self,
+        now: UtcMicros,
+        requested_sessions: usize,
+        scope: Option<([u8; 16], [u8; 16])>,
+    ) -> Result<Vec<HookReplayBatchV1>, HookSpoolError> {
         self.ensure_healthy()?;
         let session_cap = requested_sessions.min(MAX_REPLAY_SESSIONS);
         if session_cap == 0 {
             return Ok(Vec::new());
         }
-        let candidates = replayable_sessions(&self.pending, now);
+        let candidates = replayable_sessions(&self.pending, now, scope);
         let ordered = round_robin_after(&candidates, self.round_robin_after);
         let mut selected = Vec::new();
         for session in ordered {
             if selected.len() == session_cap || self.replay_claims.contains_key(&session) {
                 continue;
             }
-            let indices = batch_for_session(&self.pending, session, now)?;
+            let indices = batch_for_session(&self.pending, session, now, scope)?;
             if indices.is_empty() {
                 continue;
             }
@@ -707,6 +726,37 @@ impl HookSpoolV1 {
             .ok_or(HookSpoolError::ReplayClaimUnknown)?;
         self.replay_claims.remove(&session);
         Ok(())
+    }
+
+    /// Counts exact worktree scope from the validated bounded checkpoint index.
+    pub fn pending_scope_count(&self, project_id: [u8; 16], worktree_id: [u8; 16]) -> usize {
+        self.pending
+            .iter()
+            .filter(|record| record.project_id == project_id && record.worktree_id == worktree_id)
+            .count()
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Hydrates only records of an enrolled exact scope for reopen validation.
+    pub fn pending_records_in_scope(
+        &mut self,
+        project_id: [u8; 16],
+        worktree_id: [u8; 16],
+    ) -> Result<Vec<HookSpoolRecordV1>, HookSpoolError> {
+        self.ensure_healthy()?;
+        let indices = self
+            .pending
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                (record.project_id == project_id && record.worktree_id == worktree_id)
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        self.hydrate_many(&indices)
     }
 
     /// Every pending record in append order, for adopting this spool's

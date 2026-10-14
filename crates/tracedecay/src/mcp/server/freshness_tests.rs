@@ -3,12 +3,22 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
+use tracedecay_application::observability::{
+    BoundedObservabilityProducerV1, DeliverySettlementAuthorityV1, ObservabilityProducerIdentityV1,
+};
 use tracedecay_contracts::code_index_freshness::{
     CODE_INDEX_PUBLICATION_AUTHORITY_CORRUPT, CodeIndexConvergenceParkedV1,
 };
+use tracedecay_domain::{NativeHostIdentityV1, UtcMicros};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
+use tracedecay_hooks::{
+    HOOK_EVENT_SCHEMA_VERSION, HookBoundaryV1, HookConfigurationFileReaderV1, HookEventEnvelopeV2,
+    HookEventV2, HookOrderingV1, HookSpoolConfigV1, HookSpoolV1, hook_configuration_path,
+    hook_v2_spool_root,
+};
 use tracedecay_mcp::tool_error_response;
 use tracedecay_project::project::TraceDecay;
+use tracedecay_sessions::admission::HostAdmissionScope;
 use tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1;
 
 struct FreshnessRuntime {
@@ -94,26 +104,16 @@ async fn init_indexed_repo() -> (TraceDecay, TempDir, FreshnessFixtureAuthority)
     )
 }
 
-/// Serve-old/await-new: the request that notices the drift answers on the
-/// snapshot it already had, and the reopen (plus its owner reconcile) lands
-/// behind it.
-#[tokio::test]
-async fn branch_drift_serves_the_old_snapshot_until_the_swap_lands() {
-    let (cg, dir, fixture_authority) = init_indexed_repo().await;
-    let root = dir.path();
-    cg.checkpoint().await.unwrap();
-    let layout = cg.store_layout().clone();
-    drop(cg);
-
+fn prepare_feature_branch(data_root: &std::path::Path, root: &std::path::Path) {
     let mut meta = tracedecay_runtime_core::branch_meta::BranchMeta::new("main");
     meta.add_branch("feature", "main");
-    tracedecay_runtime_core::branch_meta::save_branch_meta(&layout.data_root, &meta).unwrap();
+    tracedecay_runtime_core::branch_meta::save_branch_meta(data_root, &meta).unwrap();
     // `add_branch` only admits the branch; until its exact graph source is
     // published the branch is still indexing and a reopen legitimately keeps
     // serving the nearest published ancestor (`main`). This test pins the
     // serve-old/await-new swap, so publish the feature provenance up front.
     let published = tracedecay_runtime_core::branch_meta::publish_graph_source(
-        &layout.data_root,
+        data_root,
         "feature",
         None,
         tracedecay_runtime_core::branch_meta::BranchGraphSourceDraftV1 {
@@ -136,33 +136,93 @@ async fn branch_drift_serves_the_old_snapshot_until_the_swap_lands() {
 
     git(root, &["checkout", "-q", "-b", "feature"]);
     git(root, &["checkout", "-q", "main"]);
-    let main = fixture_authority
+}
+
+async fn open_branch_tracked_graph(
+    graph: TraceDecay,
+    root: &std::path::Path,
+    fixture: &FreshnessFixtureAuthority,
+) -> TraceDecay {
+    graph.checkpoint().await.unwrap();
+    let data_root = graph.store_layout().data_root.clone();
+    drop(graph);
+    // Init resolves provenance before bootstrapping metadata. Mount through
+    // registered open after publication, as a long-lived project server does.
+    prepare_feature_branch(&data_root, root);
+    let graph = fixture
         ._runtime
         .open_project_graph_for_test(
             root,
             tracedecay_project::project::TraceDecayOpenOptions::for_profile(
-                &tracedecay_runtime_core::config::ProfileRoot::new(
-                    fixture_authority.profile.path(),
-                ),
+                &tracedecay_runtime_core::config::ProfileRoot::new(fixture.profile.path()),
             ),
         )
         .await
         .unwrap();
+    assert_eq!(graph.active_branch(), Some("main"));
+    assert_eq!(graph.serving_branch(), Some("main"));
+    graph
+}
+
+/// Serve-old/await-new: the request that notices the drift answers on the
+/// snapshot it already had, and the reopen (plus its owner reconcile) lands
+/// behind it.
+#[tokio::test]
+async fn branch_drift_serves_the_old_snapshot_until_the_swap_lands() {
+    let (cg, dir, fixture_authority) = init_indexed_repo().await;
+    let root = dir.path();
+    let main = open_branch_tracked_graph(cg, root, &fixture_authority).await;
+    let layout = main.store_layout().clone();
     let observed = Arc::new(Mutex::new(Vec::new()));
+    let block_reconcile = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reconcile_entered = Arc::new(tokio::sync::Notify::new());
     let callback: DatabaseOwnerReconciler = {
         let observed = Arc::clone(&observed);
+        let block_reconcile = Arc::clone(&block_reconcile);
+        let reconcile_entered = Arc::clone(&reconcile_entered);
         Arc::new(move |fresh| {
             let observed = Arc::clone(&observed);
+            let block_reconcile = Arc::clone(&block_reconcile);
+            let reconcile_entered = Arc::clone(&reconcile_entered);
             Box::pin(async move {
                 observed.lock().unwrap().push(fresh.db_path());
+                if block_reconcile.load(Ordering::Acquire) {
+                    reconcile_entered.notify_one();
+                    std::future::pending::<()>().await;
+                }
             })
         })
     };
-    let server = McpServer::new_with_context(
-        McpServerConstructionContext::direct(main, None).with_database_owner_reconciler(callback),
-    )
-    .await;
-
+    let sessions = fixture_authority
+        ._runtime
+        .registered_database_lease(HostAdmissionScope::Project)
+        .unwrap()
+        .clone();
+    let identity = ObservabilityProducerIdentityV1 {
+        authorized_scope_ref: "project.mcp-freshness".to_owned(),
+        process_boot_id: "boot:mcp-branch-reopen".to_owned(),
+        producer_revision: "branch-reopen-producer.v1".to_owned(),
+        configuration_revision: "branch-reopen-config.v1".to_owned(),
+        policy_revision: "branch-reopen-policy.v1".to_owned(),
+    };
+    let producer = Arc::new(
+        BoundedObservabilityProducerV1::start(sessions.clone(), identity.clone(), 8).unwrap(),
+    );
+    let delivery = Arc::new(
+        DeliverySettlementAuthorityV1::new(sessions.clone(), Arc::clone(&producer), identity)
+            .unwrap(),
+    );
+    let cpu = Arc::new(
+        tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1::new(
+            std::num::NonZeroUsize::new(1).unwrap(),
+        ),
+    );
+    let mut context =
+        McpServerConstructionContext::direct(main, None).with_database_owner_reconciler(callback);
+    context.project_session_db = Some(sessions.clone());
+    context.background_cpu = Some(Arc::clone(&cpu));
+    let server = McpServer::new_with_context(context).await;
+    let previous = server.cg().await;
     git(root, &["checkout", "-q", "feature"]);
     let before = server.branch_reopens_completed();
     let served = server.reopen_if_branch_drifted().await;
@@ -188,7 +248,256 @@ async fn branch_drift_serves_the_old_snapshot_until_the_swap_lands() {
     let fresh = server.reopen_if_branch_drifted().await;
     assert_eq!(fresh.serving_branch(), Some("feature"));
     assert_eq!(observed.lock().unwrap().as_slice(), &[fresh.db_path()]);
+    assert!(
+        !crate::daemon::hook_v2_replay_consumer::hook_v2_replay_consumer_registered(
+            &layout.data_root
+        ),
+        "dependent replay ownership has not mounted yet"
+    );
+    assert!(
+        server
+            .register_hook_replay_owner(Arc::clone(&delivery), sessions, cpu)
+            .await
+    );
+    // Owner setup began with `previous`, but mounts only after the swap.
+    // The receipt must belong to the current graph so subsequent transfer
+    // and final retirement both compare against the right owner.
+    let core = McpServer::new_with_context(McpServerConstructionContext::direct(
+        Arc::clone(&fresh),
+        None,
+    ))
+    .await;
+    core.shutdown().await;
+    assert!(
+        crate::daemon::hook_v2_replay_consumer::hook_v2_replay_consumer_registered(
+            &layout.data_root
+        ),
+        "retiring Core must preserve Full's consumer over the same graph"
+    );
+    crate::daemon::hook_v2_replay_consumer::shutdown_hook_v2_replay_consumer_for_graph(&previous)
+        .await;
+    assert!(
+        crate::daemon::hook_v2_replay_consumer::hook_v2_replay_consumer_registered(
+            &layout.data_root
+        )
+    );
+    let host = NativeHostIdentityV1::CursorDesktop;
+    let worktree = tracedecay_agent_hosts::hooks::hook_worktree_id_for_layout(
+        &crate::hook_runtime(tracedecay_runtime_core::config::ProfileRoot::new(
+            fixture_authority.profile.path(),
+        )),
+        fresh.hook_store_layout(),
+    )
+    .unwrap();
+    let publication = HookConfigurationFileReaderV1::new(hook_configuration_path(
+        &layout.data_root,
+        worktree,
+        host,
+    ));
+    let snapshot = publication.load(host).unwrap().unwrap();
+    let now = tracedecay_runtime_core::tracedecay::saturating_utc_now();
+    let envelope = HookEventEnvelopeV2 {
+        schema_version: HOOK_EVENT_SCHEMA_VERSION,
+        event_id: [81; 16],
+        producer: host,
+        protected_session_id: [82; 32],
+        project_id: snapshot.binding.project_id,
+        repository_id: snapshot.binding.repository_id,
+        worktree_id: snapshot.binding.worktree_id,
+        worktree_epoch: snapshot.binding.worktree_epoch,
+        binding_token: snapshot.binding.binding_token,
+        ordering: HookOrderingV1::Unknown,
+        observed_at: now,
+        event: HookEventV2::SessionBoundary {
+            boundary: HookBoundaryV1::Start,
+        },
+    };
+    let spool_root = hook_v2_spool_root(&layout.data_root, host);
+    let (mut spool, _) =
+        HookSpoolV1::open(&spool_root, HookSpoolConfigV1::stock(host), now).unwrap();
+    spool
+        .append(envelope.clone(), &snapshot.binding, now)
+        .unwrap();
+    spool.commit().unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while HookSpoolV1::has_records(&spool_root).unwrap() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the branch successor must replay the queued envelope");
+    let duplicate =
+        tracedecay_mcp::handlers::hook_runtime::admit_hook_v2_replayed_envelope_with_lifecycle(
+            &fresh,
+            &envelope,
+            None,
+            None,
+            server.project_session_db().unwrap().as_ref(),
+            &server.background_cpu_authority().unwrap(),
+            now,
+        )
+        .await;
+    assert!(matches!(
+        duplicate,
+        tracedecay_mcp::handlers::hook_runtime::HookV2AdmissionOutcomeV1::ExactDuplicate { .. }
+    ));
+    let later = UtcMicros(snapshot.expires_at.0 + 1);
+    assert_eq!(
+        previous.renew_hook_bindings(later).unwrap().len(),
+        tracedecay_agent_hosts::hooks::NATIVE_HOOK_HOSTS.len()
+    );
+    assert_eq!(fresh.renew_hook_bindings(later).unwrap(), vec![]);
+    let renewed = publication.load(host).unwrap().unwrap();
+    assert_eq!(renewed.binding, snapshot.binding);
+    assert_eq!(renewed.revision, snapshot.revision);
+    assert_eq!(renewed.published_at, later);
+    block_reconcile.store(true, Ordering::Release);
+    git(root, &["checkout", "-q", "main"]);
+    let served = server.reopen_if_branch_drifted().await;
+    assert!(Arc::ptr_eq(&served, &fresh));
+    tokio::time::timeout(Duration::from_secs(30), reconcile_entered.notified())
+        .await
+        .expect("the second branch transfer must land before retirement");
+    let retiring = server.cg().await;
+    assert_eq!(retiring.active_branch(), Some("main"));
+    assert!(!Arc::ptr_eq(&retiring, &fresh));
+    // Reconciliation is still in flight. Shutdown must close transfer
+    // admission and stop the graph actually swapped into this server.
     server.shutdown().await;
+    assert!(
+        !crate::daemon::hook_v2_replay_consumer::hook_v2_replay_consumer_registered(
+            &layout.data_root
+        )
+    );
+    drop(delivery);
+    producer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn automatic_branch_drift_preserves_a_revoked_peer_publication() {
+    for revocation in ["missing", "corrupt", "foreign"] {
+        let (graph, directory, fixture) = init_indexed_repo().await;
+        let graph = open_branch_tracked_graph(graph, directory.path(), &fixture).await;
+        let worktree = tracedecay_agent_hosts::hooks::hook_worktree_id_for_layout(
+            &crate::hook_runtime(tracedecay_runtime_core::config::ProfileRoot::new(
+                fixture.profile.path(),
+            )),
+            graph.hook_store_layout(),
+        )
+        .unwrap();
+        let publications = tracedecay_agent_hosts::hooks::NATIVE_HOOK_HOSTS
+            .iter()
+            .map(|host| {
+                let path =
+                    hook_configuration_path(&graph.hook_store_layout().data_root, worktree, *host);
+                (path.clone(), std::fs::read(path).unwrap())
+            })
+            .collect::<Vec<_>>();
+        let revoked = hook_configuration_path(
+            &graph.hook_store_layout().data_root,
+            worktree,
+            NativeHostIdentityV1::Codex,
+        );
+        let expected = match revocation {
+            "missing" => {
+                std::fs::remove_file(&revoked).unwrap();
+                None
+            }
+            "corrupt" => {
+                let bytes = b"invalid hook publication".to_vec();
+                std::fs::write(&revoked, &bytes).unwrap();
+                Some(bytes)
+            }
+            "foreign" => {
+                let mut snapshot = HookConfigurationFileReaderV1::new(revoked.clone())
+                    .load(NativeHostIdentityV1::Codex)
+                    .unwrap()
+                    .unwrap();
+                snapshot.binding.binding_token = [99; 32];
+                let bytes = serde_json::to_vec(&snapshot).unwrap();
+                std::fs::write(&revoked, &bytes).unwrap();
+                Some(bytes)
+            }
+            _ => unreachable!(),
+        };
+        let server = McpServer::new(graph, None).await;
+        let original = server.cg().await;
+        git(directory.path(), &["checkout", "-q", "feature"]);
+        assert!(
+            original.branch_drifted(),
+            "the checkout must trigger an actual reopen"
+        );
+        let before = server.branch_reopens_completed();
+        let served = server.reopen_if_branch_drifted().await;
+        assert!(Arc::ptr_eq(&served, &original));
+        assert!(
+            server
+                .wait_for_branch_reopen(before, Duration::from_secs(30))
+                .await
+        );
+        assert!(
+            Arc::ptr_eq(&server.cg().await, &original),
+            "{revocation} host publication must refuse the unattended successor"
+        );
+        assert_eq!(
+            std::fs::read(&revoked).ok(),
+            expected,
+            "{revocation} publication must remain byte-exact"
+        );
+        for (path, expected) in publications {
+            if path != revoked {
+                assert_eq!(std::fs::read(path).unwrap(), expected);
+            }
+        }
+        server.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn dropping_the_last_server_cancels_a_blocked_branch_reconcile() {
+    let (graph, directory, fixture) = init_indexed_repo().await;
+    let graph = open_branch_tracked_graph(graph, directory.path(), &fixture).await;
+    let (cancelled, cancellation) = tokio::sync::oneshot::channel::<()>();
+    let cancellation_owner = Arc::new(Mutex::new(Some(cancelled)));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let callback: DatabaseOwnerReconciler = {
+        let entered = Arc::clone(&entered);
+        Arc::new(move |_| {
+            let entered = Arc::clone(&entered);
+            let cancellation_owner = Arc::clone(&cancellation_owner);
+            Box::pin(async move {
+                let _cancellation = cancellation_owner.lock().unwrap().take().unwrap();
+                entered.notify_one();
+                std::future::pending::<()>().await;
+            })
+        })
+    };
+    let server = McpServer::new_with_context(
+        McpServerConstructionContext::direct(Arc::new(graph), None)
+            .with_database_owner_reconciler(callback),
+    )
+    .await;
+    let background_owner = Arc::downgrade(&server.background_tasks);
+    git(directory.path(), &["checkout", "-q", "feature"]);
+    assert!(
+        server.cg().await.branch_drifted(),
+        "the checkout must trigger an actual reopen"
+    );
+    server.reopen_if_branch_drifted().await;
+    tokio::time::timeout(Duration::from_secs(30), entered.notified())
+        .await
+        .expect("the real branch reconcile must be blocked before dropping the server");
+    drop(server);
+    assert!(
+        background_owner.upgrade().is_none(),
+        "the retained task must not own its JoinSet"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(30), cancellation)
+            .await
+            .expect("dropping the last server must abort its pending branch task")
+            .is_err()
+    );
 }
 
 // ---- D1: startup catch-up runs exactly once (test b) --------------

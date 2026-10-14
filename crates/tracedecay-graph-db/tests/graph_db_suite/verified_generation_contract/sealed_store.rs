@@ -911,7 +911,49 @@ impl tracing::Subscriber for PauseSnapshotRead {
 
 #[test]
 fn point_read_observes_sealed_store_installed_before_staging_gate_acquisition() {
-    for read_relation in [false, true] {
+    const CHILD_ENV: &str = "TRACEDECAY_GRAPH_DB_SEALED_ADOPTION_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let test_name = std::env::var("NEXTEST_TEST_NAME")
+            .ok()
+            .or_else(|| std::thread::current().name().map(str::to_owned))
+            .expect("the point-read child needs the libtest/nextest test name");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "the isolated point-read journey failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == format!("test {test_name} ... ok")),
+            "the child did not run the selected point-read journey: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        return;
+    }
+
+    // No sibling test or graph thread may register the shared lock callsite
+    // during tracing's initial single-dispatch window. Build both dispatches
+    // before any graph engine, then retain them through both reader joins.
+    let readers = [false, true].map(|read_relation| {
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let dispatch = tracing::Dispatch::new(PauseSnapshotRead {
+            reached: reached_tx,
+            resume: std::sync::Mutex::new(resume_rx),
+            paused: AtomicBool::new(false),
+        });
+        (read_relation, reached_rx, resume_tx, dispatch)
+    });
+    for (read_relation, reached_rx, resume_tx, dispatch) in &readers {
+        let read_relation = *read_relation;
         let temp = TempDir::new().unwrap();
         let registered = RegisteredGraph::new_mounted(temp.path()).unwrap();
         let mut authority = RelationalAuthority::default();
@@ -963,50 +1005,42 @@ fn point_read_observes_sealed_store_installed_before_staging_gate_acquisition() 
             .unwrap();
         assert!(!commit.snapshot.serves_from_sealed_store());
 
-        let (reached_tx, reached_rx) = mpsc::channel();
-        let (resume_tx, resume_rx) = mpsc::channel();
+        let reader_dispatch = dispatch.clone();
         let reader_snapshot = commit.snapshot.clone();
         let reader_identity = identity.clone();
         let reader = std::thread::spawn(move || {
-            tracing::subscriber::with_default(
-                PauseSnapshotRead {
-                    reached: reached_tx,
-                    resume: std::sync::Mutex::new(resume_rx),
-                    paused: AtomicBool::new(false),
-                },
-                || {
-                    if read_relation {
-                        let relation = reader_snapshot
-                            .relation(
-                                &GraphRelationRef::new(
-                                    reader_identity,
-                                    GraphRelationId::new("relation:a-b").unwrap(),
-                                ),
-                                Arc::new(TestCancellation),
-                            )?
-                            .expect("the adopted relation must resolve");
-                        assert_eq!(relation.from.identity.as_str(), "entity:a");
-                        assert_eq!(relation.to.identity.as_str(), "entity:b");
-                    } else {
-                        let entity = reader_snapshot
-                            .entity(
-                                &GraphEntityRef::new(
-                                    reader_identity,
-                                    GraphEntityId::new("entity:a").unwrap(),
-                                ),
-                                Arc::new(TestCancellation),
-                            )?
-                            .expect("the adopted entity must resolve");
-                        assert_eq!(
-                            entity
-                                .properties
-                                .get(&GraphPropertyName::new("marker").unwrap()),
-                            Some(&GraphProperty::String("adopted".to_owned()))
-                        );
-                    }
-                    Ok::<_, GraphDbError>(())
-                },
-            )
+            tracing::dispatcher::with_default(&reader_dispatch, || {
+                if read_relation {
+                    let relation = reader_snapshot
+                        .relation(
+                            &GraphRelationRef::new(
+                                reader_identity,
+                                GraphRelationId::new("relation:a-b").unwrap(),
+                            ),
+                            Arc::new(TestCancellation),
+                        )?
+                        .expect("the adopted relation must resolve");
+                    assert_eq!(relation.from.identity.as_str(), "entity:a");
+                    assert_eq!(relation.to.identity.as_str(), "entity:b");
+                } else {
+                    let entity = reader_snapshot
+                        .entity(
+                            &GraphEntityRef::new(
+                                reader_identity,
+                                GraphEntityId::new("entity:a").unwrap(),
+                            ),
+                            Arc::new(TestCancellation),
+                        )?
+                        .expect("the adopted entity must resolve");
+                    assert_eq!(
+                        entity
+                            .properties
+                            .get(&GraphPropertyName::new("marker").unwrap()),
+                        Some(&GraphProperty::String("adopted".to_owned()))
+                    );
+                }
+                Ok::<_, GraphDbError>(())
+            })
         });
         reached_rx
             .recv_timeout(std::time::Duration::from_secs(5))

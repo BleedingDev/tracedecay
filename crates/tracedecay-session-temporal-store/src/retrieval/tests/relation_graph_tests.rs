@@ -276,10 +276,12 @@ async fn seed_production_summary(
                 },
             },
             &ExecutionControl::default(),
+            None,
             || Ok(()),
         )
         .await
-        .expect("production summary publication");
+        .expect("production summary publication")
+        .0;
     assert_eq!(response.summary_nodes.len(), 1);
     response
         .summary_nodes
