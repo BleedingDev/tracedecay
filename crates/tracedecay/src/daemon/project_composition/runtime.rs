@@ -64,7 +64,10 @@ impl ProductionProjectCompositionRuntime {
     pub(super) fn hook_recovery(&self) -> Option<&[tracedecay_hooks::HookConfigurationSnapshotV1]> {
         match self {
             Self::HookReplay { publications, .. } => Some(publications.as_slice()),
-            _ => None,
+            #[cfg(unix)]
+            Self::Unix(_) => None,
+            #[cfg(any(not(unix), test, feature = "test-transport"))]
+            Self::Portable { .. } => None,
         }
     }
 

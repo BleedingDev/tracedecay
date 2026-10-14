@@ -313,31 +313,12 @@ async fn hook_recovery_publications_for_owed_scope(
         let repository_id =
             tracedecay_hooks::envelope_identity_hash16("repository", scope.repository_id.as_str());
         let now = super::hook_replay_now();
-        let mut publications = Vec::new();
-        for host in tracedecay_agent_hosts::hooks::NATIVE_HOOK_HOSTS {
-            let snapshot = HookConfigurationFileReaderV1::new(hook_configuration_path(
-                &project.data_root,
-                worktree_id,
-                *host,
-            ))
-            .load(*host)
-            .map_err(|error| TraceDecayError::Config {
-                message: format!("hook recovery publication unavailable: {error}"),
-            })?
-            .ok_or_else(|| TraceDecayError::Config {
-                message: format!("{} hook recovery publication was revoked", host.hook_key()),
-            })?;
-            if snapshot.binding.project_id != project_id
-                || snapshot.binding.worktree_id != worktree_id
-                || snapshot.binding.repository_id != repository_id
-                || snapshot.binding.host != *host
-            {
-                return Err(TraceDecayError::Config {
-                    message: "hook recovery publication changed its canonical scope".to_owned(),
-                });
-            }
-            publications.push(snapshot);
-        }
+        let publications = load_hook_recovery_publications(
+            &project.data_root,
+            project_id,
+            worktree_id,
+            repository_id,
+        )?;
         for snapshot in &publications {
             let host = &snapshot.binding.host;
             let pending = tracedecay_mcp::handlers::hook_runtime::hook_v2_pending_work_envelopes(
@@ -391,6 +372,41 @@ async fn hook_recovery_publications_for_owed_scope(
     .map_err(|error| TraceDecayError::Config {
         message: format!("hook scope inspection failed: {error}"),
     })?
+}
+
+/// Validate every host publication before inspecting or opening any spool.
+fn load_hook_recovery_publications(
+    data_root: &Path,
+    project_id: [u8; 16],
+    worktree_id: [u8; 16],
+    repository_id: [u8; 16],
+) -> Result<Vec<tracedecay_hooks::HookConfigurationSnapshotV1>> {
+    let mut publications = Vec::new();
+    for host in tracedecay_agent_hosts::hooks::NATIVE_HOOK_HOSTS {
+        let snapshot = HookConfigurationFileReaderV1::new(hook_configuration_path(
+            data_root,
+            worktree_id,
+            *host,
+        ))
+        .load(*host)
+        .map_err(|error| TraceDecayError::Config {
+            message: format!("hook recovery publication unavailable: {error}"),
+        })?
+        .ok_or_else(|| TraceDecayError::Config {
+            message: format!("{} hook recovery publication was revoked", host.hook_key()),
+        })?;
+        if snapshot.binding.project_id != project_id
+            || snapshot.binding.worktree_id != worktree_id
+            || snapshot.binding.repository_id != repository_id
+            || snapshot.binding.host != *host
+        {
+            return Err(TraceDecayError::Config {
+                message: "hook recovery publication changed its canonical scope".to_owned(),
+            });
+        }
+        publications.push(snapshot);
+    }
+    Ok(publications)
 }
 
 /// Opens `project` with the daemon's own profile identity, exactly as a

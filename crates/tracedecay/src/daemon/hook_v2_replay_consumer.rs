@@ -208,6 +208,12 @@ struct DeferredHostReplay {
     scope_pending: bool,
 }
 
+impl DeferredHostReplay {
+    fn defers_lane(&self, spool: StatusHookReplaySpoolV1) -> bool {
+        self.failures.iter().any(|failure| failure.spool == spool)
+    }
+}
+
 impl HookReplaySweepV1 {
     fn fail(&mut self, host: NativeHostIdentityV1, spool: StatusHookReplaySpoolV1, cause: String) {
         tracing::warn!(host = host.hook_key(), ?spool, %cause, "hook spool drain failed");
@@ -226,22 +232,7 @@ async fn drain_all_hosts(
     deferred_hosts: &mut BTreeMap<NativeHostIdentityV1, DeferredHostReplay>,
 ) -> HookReplaySweepV1 {
     let mut sweep = HookReplaySweepV1::default();
-    match graph.renew_hook_bindings(hook_replay_now()) {
-        Ok(failures) => {
-            for (host, cause) in failures {
-                sweep.fail(
-                    host,
-                    StatusHookReplaySpoolV1::Records,
-                    format!("Hook binding renewal failed: {cause}"),
-                );
-            }
-        }
-        Err(error) => {
-            for host in tracedecay_agent_hosts::hooks::NATIVE_HOOK_HOSTS {
-                sweep.fail(*host, StatusHookReplaySpoolV1::Records, error.to_string());
-            }
-        }
-    }
+    renew_replay_bindings(graph, &mut sweep);
     let project_id =
         tracedecay_agent_hosts::hooks::hook_project_id_for_layout(graph.hook_store_layout());
     // Worktree identity needs only the hook runtime's scope resolver; the
@@ -263,12 +254,9 @@ async fn drain_all_hosts(
             sweep.scope_pending |= deferred.scope_pending;
         }
         let lane_deferred = |spool| {
-            deferred.as_ref().is_some_and(|deferred| {
-                deferred
-                    .failures
-                    .iter()
-                    .any(|failure| failure.spool == spool)
-            })
+            deferred
+                .as_ref()
+                .is_some_and(|deferred| deferred.defers_lane(spool))
         };
         let now = hook_replay_now();
         if !lane_deferred(StatusHookReplaySpoolV1::DeliveryReceipts) {
@@ -325,31 +313,7 @@ async fn drain_all_hosts(
             }
         };
         if let Some(report) = report {
-            sweep.scope_pending |= report.scope_deferred > 0;
-            if report.committed > 0 || report.duplicates > 0 || report.tombstoned > 0 {
-                spool_watch::wake_peer_consumers(data_root, graph.project_root());
-            }
-            note_replay_report(&mut sweep, *host, &report);
-            match HookSpoolV1::has_records(&hook_v2_spool_root(data_root, *host)) {
-                Ok(true) if report.binding_unavailable || report.retained > 0 => {}
-                Ok(true) if !report.more_in_scope && report.scope_deferred > 0 => {
-                    sweep.scope_pending = true;
-                }
-                Ok(true)
-                    if report.committed > 0 || report.duplicates > 0 || report.tombstoned > 0 =>
-                {
-                    sweep.more_pending = true;
-                }
-                Ok(true) => sweep.fail(
-                    *host,
-                    StatusHookReplaySpoolV1::Records,
-                    "pending records await a replay batch".to_owned(),
-                ),
-                Ok(false) => {}
-                Err(error) => {
-                    sweep.fail(*host, StatusHookReplaySpoolV1::Records, error.to_string());
-                }
-            }
+            note_host_replay_progress(&mut sweep, *host, &report, data_root, graph.project_root());
         }
         // Admission can acknowledge the transport while producer execution is
         // still queued. Only the durable work ledger proves completion.
@@ -364,28 +328,92 @@ async fn drain_all_hosts(
                 pending_cause,
             );
         }
-        let failures = sweep
-            .failures
-            .iter()
-            .filter(|failure| failure.host == *host)
-            .cloned()
-            .collect::<Vec<_>>();
-        let scope_pending = report
-            .is_some_and(|report| report.scope_deferred > 0 && !report.more_in_scope)
-            || deferred.is_some_and(|deferred| deferred.scope_pending);
-        if !failures.is_empty() || scope_pending {
-            deferred_hosts.insert(
-                *host,
-                DeferredHostReplay {
-                    failures,
-                    scope_pending,
-                },
-            );
-        } else {
-            deferred_hosts.remove(host);
-        }
+        update_deferred_host(deferred_hosts, *host, &sweep, report, deferred);
     }
     sweep
+}
+
+fn renew_replay_bindings(
+    graph: &tracedecay_project::project::TraceDecay,
+    sweep: &mut HookReplaySweepV1,
+) {
+    match graph.renew_hook_bindings(hook_replay_now()) {
+        Ok(failures) => {
+            for (host, cause) in failures {
+                sweep.fail(
+                    host,
+                    StatusHookReplaySpoolV1::Records,
+                    format!("Hook binding renewal failed: {cause}"),
+                );
+            }
+        }
+        Err(error) => {
+            for host in tracedecay_agent_hosts::hooks::NATIVE_HOOK_HOSTS {
+                sweep.fail(*host, StatusHookReplaySpoolV1::Records, error.to_string());
+            }
+        }
+    }
+}
+
+fn note_host_replay_progress(
+    sweep: &mut HookReplaySweepV1,
+    host: NativeHostIdentityV1,
+    report: &HookReplayPassReportV1,
+    data_root: &Path,
+    project_root: &Path,
+) {
+    sweep.scope_pending |= report.scope_deferred > 0;
+    if report.committed > 0 || report.duplicates > 0 || report.tombstoned > 0 {
+        spool_watch::wake_peer_consumers(data_root, project_root);
+    }
+    note_replay_report(sweep, host, report);
+    match HookSpoolV1::has_records(&hook_v2_spool_root(data_root, host)) {
+        Ok(true) if report.binding_unavailable || report.retained > 0 => {}
+        Ok(true) if !report.more_in_scope && report.scope_deferred > 0 => {
+            sweep.scope_pending = true;
+        }
+        Ok(true) if report.committed > 0 || report.duplicates > 0 || report.tombstoned > 0 => {
+            sweep.more_pending = true;
+        }
+        Ok(true) => sweep.fail(
+            host,
+            StatusHookReplaySpoolV1::Records,
+            "pending records await a replay batch".to_owned(),
+        ),
+        Ok(false) => {}
+        Err(error) => {
+            sweep.fail(host, StatusHookReplaySpoolV1::Records, error.to_string());
+        }
+    }
+}
+
+fn update_deferred_host(
+    deferred_hosts: &mut BTreeMap<NativeHostIdentityV1, DeferredHostReplay>,
+    host: NativeHostIdentityV1,
+    sweep: &HookReplaySweepV1,
+    report: Option<HookReplayPassReportV1>,
+    deferred: Option<DeferredHostReplay>,
+) {
+    let failures = sweep
+        .failures
+        .iter()
+        .filter(|failure| failure.host == host)
+        .cloned()
+        .collect::<Vec<_>>();
+    let scope_pending = report
+        .is_some_and(|report| report.scope_deferred > 0 && !report.more_in_scope)
+        || deferred.is_some_and(|deferred| deferred.scope_pending);
+    if !failures.is_empty() || scope_pending {
+        deferred_hosts.insert(
+            host,
+            DeferredHostReplay {
+                failures,
+                scope_pending,
+            },
+        );
+    } else {
+        deferred_hosts.remove(&host);
+    }
 }
 
 fn note_replay_report(

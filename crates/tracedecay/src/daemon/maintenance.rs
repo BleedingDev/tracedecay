@@ -15,6 +15,7 @@ use tracedecay_maintenance::generation::{
 };
 use tracedecay_maintenance::lease::ProjectStoreMaintenanceLeaseV1;
 use tracedecay_maintenance::loop_run::{MaintenanceWake, run_maintenance_loop};
+use tracedecay_maintenance::retention::registered_store::RegisteredStoreRetentionReportV1;
 use tracedecay_maintenance::store_maintenance::RegisteredProjectStoreV1;
 use tracedecay_maintenance::telemetry::StoreTelemetrySamplingOutcome;
 use tracedecay_maintenance::tick::{
@@ -134,6 +135,38 @@ async fn run_registered_store_retention(
             now,
         )
         .await;
+    log_registered_store_retention_outcome(&report);
+    progress.canonical.pending = report.canonical_gc.as_ref().map_or(true, |gc| gc.pending);
+    progress.observations.pending = report.observations.as_ref().is_some_and(|result| {
+        result
+            .as_ref()
+            .map_or(true, |observations| observations.pending)
+    });
+    progress.canonical.failed = report.canonical_gc.is_err();
+    progress.observations.failed = report.observations.as_ref().is_some_and(|result| {
+        result
+            .as_ref()
+            .map_or(true, |observations| !observations.errors.is_empty())
+    });
+    let pending = progress.canonical.pending || progress.observations.pending;
+    let mut succeeded = report.succeeded();
+    if let Some(compaction) = &config.compaction {
+        let outcome = tracedecay_maintenance::retention::live_compaction::compact_registered_store(
+            database, compaction,
+        )
+        .await;
+        succeeded &= record_live_compaction_outcome("mounted_sessions", outcome);
+    }
+    if !succeeded {
+        MaintenanceTickOutcome::Retry
+    } else if pending {
+        MaintenanceTickOutcome::Continue(MaintenanceContinuation::SessionContentRetention)
+    } else {
+        MaintenanceTickOutcome::Complete
+    }
+}
+
+fn log_registered_store_retention_outcome(report: &RegisteredStoreRetentionReportV1) {
     match &report.session_lcm {
         Some(Ok(session_lcm)) => {
             let reclaimed = session_lcm.bytes_reclaimed();
@@ -202,34 +235,6 @@ async fn run_registered_store_retention(
     }
     log_payload_gc_outcome(&report.payload_gc);
     log_canonical_gc_outcome(&report.canonical_gc);
-    progress.canonical.pending = report.canonical_gc.as_ref().map_or(true, |gc| gc.pending);
-    progress.observations.pending = report.observations.as_ref().is_some_and(|result| {
-        result
-            .as_ref()
-            .map_or(true, |observations| observations.pending)
-    });
-    progress.canonical.failed = report.canonical_gc.is_err();
-    progress.observations.failed = report.observations.as_ref().is_some_and(|result| {
-        result
-            .as_ref()
-            .map_or(true, |observations| !observations.errors.is_empty())
-    });
-    let pending = progress.canonical.pending || progress.observations.pending;
-    let mut succeeded = report.succeeded();
-    if let Some(compaction) = &config.compaction {
-        let outcome = tracedecay_maintenance::retention::live_compaction::compact_registered_store(
-            database, compaction,
-        )
-        .await;
-        succeeded &= record_live_compaction_outcome("mounted_sessions", outcome);
-    }
-    if !succeeded {
-        MaintenanceTickOutcome::Retry
-    } else if pending {
-        MaintenanceTickOutcome::Continue(MaintenanceContinuation::SessionContentRetention)
-    } else {
-        MaintenanceTickOutcome::Complete
-    }
 }
 
 async fn run_observation_retention_page(
