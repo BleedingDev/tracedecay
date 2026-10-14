@@ -1078,6 +1078,8 @@ fn delivered_rows(store: &SqliteObservationJournal) -> Result<u64, Box<dyn Error
 /// full-table revalidation on every open is measurable, small enough that
 /// writing them is not the slow part of the test.
 const WITHHELD_AUDIT_ROWS: u64 = 6_000;
+/// Samples per journal open; the fastest is the one compared.
+const OPEN_TIMING_SAMPLES: usize = 5;
 
 #[test]
 fn opening_a_journal_costs_the_same_whatever_the_withheld_audit_holds() -> TestResult {
@@ -1096,9 +1098,18 @@ fn opening_a_journal_costs_the_same_whatever_the_withheld_audit_holds() -> TestR
 
     // Both opens are measured the same way, on the same disk, in the same
     // process: the difference between them is the audit table and nothing
-    // else.
-    let empty_open = time_open(&empty_path)?;
-    let full_open = time_open(&full_path)?;
+    // else. Each is the best of a few samples: a scheduler stall on a loaded
+    // runner inflates one sample, never the fastest, while an unbounded scan
+    // slows every sample.
+    let best_open = |path: &std::path::Path| -> Result<i64, Box<dyn Error>> {
+        let mut best = i64::MAX;
+        for _ in 0..OPEN_TIMING_SAMPLES {
+            best = best.min(time_open(path)?);
+        }
+        Ok(best)
+    };
+    let empty_open = best_open(&empty_path)?;
+    let full_open = best_open(&full_path)?;
 
     // A full-table revalidation of six thousand rows is not free; a bounded
     // page of `OPEN_WITHHELD_AUDIT_ROWS` is. Allowing the loaded open a

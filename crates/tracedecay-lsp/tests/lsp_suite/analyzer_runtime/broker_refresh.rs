@@ -1017,6 +1017,10 @@ async fn refresh_quiet_window_stays_budget_neutral_and_reuses_live_client() {
     let temp = tempfile::tempdir().unwrap();
     let script_path = temp.path().join("never_publish_lsp.py");
     let starts_path = temp.path().join("starts.txt");
+    // The fake analyzer appends one line per start. The file exists before
+    // the first start so a read after a start the runner killed early still
+    // proves "no further start" rather than failing on a missing file.
+    std::fs::write(&starts_path, "").unwrap();
     let preamble = format!(
         r#"
 with open({starts:?}, "a", encoding="utf-8") as f:
@@ -1119,6 +1123,10 @@ async fn refresh_only_post_initialize_crash_loop_exhausts_restart_budget() {
     let temp = tempfile::tempdir().unwrap();
     let script_path = temp.path().join("exit_after_initialize_lsp.py");
     let starts_path = temp.path().join("starts.txt");
+    // The fake analyzer appends one line per start. The file exists before
+    // the first start so a read after a start the runner killed early still
+    // proves "no further start" rather than failing on a missing file.
+    std::fs::write(&starts_path, "").unwrap();
     let preamble = format!(
         r#"
 with open({starts:?}, "a", encoding="utf-8") as f:
@@ -1217,6 +1225,10 @@ async fn an_exhausted_restart_budget_stops_the_refresh_lane_from_respawning() {
     let temp = tempfile::tempdir().unwrap();
     let script_path = temp.path().join("never_initialize_lsp.py");
     let starts_path = temp.path().join("starts.txt");
+    // The fake analyzer appends one line per start. The file exists before
+    // the first start so a read after a start the runner killed early still
+    // proves "no further start" rather than failing on a missing file.
+    std::fs::write(&starts_path, "").unwrap();
     std::fs::write(
         &script_path,
         format!(
@@ -1271,9 +1283,8 @@ time.sleep(60)
     assert_eq!(exhausted.state(), AnalyzerState::Exhausted);
     // Every failed start waits for its child to exit before reporting, so this
     // read races nothing. A starved runner can kill a start before python
-    // wrote its line, or before it wrote any, which is why only the upper
-    // bound is exact and an absent file counts as no starts.
-    let starts_before = std::fs::read_to_string(&starts_path).unwrap_or_default();
+    // wrote its line, which is why only the upper bound is exact.
+    let starts_before = std::fs::read_to_string(&starts_path).unwrap();
     assert!(starts_before.lines().count() <= usize::from(tracedecay_lsp::MAX_ANALYZER_RESTARTS));
 
     std::fs::write(&script_path, fake_lsp_script()).unwrap();
