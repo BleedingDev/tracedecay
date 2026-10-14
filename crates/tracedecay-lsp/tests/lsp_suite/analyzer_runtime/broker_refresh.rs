@@ -1217,6 +1217,9 @@ async fn an_exhausted_restart_budget_stops_the_refresh_lane_from_respawning() {
     let temp = tempfile::tempdir().unwrap();
     let script_path = temp.path().join("never_initialize_lsp.py");
     let starts_path = temp.path().join("starts.txt");
+    // A bounded start may be reaped before Python runs its append. Keep the
+    // baseline durable so zero observed starts remains an exact counter value.
+    std::fs::write(&starts_path, "").unwrap();
     std::fs::write(
         &script_path,
         format!(
@@ -1275,7 +1278,11 @@ time.sleep(60)
     let starts_before = std::fs::read_to_string(&starts_path).unwrap();
     assert!(starts_before.lines().count() <= usize::from(tracedecay_lsp::MAX_ANALYZER_RESTARTS));
 
-    std::fs::write(&script_path, fake_lsp_script()).unwrap();
+    std::fs::write(
+        &script_path,
+        fake_lsp_script_that_records_start(&starts_path),
+    )
+    .unwrap();
     let error = broker
         .refresh_documents_with_timeouts(
             FAKE_LANGUAGE,
