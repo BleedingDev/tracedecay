@@ -9,7 +9,9 @@ pub use tracedecay_contracts::automation::{
 };
 use tracedecay_contracts::retained_surfaces::AutomationSkipReasonV1;
 
-use super::backend::{AgentTaskKind, task_key as canonical_task_key};
+use super::backend::{
+    AgentTaskKind, agent_task_contract, prompt_version, task_key as canonical_task_key,
+};
 use super::config_error;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 
@@ -458,6 +460,87 @@ fn forget_rewritten_run_ledger(path: &Path) {
     let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     run_ledger_summary_memo().retain(|(memo_path, _, _), _| *memo_path != canonical_path);
     lifecycle_index::discard_run_ledger_index(path);
+}
+
+/// `backend` for a row no runner attributed, so the field never claims a
+/// backend the settling authority did not observe.
+pub(crate) const UNATTRIBUTED_BACKEND: &str = "unattributed";
+
+/// `error` substituted when a synthesized terminal is handed an empty one, so
+/// a `Failed` row always carries the non-empty error its readers require.
+const UNATTRIBUTED_FAILURE: &str = "the automation run failed without a reported terminal";
+
+/// The canonical `Failed` terminal for an admitted run whose runner returned
+/// no ledger record of its own.
+///
+/// Deferred retained settlement is the only authority that publishes a row for
+/// such a run, so without this an admitted run can finish with no history at
+/// all. The record carries exactly what the admission proves — the run
+/// identity, its task, and the terminal error — and claims nothing about an
+/// execution it never observed:
+///
+/// * `trigger` is [`AutomationTrigger::Application`], naming the authority
+///   that settled it. Mislabelling a scheduler run this way only fails open:
+///   repeat-skip suppression requires `Scheduler`, so the scheduler re-admits
+///   the task instead of treating this as its own prior terminal.
+/// * `backend` is [`UNATTRIBUTED_BACKEND`] and `backend_identity` is absent,
+///   which by the `backend_identity` contract suppresses nothing.
+pub(crate) fn unattributed_failed_run_record(
+    run_id: &str,
+    task: AgentTaskKind,
+    task_key: Option<String>,
+    error: &str,
+) -> Result<AutomationRunLedgerRecord> {
+    let completed_at_micros = current_timestamp_micros()?;
+    let completed_at = (completed_at_micros / 1_000_000).to_string();
+    let contract = agent_task_contract(task);
+    let error = match error.trim() {
+        "" => UNATTRIBUTED_FAILURE.to_owned(),
+        reported => reported.to_owned(),
+    };
+    Ok(AutomationRunLedgerRecord {
+        schema_version: 2,
+        run_id: run_id.to_owned(),
+        trigger: AutomationTrigger::Application,
+        task,
+        task_key: task_key.or_else(|| Some(canonical_task_key(task).to_owned())),
+        backend: UNATTRIBUTED_BACKEND.to_owned(),
+        backend_identity: None,
+        host_mode: None,
+        prompt_version: Some(prompt_version(task).to_owned()),
+        response_schema: Some(contract.response_schema),
+        strict_json: Some(contract.strict_json),
+        model: None,
+        status: AutomationRunStatus::Failed,
+        evidence_hash: None,
+        input_hash: None,
+        output_hash: None,
+        proposed_ops: None,
+        applied_ops: None,
+        rejected_ops: None,
+        validation_report: None,
+        reviewed_count: 0,
+        accepted_count: 0,
+        rejected_count: 0,
+        skipped_count: 0,
+        error: Some(error),
+        session_evidence_budget_stage: None,
+        error_classification: None,
+        error_retryable: None,
+        backend_attempt_count: 0,
+        backend_attempts: Vec::new(),
+        fallback_status: None,
+        report_ref: Some(serde_json::json!({
+            "dashboard_runs": "/api/automation/runs",
+            "run_id": run_id,
+        })),
+        artifacts: Vec::new(),
+        // The settling authority never observed the runner's start instant, so
+        // the row reports the one instant it can prove: its own terminal.
+        started_at: completed_at.clone(),
+        completed_at,
+        completed_at_micros: Some(completed_at_micros),
+    })
 }
 
 pub(super) fn validate_run_ledger_record_semantics(
