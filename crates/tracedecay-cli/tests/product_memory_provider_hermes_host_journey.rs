@@ -1234,7 +1234,10 @@ fn assert_native_search_messages(
         assert_eq!(
             matches.len(),
             1,
-            "each Hermes message has one canonical identity"
+            "each Hermes message has one canonical identity; expected {message_id}, hits carry {:?}",
+            hits.iter()
+                .map(|hit| hit.message.message_id.as_str())
+                .collect::<Vec<_>>()
         );
         let hit = matches[0];
         assert_eq!(hit.session.provider, HERMES_CANONICAL_PROVIDER_ID);
