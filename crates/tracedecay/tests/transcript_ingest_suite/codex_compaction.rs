@@ -255,14 +255,20 @@ done
     let publication_deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let remaining = publication_deadline.saturating_duration_since(std::time::Instant::now());
-        assert!(!remaining.is_zero(), "daemon LCM owner did not publish its summary");
+        assert!(
+            !remaining.is_zero(),
+            "daemon LCM owner did not publish its summary"
+        );
         let child = tracedecay_command_with_home(&home)
             .current_dir(&project)
             .args(["tool", "tracedecay_lcm_status", "--json", "--args"])
-            .arg(serde_json::json!({
-                "provider": "codex",
-                "session_id": "codex-compact"
-            }).to_string())
+            .arg(
+                serde_json::json!({
+                    "provider": "codex",
+                    "session_id": "codex-compact"
+                })
+                .to_string(),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -279,9 +285,13 @@ done
         );
         let printed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         let status: tracedecay_contracts::retained_surfaces::LcmStatusResultV1 =
-            serde_json::from_value(printed["structuredContent"]["outcome"]["value"]["payload"].clone())
-                .unwrap();
-        let lcm = status.lcm.expect("daemon status must retain its canonical LCM authority");
+            serde_json::from_value(
+                printed["structuredContent"]["outcome"]["value"]["payload"].clone(),
+            )
+            .unwrap();
+        let lcm = status
+            .lcm
+            .expect("daemon status must retain its canonical LCM authority");
         if lcm.summary_node_count > 0 {
             assert_eq!(lcm.raw_message_count, 4);
             assert_eq!(lcm.summary_node_count, 1);
