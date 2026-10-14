@@ -137,8 +137,16 @@ impl UpstreamCapabilityInitializationAuthority for CompositeUpstreamCapabilities
                 // answered `Unavailable`. A rustup host without the
                 // `rust-analyzer` component is exactly that shape: the proxy is
                 // on PATH, so the language routes, and only the spawn fails.
-                let Ok(current) = initializer.upstream_capabilities().await else {
-                    continue;
+                let current = match initializer.upstream_capabilities().await {
+                    Ok(current) => current,
+                    Err(error) => {
+                        tracing::warn!(
+                            language = initializer.language(),
+                            error = %error,
+                            "upstream analyzer unavailable; negotiating without its capabilities"
+                        );
+                        continue;
+                    }
                 };
                 capabilities.supports_diagnostics |= current.supports_diagnostics;
                 capabilities.semantic.extend(current.semantic);
