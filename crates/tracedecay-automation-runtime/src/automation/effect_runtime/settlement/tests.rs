@@ -2224,14 +2224,29 @@ async fn retained_projector_panic_finishes_recovery_before_releasing_task_lock()
         );
         tokio::task::yield_now().await;
     }
+    let panic_row = crate::automation::run_ledger::find_run_record_exact_bounded_blocking(
+        dashboard_root,
+        run_id,
+    )
+    .expect("projector-panic exact lookup")
+    .expect("projector panic must still publish its failed ledger terminal");
+    assert_eq!(panic_row.run_id, run_id);
+    assert_eq!(panic_row.task, AgentTaskKind::UserJob);
+    assert_eq!(panic_row.status, AutomationRunStatus::Failed);
+    assert_eq!(
+        panic_row.task_key.as_deref(),
+        Some(format!("user_job:{job_id}").as_str())
+    );
     assert!(
-        crate::automation::run_ledger::find_run_record_exact_bounded_blocking(
-            dashboard_root,
-            run_id,
-        )
-        .expect("projector-panic exact lookup")
-        .is_none(),
-        "projector panic must not fabricate a successful ledger row"
+        panic_row
+            .error
+            .as_deref()
+            .is_some_and(|error| !error.trim().is_empty()),
+        "a failed row must carry its terminal error: {panic_row:?}"
+    );
+    assert!(
+        panic_row.proposed_ops.is_none() && panic_row.applied_ops.is_none(),
+        "projector panic must not fabricate a successful ledger row: {panic_row:?}"
     );
 
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -2254,6 +2269,72 @@ async fn retained_projector_panic_finishes_recovery_before_releasing_task_lock()
         );
         tokio::task::yield_now().await;
     }
+}
+
+/// A runner that failed before it could build a ledger record still settles
+/// into a terminal `Failed` row. Deferred publication is the only authority
+/// that writes a row for an admitted run, so a settlement that published none
+/// would erase the run from automation history entirely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_runner_failure_without_a_record_publishes_its_failed_ledger_row() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let dashboard_root = temp.path();
+    let run_id = "run.runner-failure-without-record";
+    let admission = admission(run_id, "request.runner-failure-without-record");
+    let (authority, journal_path, expected_admission) =
+        retained_external_authority(dashboard_root, admission);
+    recovery_index::add_pending_blocking(dashboard_root, &journal_path, &expected_admission)
+        .expect("retain the reserved authority");
+
+    let retained = crate::automation::runner::RetainedAutomationRun::new(
+        Err(AutomationRunError::Runtime(TraceDecayError::Database {
+            operation: "run memory curator".to_owned(),
+            message: "memory curator run was interrupted before review".to_owned(),
+        })),
+        AutomationRunSettlementGuard::new(),
+    );
+    let outcome = authority
+        .start_retained_automation_settlement(
+            retained,
+            None,
+            |(): ()| -> (
+                AutomationRunLedgerRecord,
+                Option<AutomationCommittedReceipt>,
+            ) { panic!("a failed runner result must not reach the projector") },
+        )
+        .wait()
+        .await
+        .expect("retained settlement");
+
+    let super::RetainedAutomationSettlementOutcome::Problem { problem, record } = outcome else {
+        panic!("a runner failure must settle an application problem");
+    };
+    let record = record.expect("a settled problem must publish its ledger terminal");
+    assert_eq!(record.run_id, run_id);
+    assert_eq!(record.task, AgentTaskKind::MemoryCurator);
+    assert_eq!(record.task_key.as_deref(), Some("memory_curator"));
+    assert_eq!(record.status, AutomationRunStatus::Failed);
+    assert_eq!(
+        record.error.as_deref(),
+        Some(problem.problem.problem.summary().as_str()),
+        "the row's error must be the exact settled problem"
+    );
+    assert!(record.artifacts.is_empty() && record.proposed_ops.is_none());
+    assert_eq!(
+        crate::automation::run_ledger::find_run_record_exact_bounded_blocking(
+            dashboard_root,
+            run_id,
+        )
+        .expect("exact lookup after a runner failure"),
+        Some(record),
+        "the synthesized terminal must be durable in the ledger"
+    );
+    assert!(
+        read_indexed_record_blocking(&journal_path)
+            .expect("runner-failure journal read")
+            .expect("runner-failure journal")
+            .is_terminal()
+    );
 }
 
 struct RequestWaitingPairFixture {
@@ -2530,14 +2611,27 @@ async fn retained_pair_attempts_second_leg_and_keeps_both_guards_until_both_fini
     assert_eq!(first_terminal.admission(), &first_admission);
     assert!(task_lock_is_denied(dashboard_root, first_job_id).await);
     assert!(task_lock_is_denied(dashboard_root, second_job_id).await);
-    assert!(
-        crate::automation::run_ledger::find_run_record_exact_bounded_blocking(
-            dashboard_root,
-            first_run_id,
-        )
-        .expect("first recovery exact lookup")
-        .is_none()
+    // An invalid projection still ends the admitted run with a terminal
+    // ledger row, a failed one naming the recovery problem, never a
+    // successful one.
+    let first_record = crate::automation::run_ledger::find_run_record_exact_bounded_blocking(
+        dashboard_root,
+        first_run_id,
+    )
+    .expect("first recovery exact lookup")
+    .expect("first recovery publishes its failed ledger row");
+    assert_eq!(first_record.run_id, first_run_id);
+    assert_eq!(
+        first_record.status,
+        crate::automation::run_ledger::AutomationRunStatus::Failed
     );
+    assert!(
+        first_record
+            .error
+            .as_deref()
+            .is_some_and(|error| !error.is_empty())
+    );
+    assert!(first_record.proposed_ops.is_none() && first_record.applied_ops.is_none());
 
     release_tx.send(()).expect("release second pair leg");
     let second_owned = tokio::time::timeout(Duration::from_secs(5), second.wait())

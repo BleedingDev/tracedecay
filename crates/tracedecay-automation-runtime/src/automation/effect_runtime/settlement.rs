@@ -983,48 +983,42 @@ impl AutomationEffectAuthority {
             Ok(projected) => projected,
             Err(error) => return self.finish_projection_failure(guard, error),
         };
+        // A runner that failed before it could build its own ledger terminal
+        // still has to leave one behind: deferred publication is the only
+        // authority that writes a row for this run, so settling the journal
+        // alone would erase an admitted run from automation history.
+        let ledger = match ledger {
+            Some(ledger) => match self.validate_failed_ledger(&ledger) {
+                Ok(()) => ledger,
+                Err(error) => return self.finish_projection_failure(guard, error),
+            },
+            None => match self.unattributed_failed_ledger(&problem.problem.problem.summary()) {
+                Ok(ledger) => ledger,
+                Err(error) => return self.finish_projection_failure(guard, error),
+            },
+        };
         let terminal = AutomationSettledTerminal::Problem(problem);
-        if let Some(ledger) = ledger {
-            if let Err(error) = self.validate_failed_ledger(&ledger) {
-                return self.finish_projection_failure(guard, error);
-            }
-            let owned = settle_bound_owner(RetainedBoundSettlement {
-                authority: self,
-                guard,
-                terminal,
-                ledger,
-                publication: None,
-                observer,
-                #[cfg(test)]
-                phase_hook,
-                #[cfg(test)]
-                prepared_write_hook: None,
-            })?;
-            let (terminal, ledger) = owned.value;
-            match terminal {
-                AutomationSettledTerminal::Problem(problem) => Ok(RetainedOwnerValue {
-                    value: (problem, Some(ledger)),
-                    pair_keepalive: owned.pair_keepalive,
-                }),
-                AutomationSettledTerminal::Outcome { .. } => Err(contract_error(
-                    "automation problem settlement replayed a successful terminal",
-                )),
-            }
-        } else {
-            let owned = settle_direct_owner(RetainedDirectSettlement {
-                authority: self,
-                guard,
-                terminal,
-            })?;
-            match owned.value {
-                AutomationSettledTerminal::Problem(problem) => Ok(RetainedOwnerValue {
-                    value: (problem, None),
-                    pair_keepalive: owned.pair_keepalive,
-                }),
-                AutomationSettledTerminal::Outcome { .. } => Err(contract_error(
-                    "automation problem settlement replayed a successful terminal",
-                )),
-            }
+        let owned = settle_bound_owner(RetainedBoundSettlement {
+            authority: self,
+            guard,
+            terminal,
+            ledger,
+            publication: None,
+            observer,
+            #[cfg(test)]
+            phase_hook,
+            #[cfg(test)]
+            prepared_write_hook: None,
+        })?;
+        let (terminal, ledger) = owned.value;
+        match terminal {
+            AutomationSettledTerminal::Problem(problem) => Ok(RetainedOwnerValue {
+                value: (problem, Some(ledger)),
+                pair_keepalive: owned.pair_keepalive,
+            }),
+            AutomationSettledTerminal::Outcome { .. } => Err(contract_error(
+                "automation problem settlement replayed a successful terminal",
+            )),
         }
     }
 
@@ -1038,19 +1032,68 @@ impl AutomationEffectAuthority {
         })
     }
 
+    /// The canonical `Failed` ledger terminal for this admitted run, for a
+    /// settlement whose runner produced no record of its own.
+    ///
+    /// Only the run identity, its admitted task, and the terminal error are
+    /// claimed; the task key is the same one the admitted request binds, so
+    /// [`Self::validate_failed_ledger`] accepts the synthesized row.
+    fn unattributed_failed_ledger(&self, error: &str) -> Result<AutomationRunLedgerRecord> {
+        let task = agent_task_kind(self.admission.request.task_kind());
+        run_ledger::unattributed_failed_run_record(
+            self.admission.request.run_id.as_str(),
+            task,
+            self.admission.request.task.expected_external_task_key(),
+            error,
+        )
+    }
+
+    /// Settles the admitted recovery terminal for a projection that could not
+    /// produce one, publishing its ledger row before returning the exact
+    /// projection failure to the caller.
     fn finish_projection_failure<T>(
         self,
         guard: RetainedSettlementGuardOwner,
         error: tracedecay_domain::errors::TraceDecayError,
     ) -> Result<T> {
-        let terminal =
-            AutomationSettledTerminal::Problem(self.admission.recovery_problem().clone());
-        let _ = settle_direct_owner(RetainedDirectSettlement {
-            authority: self,
-            guard,
-            terminal,
-        })?;
-        Err(error)
+        let problem = self.admission.recovery_problem().clone();
+        // The recovery problem names the terminal state; the projection
+        // failure names what stopped the runner from reporting its own.
+        let reported = format!("{} ({error})", problem.problem.problem.summary());
+        let ledger = self.unattributed_failed_ledger(&reported);
+        let terminal = AutomationSettledTerminal::Problem(problem);
+        match ledger {
+            Ok(ledger) => {
+                let _ = settle_bound_owner(RetainedBoundSettlement {
+                    authority: self,
+                    guard,
+                    terminal,
+                    ledger,
+                    publication: None,
+                    observer: None,
+                    #[cfg(test)]
+                    phase_hook: None,
+                    #[cfg(test)]
+                    prepared_write_hook: None,
+                })?;
+                Err(error)
+            }
+            // A row that cannot be assembled must not cost the run its
+            // durable journal terminal, which is what releases the guard.
+            Err(ledger_error) => {
+                tracing::warn!(
+                    run_id = %self.admission.request.run_id,
+                    error = %ledger_error,
+                    "automation projection failure has no publishable ledger terminal"
+                );
+                let _ = settle_direct_owner(RetainedDirectSettlement {
+                    authority: self,
+                    guard,
+                    terminal,
+                })?;
+                Err(error)
+            }
+        }
     }
 
     pub async fn prepare<M, F, Fut>(

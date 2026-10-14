@@ -140,7 +140,8 @@ pub async fn execute_retained_memory_curator(
         fact_review_limit: request.fact_review_limit as usize,
         min_confidence,
     };
-    drop(tokio::spawn(async move {
+    let curator_run_id = run_id.clone();
+    let curator = tokio::spawn(async move {
         let retained_run = run_memory_curator_with_backend_for_retained_settlement(
             &automation_context,
             &config,
@@ -154,6 +155,18 @@ pub async fn execute_retained_memory_curator(
             (run.ledger_record, run.committed_receipt)
         });
         log_curator_settlement(&run_id, waiter.wait().await);
+    });
+    // The run outlives the request. A panic before settlement would otherwise
+    // vanish with the dropped join handle, leaving a run that never settles
+    // and nothing that names it.
+    drop(tokio::spawn(async move {
+        if let Err(error) = curator.await {
+            tracing::error!(
+                run_id = %curator_run_id,
+                error = %error,
+                "retained memory curator run ended without settling"
+            );
+        }
     }));
     Ok(started)
 }

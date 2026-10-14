@@ -18,11 +18,35 @@ pub(crate) fn is_already_protected_structural_id(value: &str) -> bool {
         || is_tagged_lowercase_hex(value, CLAUDE_OBSERVATION_SOURCE_ID_PREFIX_V1, 64)
 }
 
+/// True for the message identity TraceDecay's own host plugins mint for a
+/// synced turn: `tracedecay_sync_<batch>_<unix nanos>_<index>_<role>`.
+///
+/// The id is public by construction, but as one token it is long enough and
+/// mixed enough for the entropy detector, and whether it crosses that
+/// threshold depends on the digits of the timestamp: some turns kept their
+/// id and others came back as a protected digest, so one message carried
+/// two canonical identities depending on the clock.
+fn is_public_sync_message_id(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("tracedecay_sync_") else {
+        return false;
+    };
+    let mut parts = rest.splitn(4, '_');
+    let numeric = |part: Option<&str>| {
+        part.is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    };
+    numeric(parts.next())
+        && numeric(parts.next())
+        && numeric(parts.next())
+        && parts.next().is_some_and(|role| {
+            !role.is_empty() && role.bytes().all(|byte| byte.is_ascii_lowercase())
+        })
+}
+
 /// Replaces credential-shaped structural identifiers with a stable,
 /// versioned digest. Public identifiers and values already protected by this
 /// version are preserved byte-for-byte.
 pub fn protect_sensitive_structural_id(value: &str) -> Result<String, StructuralIdProtectionError> {
-    if is_already_protected_structural_id(value) {
+    if is_already_protected_structural_id(value) || is_public_sync_message_id(value) {
         return Ok(value.to_owned());
     }
     let sanitized = sanitize_provider_metadata_text(value).ok_or(StructuralIdProtectionError)?;
@@ -109,5 +133,22 @@ mod tests {
             assert!(is_already_protected_structural_id(&protected));
             assert!(!protected.contains("sk-test-123456"));
         }
+    }
+    #[test]
+    fn plugin_sync_message_ids_stay_public_whatever_their_timestamp() {
+        // Both score just above the entropy threshold as one token; a
+        // timestamp a few digits apart scores below it.
+        for id in [
+            "tracedecay_sync_1_1792008757259472364_0_user",
+            "tracedecay_sync_1_1792008757259472364_1_assistant",
+            "tracedecay_sync_1_1760000000000000000_0_user",
+        ] {
+            assert_eq!(protect_sensitive_structural_id(id).unwrap(), id);
+        }
+        assert_ne!(
+            protect_sensitive_structural_id("tracedecay_sync_x_AKIAIOSFODNN7EXAMPLE_0_user")
+                .unwrap(),
+            "tracedecay_sync_x_AKIAIOSFODNN7EXAMPLE_0_user"
+        );
     }
 }
