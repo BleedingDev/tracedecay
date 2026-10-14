@@ -640,10 +640,12 @@ with (_starts / f"{{os.getpid()}}-{{time.time_ns()}}").open("x", encoding="utf-8
     fake_lsp_script_with_preamble(&preamble, EMPTY_DIAGNOSTIC_PUBLISH)
 }
 
-/// Starts recorded by [`fake_lsp_script_that_records_start`].
+/// Count complete start records; missing directories and unreadable records fail.
 fn start_count(counter_path: &std::path::Path) -> usize {
+    let entries = std::fs::read_dir(counter_path)
+        .unwrap_or_else(|error| panic!("cannot read analyzer starts: {error}"));
     let mut starts = 0;
-    for entry in std::fs::read_dir(counter_path).unwrap() {
+    for entry in entries {
         let entry = entry.unwrap();
         assert_eq!(std::fs::read_to_string(entry.path()).unwrap(), "start");
         starts += 1;
