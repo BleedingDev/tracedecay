@@ -306,6 +306,26 @@ fn read_reply(stdout: &mut ChildStdout) -> Reply {
         .expect("reply exists")
 }
 
+/// Forced, uncatchable termination on each platform.
+fn force_kill(pid: u32) {
+    let mut kill = if cfg!(windows) {
+        let mut taskkill = Command::new("taskkill");
+        taskkill.args(["/F", "/PID"]);
+        taskkill
+    } else {
+        let mut kill = Command::new("kill");
+        kill.arg("-9");
+        kill
+    };
+    assert!(
+        kill.arg(pid.to_string())
+            .status()
+            .expect("kill command runs")
+            .success(),
+        "force kill of worker {pid}"
+    );
+}
+
 fn process_exists(pid: u32) -> bool {
     Command::new("kill")
         .arg("-0")
@@ -1183,14 +1203,7 @@ fn common_maintenance_pages_restart_worker_between_continuations() {
             );
 
             let pid = client.pid().expect("worker pid exists after page");
-            assert!(
-                Command::new("kill")
-                    .arg("-9")
-                    .arg(pid.to_string())
-                    .status()
-                    .expect("kill command runs")
-                    .success()
-            );
+            force_kill(pid);
             let dead = client.call(
                 Request::new(240 + index, 0, Operation::Health, "", json!({})),
                 Duration::from_millis(500),
@@ -2109,14 +2122,7 @@ fn process_death_is_detected_then_lazily_restarted() {
         )
         .expect("initial worker starts");
     let first_pid = client.pid().expect("worker pid exists");
-    assert!(
-        Command::new("kill")
-            .arg("-9")
-            .arg(first_pid.to_string())
-            .status()
-            .expect("kill command runs")
-            .success()
-    );
+    force_kill(first_pid);
     let failed = client.call(
         Request::new(221, 0, Operation::Health, "", json!({})),
         Duration::from_millis(500),
@@ -2191,14 +2197,7 @@ fn recall_after_worker_restart_reproves_namespace_and_recovers_privacy_fence() {
     );
     assert_eq!(fenced.outcome, Outcome::EffectUnknown);
     drop(engine);
-    assert!(
-        Command::new("kill")
-            .arg("-9")
-            .arg(first_pid.to_string())
-            .status()
-            .expect("kill command runs")
-            .success()
-    );
+    force_kill(first_pid);
     let recovered = client
         .call(
             Request::new(

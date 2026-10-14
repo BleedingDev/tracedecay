@@ -1464,8 +1464,13 @@ impl ProviderLifecycleAdapterV1 for ProcessAdapter {
     type Error = ProcessAdapterError;
 
     fn start(&self, _deadline_unix_micros: i64) -> Result<(), Self::Error> {
-        let child = Command::new("/bin/sh")
-            .arg("-c")
+        let (shell, flag) = if cfg!(windows) {
+            ("cmd", "/C")
+        } else {
+            ("/bin/sh", "-c")
+        };
+        let child = Command::new(shell)
+            .arg(flag)
             .arg(self.program)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1535,7 +1540,12 @@ fn a_real_external_process_exit_is_typed_unavailability_and_the_host_survives() 
     // The host is unaffected: a separate supervised long-lived process still
     // reaches readiness and shuts down inside its bounded budget.
     let mut live = ProviderSupervisorV1::new(
-        ProcessAdapter::new("sleep 30"),
+        // A 30-second wait in each platform's shell.
+        ProcessAdapter::new(if cfg!(windows) {
+            "ping -n 31 127.0.0.1 >NUL"
+        } else {
+            "sleep 30"
+        }),
         supervised_scope(primary_scope()),
         restart_budget(3),
         shutdown_budget(),

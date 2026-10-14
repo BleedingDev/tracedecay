@@ -1202,6 +1202,17 @@ fn fixture_message_ids(fixture: &Value) -> [String; 2] {
     ids
 }
 
+/// Path spelling for comparison: Windows paths are case-insensitive and take
+/// either separator, so `c:/repo` and `C:\repo` name the same root there.
+fn host_path_key(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) {
+        tracedecay_domain::forward_slash_text(&text).to_lowercase()
+    } else {
+        text.into_owned()
+    }
+}
+
 fn assert_native_search_messages(
     searched: &MessageSearchResultV1,
     project: &Path,
@@ -1210,8 +1221,8 @@ fn assert_native_search_messages(
 ) {
     let hits = searched.results.as_ref().expect("fresh Hermes search hits");
     assert_eq!(hits.len(), 2);
-    let project = fs::canonicalize(project).expect("canonical Hermes project root");
-    let project = project.to_str().expect("Hermes project path is UTF-8");
+    let project = tracedecay_runtime_core::path_safety::canonical_existing_identity(project)
+        .expect("canonical Hermes project root");
     for (message_id, role, content) in [
         (&message_ids[0], "user", USER_CONTENT),
         (&message_ids[1], "assistant", ASSISTANT_CONTENT),
@@ -1228,7 +1239,10 @@ fn assert_native_search_messages(
         let hit = matches[0];
         assert_eq!(hit.session.provider, HERMES_CANONICAL_PROVIDER_ID);
         assert_eq!(hit.session.session_id, SESSION_ID);
-        assert_eq!(hit.session.project_path, project);
+        assert_eq!(
+            host_path_key(Path::new(&hit.session.project_path)),
+            host_path_key(&project)
+        );
         assert_eq!(hit.message.provider, HERMES_CANONICAL_PROVIDER_ID);
         assert_eq!(hit.message.session_id, SESSION_ID);
         assert_eq!(hit.message.role, role);
@@ -1237,7 +1251,7 @@ fn assert_native_search_messages(
             assert_eq!(owner, project_id);
         }
         if let Some(root) = &hit.root {
-            assert_eq!(root, project);
+            assert_eq!(host_path_key(Path::new(root)), host_path_key(&project));
         }
     }
 }

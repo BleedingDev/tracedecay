@@ -1429,7 +1429,12 @@ fn secure_private_directory_entry(
     path: &Path,
 ) -> Result<Dir, EncoderError> {
     let mut options = OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
+    // `maybe_dir`: Windows grants a directory handle only with backup
+    // semantics and refuses the open as access denied otherwise.
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
     let file = parent
         .open_with(name, &options)
         .map_err(|error| io_error("open model staging directory for privacy", path, error))?;
@@ -2097,7 +2102,11 @@ fn open_optional_directory(
 
 fn path_entry_exists(parent: &Dir, name: &OsStr, path: &Path) -> Result<bool, EncoderError> {
     let mut options = OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
+    // The entry may be a directory; Windows opens one only with `maybe_dir`.
+    options
+        .read(true)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
     match parent.open_with(name, &options) {
         Ok(file) => {
             let metadata = file

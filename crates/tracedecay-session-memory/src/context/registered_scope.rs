@@ -86,7 +86,10 @@ fn resolve_authorized_root(
     // A linked checkout can live beneath the registered root. Resolve its
     // actual worktree before ordinary subdirectories converge on that root.
     let nested_worktree = if requested_root.starts_with(&registered_root) {
+        // The topology root is `std::fs::canonicalize` output (`\\?\C:\..` on
+        // Windows); compare it in the same plain form as the roots above.
         tracedecay_runtime_core::worktree::git_worktree_root(&requested_root)
+            .map(|root| tracedecay_runtime_core::path_safety::plain_host_path(&root))
             .filter(|root| root != &registered_root && root.starts_with(&registered_root))
     } else {
         None
