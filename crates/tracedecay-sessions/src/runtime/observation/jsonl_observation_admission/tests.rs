@@ -470,8 +470,41 @@ async fn generation_pin_prevents_slow_consumer_page_eviction() {
     }
 }
 
+fn run_idle_release_fixture_in_child() -> bool {
+    const CHILD: &str = "TRACEDECAY_TEST_JSONL_IDLE_RELEASE_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return false;
+    }
+    let qualified = concat!(
+        module_path!(),
+        "::idle_release_drops_unpinned_prepared_pages_and_keeps_pinned_ones"
+    );
+    let (_, test_name) = qualified.split_once("::").expect("test module path");
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", test_name, "--nocapture"])
+        .env(CHILD, "1")
+        .output()
+        .expect("isolated idle release fixture");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "isolated idle release failed: {stdout} {stderr}"
+    );
+    assert!(
+        stdout.contains("test result: ok. 1 passed;"),
+        "isolated fixture must execute its test: {stdout} {stderr}"
+    );
+    true
+}
+
 #[tokio::test]
 async fn idle_release_drops_unpinned_prepared_pages_and_keeps_pinned_ones() {
+    // Pins protect admitted cache entries; they do not reserve capacity when
+    // unrelated consumers already hold every process-wide slot.
+    if run_idle_release_fixture_in_child() {
+        return;
+    }
     super::install_test_shared_jsonl_preparation_authority();
     let temp = tempfile::TempDir::new().expect("temp directory");
     let mut encoded = serde_json::to_vec(&json!({
@@ -480,9 +513,8 @@ async fn idle_release_drops_unpinned_prepared_pages_and_keeps_pinned_ones() {
     .expect("JSONL payload");
     encoded.push(b'\n');
 
-    // Every test in this binary shares the process-wide page cache, so a
-    // concurrent ingest can capacity-evict any unpinned page. Hold a setup pin
-    // until the cache guard below excludes those evictions.
+    // Keep the setup page pinned until the cache guard excludes eviction and
+    // the idle-release pass adopts it as an unpinned entry.
     let unpinned_path = temp.path().join("unpinned.jsonl");
     std::fs::write(&unpinned_path, &encoded).expect("unpinned JSONL");
     let unpinned_settled = spin_until_jsonl_change_settled(&unpinned_path);
