@@ -421,10 +421,10 @@ fn restore_sigpipe_default() -> std::io::Result<()> {
     if previous == libc::SIG_ERR {
         return Err(std::io::Error::last_os_error());
     }
-    // A blocked mask survives exec, and some launchers (macOS test sandboxes
-    // among them) hand SIGPIPE over blocked: the default action then never
-    // runs and the write fails with EPIPE instead. Unblock it on this thread,
-    // which writes the output and whose mask later threads inherit.
+    // A blocked mask survives exec, and some launchers hand SIGPIPE over
+    // blocked: the default action then never runs and the write fails with
+    // EPIPE instead. Unblock it on this thread, which writes the output and
+    // whose mask later threads inherit.
     // SAFETY: `set` is a local signal set initialised by `sigemptyset` before
     // use, and `pthread_sigmask` only reads it.
     let unblocked = unsafe {
@@ -433,11 +433,34 @@ fn restore_sigpipe_default() -> std::io::Result<()> {
         libc::sigaddset(set.as_mut_ptr(), libc::SIGPIPE);
         libc::pthread_sigmask(libc::SIG_UNBLOCK, set.as_ptr(), std::ptr::null_mut())
     };
-    if unblocked == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::from_raw_os_error(unblocked))
+    if unblocked != 0 {
+        return Err(std::io::Error::from_raw_os_error(unblocked));
     }
+    // The default disposition alone is not enough everywhere. Linux raises
+    // the pipe write's SIGPIPE on the writing thread before the call returns,
+    // so the process ends inside `write`. macOS posts it to the process and
+    // delivers it asynchronously: `write` returns EPIPE first, `println!`
+    // panics, and the panic message reaches stderr before the pending signal
+    // ends the process. End the process the way the signal would have, from
+    // the thread that hit the closed pipe, before anything is printed.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        if message.contains("Broken pipe") {
+            // SAFETY: SIGPIPE's disposition was restored to the default above;
+            // raising it on this thread terminates the process.
+            unsafe {
+                libc::raise(libc::SIGPIPE);
+            }
+        }
+        default_hook(info);
+    }));
+    Ok(())
 }
 
 fn main() -> ExitCode {
