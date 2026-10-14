@@ -8,14 +8,20 @@ _POSIX_LAUNCHER = """#!/bin/sh
 set -eu
 : "${{TEST_TMPDIR:?Bazel did not provide TEST_TMPDIR}}"
 export RUSTUP_HOME="${{RUSTUP_HOME:-$HOME/.rustup}}"
-# The directory holding rustup and its proxies (rust-analyzer among them),
-# which the LSP acceptance puts on the daemon's PATH. The rustup on PATH is
-# the authority; CARGO_HOME is only a fallback, since a CARGO_HOME that
-# holds just a registry (a shared build cache) has no proxies in its bin.
-if rustup_path="$(command -v rustup 2>/dev/null)"; then
-  export TRACEDECAY_TEST_RUSTUP_BIN="$(dirname "$rustup_path")"
-else
-  export TRACEDECAY_TEST_RUSTUP_BIN="${{CARGO_HOME:-$HOME/.cargo}}/bin"
+# The directory holding the rustup proxies (rust-analyzer among them), which
+# the LSP acceptance puts on the daemon's PATH. CARGO_HOME/bin is the usual
+# place; a CARGO_HOME holding just a registry (a shared build cache) has no
+# proxies there, so the directories that can hold them are probed for the
+# proxy itself. A rustup found elsewhere (a package manager stub) does not
+# name the proxy directory, so it is only the last candidate.
+export TRACEDECAY_TEST_RUSTUP_BIN="${{CARGO_HOME:-$HOME/.cargo}}/bin"
+if [ ! -x "$TRACEDECAY_TEST_RUSTUP_BIN/rust-analyzer" ]; then
+  for proxy_dir in "$HOME/.cargo/bin" "$(dirname "$(command -v rust-analyzer 2>/dev/null || echo /nonexistent/x)")" "$(dirname "$(command -v rustup 2>/dev/null || echo /nonexistent/x)")"; do
+    if [ -x "$proxy_dir/rust-analyzer" ]; then
+      export TRACEDECAY_TEST_RUSTUP_BIN="$proxy_dir"
+      break
+    fi
+  done
 fi
 export CARGO_HOME="$TEST_TMPDIR/cargo-home"
 export HOME="$TEST_TMPDIR/home"
@@ -49,9 +55,11 @@ if not defined RUSTUP_HOME set "RUSTUP_HOME=%USERPROFILE%/.rustup"
 if not defined CARGO_HOME set "CARGO_HOME=%USERPROFILE%/.cargo"
 set "TEST_TMPDIR=%TEST_TMPDIR:/=\\%"
 set "TRACEDECAY_TEST_RUSTUP_BIN=%CARGO_HOME%/bin"
-rem The rustup on PATH is the authority for the proxy directory; see the
-rem POSIX launcher. %%~dp$PATH:i resolves rustup.exe through PATH.
-for %%i in (rustup.exe) do if not "%%~dp$PATH:i"=="" set "TRACEDECAY_TEST_RUSTUP_BIN=%%~dp$PATH:i"
+rem The directory holding the rust-analyzer proxy is the authority; see the
+rem POSIX launcher. %%~dp$PATH:i resolves a name through PATH.
+if not exist "%TRACEDECAY_TEST_RUSTUP_BIN%\rust-analyzer.exe" (
+  for %%i in (rust-analyzer.exe) do if not "%%~dp$PATH:i"=="" set "TRACEDECAY_TEST_RUSTUP_BIN=%%~dp$PATH:i"
+)
 set "CARGO_HOME=%TEST_TMPDIR%\\cargo-home"
 set "HOME=%TEST_TMPDIR%\\home"
 set "USERPROFILE=%HOME%"

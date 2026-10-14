@@ -1271,8 +1271,9 @@ time.sleep(60)
     assert_eq!(exhausted.state(), AnalyzerState::Exhausted);
     // Every failed start waits for its child to exit before reporting, so this
     // read races nothing. A starved runner can kill a start before python
-    // wrote its line, which is why only the upper bound is exact.
-    let starts_before = std::fs::read_to_string(&starts_path).unwrap();
+    // wrote its line, or before it wrote any, which is why only the upper
+    // bound is exact and an absent file counts as no starts.
+    let starts_before = std::fs::read_to_string(&starts_path).unwrap_or_default();
     assert!(starts_before.lines().count() <= usize::from(tracedecay_lsp::MAX_ANALYZER_RESTARTS));
 
     std::fs::write(&script_path, fake_lsp_script()).unwrap();
