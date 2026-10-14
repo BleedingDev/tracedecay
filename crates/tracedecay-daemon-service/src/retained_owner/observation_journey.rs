@@ -7350,7 +7350,7 @@ mod tests {
             let inspection = fixture
                 .journey
                 .journal
-                .inspect(&Default::default())
+                .inspect(&JournalInspectionFilterV1::default())
                 .unwrap();
             assert_eq!(inspection.rows.len(), 1);
             let receipts = fixture
@@ -7397,17 +7397,13 @@ mod tests {
                 assert_eq!(receipt.state_generation_after, None);
                 assert_eq!(receipt.provider_receipt_digest, None);
                 assert_eq!(receipt.provider_effect_summary.effect_count, 0);
-                assert!(
-                    receipt
-                        .provider_effect_summary
-                        .stable_memory_refs
-                        .is_empty()
+                assert_eq!(
+                    receipt.provider_effect_summary.stable_memory_refs,
+                    Vec::<String>::new()
                 );
-                assert!(
-                    receipt
-                        .provider_effect_summary
-                        .provider_trace_refs
-                        .is_empty()
+                assert_eq!(
+                    receipt.provider_effect_summary.provider_trace_refs,
+                    Vec::<String>::new()
                 );
             }
             assert_eq!(
