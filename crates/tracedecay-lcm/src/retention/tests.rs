@@ -7,6 +7,11 @@ use tracedecay_privacy::sanitize_lcm_payload_text;
 use tracedecay_runtime_core::db::engine::{
     Connection, Executor, IntoParams, QueryExecutor, TestConnection, params,
 };
+use tracedecay_store::SessionMessageRecord;
+use tracedecay_store::canonical_body::{
+    CanonicalBodyError, INSERT_OBSERVATION_BODY_REFERENCE_SQL, hydrate_json_value, slim_json_value,
+    unpack_body,
+};
 
 use super::*;
 
@@ -70,6 +75,17 @@ async fn insert_message(
     age_days: i64,
     content: &str,
 ) -> Result<i64, String> {
+    insert_scoped_message(conn, PROVIDER, SESSION, ordinal, age_days, content).await
+}
+
+async fn insert_scoped_message(
+    conn: &(impl Executor + ?Sized),
+    provider: &str,
+    session_id: &str,
+    ordinal: i64,
+    age_days: i64,
+    content: &str,
+) -> Result<i64, String> {
     let message_id = format!("msg-{ordinal}");
     let timestamp = NOW - age_days * DAY;
     let sanitization =
@@ -87,9 +103,9 @@ async fn insert_message(
          )
          VALUES (?1, ?2, ?3, 'assistant', ?4, ?5, ?6, ?7, 'inline', NULL, ?8)",
         params![
-            PROVIDER,
+            provider,
             message_id.as_str(),
-            SESSION,
+            session_id,
             ordinal,
             timestamp,
             content,
@@ -102,7 +118,7 @@ async fn insert_message(
     let store_id = fetch_i64(
         conn,
         "SELECT store_id FROM lcm_raw_messages WHERE provider = ?1 AND message_id = ?2",
-        params![PROVIDER, message_id.as_str()],
+        params![provider, message_id.as_str()],
     )
     .await?;
     Ok(store_id)
@@ -114,6 +130,21 @@ async fn make_projection_durable(
     conn: &(impl Executor + ?Sized),
     store_id: i64,
 ) -> Result<String, String> {
+    let mut owners = conn
+        .query(
+            "SELECT provider, session_id FROM lcm_raw_messages WHERE store_id = ?1",
+            params![store_id],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let owner = owners
+        .next()
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "raw owner missing".to_string())?;
+    let provider: String = owner.get(0).map_err(|error| error.to_string())?;
+    let session_id: String = owner.get(1).map_err(|error| error.to_string())?;
+    drop(owners);
     let node_id = format!("node-{store_id}");
     let summary_hash = crate::retrieval_content::projected_content_hash(SUMMARY_TEXT);
     conn.execute(
@@ -124,8 +155,8 @@ async fn make_projection_durable(
          VALUES (?1, ?2, 'conv', ?3, 0, ?4, ?5, 1, 1)",
         params![
             node_id.as_str(),
-            PROVIDER,
-            SESSION,
+            provider.as_str(),
+            session_id.as_str(),
             SUMMARY_TEXT,
             summary_hash.as_str()
         ],
@@ -143,7 +174,7 @@ async fn make_projection_durable(
         "INSERT INTO session_summary_availability(session_id, generation, summary_id, availability)
          VALUES (?1, ?2, ?3, 'available')",
         params![
-            SESSION,
+            session_id.as_str(),
             crate::test_support::FIXTURE_GENERATION,
             node_id.as_str()
         ],
@@ -534,6 +565,158 @@ async fn offload_externalizes_durable_content_after_durability() -> Result<(), S
 }
 
 #[tokio::test]
+async fn canonical_retention_preserves_shared_bytes() -> Result<(), String> {
+    let store = test_store().await?;
+    let content = "canonical shared body 界\n".repeat(512);
+    assert!(content.len() > tracedecay_store::INLINE_BODY_BYTES);
+    let mut observation = serde_json::json!({"payload": {"text": content}});
+    let bodies = slim_json_value(&mut observation).map_err(|error| error.to_string())?;
+    assert_eq!(bodies.len(), 1);
+    let hash = &bodies[0].content_hash;
+    // The observation writer owns this same hash through the canonical
+    // reverse-reference authority; raw retention must never release it.
+    store
+        .conn
+        .execute(
+            INSERT_OBSERVATION_BODY_REFERENCE_SQL,
+            params!["retained-observation", hash.as_str()],
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    for ordinal in 1..=2 {
+        crate::raw::upsert_projection_raw_message(
+            &store.conn,
+            &SessionMessageRecord {
+                provider: PROVIDER.to_string(),
+                message_id: format!("canonical-{ordinal}"),
+                session_id: SESSION.to_string(),
+                role: "assistant".to_string(),
+                timestamp: Some(NOW - 31 * DAY),
+                ordinal,
+                text: content.clone(),
+                kind: Some("chat".to_string()),
+                model: None,
+                tool_names: None,
+                source_path: None,
+                source_offset: None,
+                metadata_json: None,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    let covered =
+        crate::raw::load_raw_message_by_identity(&store.conn, PROVIDER, SESSION, "canonical-1")
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("covered raw missing")?;
+    assert_eq!(covered.content.as_bytes(), content.as_bytes());
+    make_projection_durable(&store.conn, covered.store_id).await?;
+    assert_eq!(count(&store.conn, "session_canonical_bodies").await?, 1);
+    assert_eq!(fetch_i64(&store.conn,
+        "SELECT COUNT(*) FROM lcm_raw_messages WHERE content IS NULL AND storage_kind = 'inline'",
+        (),
+    ).await?, 2);
+    assert_eq!(
+        fetch_str(
+            &store.conn,
+            "SELECT encoding FROM session_canonical_bodies WHERE content_hash = ?1",
+            params![hash.as_str()],
+        )
+        .await?,
+        "deflate"
+    );
+    assert!(
+        fetch_i64(
+            &store.conn,
+            "SELECT LENGTH(body) FROM session_canonical_bodies WHERE content_hash = ?1",
+            params![hash.as_str()],
+        )
+        .await?
+            < content.len() as i64
+    );
+    let payload_dir = crate::payload::payload_dir(&store.storage_root);
+    assert!(!payload_dir.exists());
+    let config = LcmRetentionConfig::default();
+    for (now, expected_drops) in [(NOW, 0), (NOW + 149 * DAY, 0), (NOW + 150 * DAY, 1)] {
+        let report = run_session_retention_authorized(
+            &store.conn,
+            &store.storage_root,
+            "all",
+            None,
+            &config,
+            RetentionMode::Apply,
+            now,
+            &|_| Ok(()),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        assert_eq!(report.dropped.acted, expected_drops);
+        assert_eq!(report.offloaded.eligible, 0);
+        assert_eq!(report.offloaded.acted, 0);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(count(&store.conn, "lcm_external_payloads").await?, 0);
+        assert!(
+            !payload_dir.exists(),
+            "canonical retention must not create plaintext payload files"
+        );
+        let retained_covered =
+            crate::raw::load_raw_message_by_identity(&store.conn, PROVIDER, SESSION, "canonical-1")
+                .await
+                .map_err(|error| error.to_string())?;
+        if expected_drops == 0 {
+            assert_eq!(
+                retained_covered
+                    .ok_or("covered raw disappeared before drop window")?
+                    .content
+                    .as_bytes(),
+                content.as_bytes()
+            );
+        } else {
+            assert!(retained_covered.is_none());
+        }
+        let uncovered =
+            crate::raw::load_raw_message_by_identity(&store.conn, PROVIDER, SESSION, "canonical-2")
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or("uncovered raw missing")?;
+        assert_eq!(uncovered.content.as_bytes(), content.as_bytes());
+        assert_eq!(count(&store.conn, "session_canonical_bodies").await?, 1);
+    }
+    assert_eq!(fetch_i64(&store.conn,
+        "SELECT COUNT(*) FROM session_canonical_body_references
+         WHERE owner_kind = 'observation' AND owner_key = 'retained-observation' AND content_hash = ?1",
+        params![hash.as_str()],
+    ).await?, 1);
+    let mut rows = store.conn.query(
+        "SELECT encoding, body, uncompressed_bytes FROM session_canonical_bodies WHERE content_hash = ?1",
+        params![hash.as_str()],
+    ).await.map_err(|error| error.to_string())?;
+    let row = rows
+        .next()
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or("canonical body missing")?;
+    let bytes = unpack_body(
+        hash,
+        &row.get::<String>(0).map_err(|error| error.to_string())?,
+        &row.get::<Vec<u8>>(1).map_err(|error| error.to_string())?,
+        row.get(2).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    hydrate_json_value(&mut observation, |requested| {
+        assert_eq!(requested, hash);
+        Ok::<_, CanonicalBodyError>(bytes.clone())
+    })
+    .map_err(|error| error.to_string())?;
+    assert_eq!(
+        observation["payload"]["text"].as_str(),
+        Some(content.as_str())
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn offload_cas_preserves_revived_row_and_rolls_back_payload() -> Result<(), String> {
     let store = test_store().await?;
     let original = "stale content".repeat(128);
@@ -599,6 +782,117 @@ async fn offload_cas_preserves_revived_row_and_rolls_back_payload() -> Result<()
         0,
         "failed CAS removes the newly-created payload file"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_retention_leaves_other_owners_eligible_for_global_passes() -> Result<(), String> {
+    for (provider, session_id) in [(PROVIDER, None), ("all", Some(SESSION))] {
+        for drop_rows in [false, true] {
+            let store = test_store().await?;
+            store
+                .conn
+                .execute(
+                    "INSERT INTO sessions(provider, session_id, project_key, project_path)
+                 VALUES ('codex', 'session-b', '/p', '/p')",
+                    (),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            crate::test_support::seed_active_generation(&store.conn, "session-b").await;
+            let config = LcmRetentionConfig {
+                offload_after_days: (!drop_rows).then_some(30),
+                drop_after_days: drop_rows.then_some(180),
+                ..LcmRetentionConfig::default()
+            };
+            let age_days = if drop_rows { 190 } else { 90 };
+            let local = insert_message(&store.conn, 1, age_days, "local old body").await?;
+            let other = insert_scoped_message(
+                &store.conn,
+                "codex",
+                "session-b",
+                2,
+                age_days,
+                "other old body",
+            )
+            .await?;
+            // Both rows are already old when the global aging cursor passes
+            // them. Their later summary sources are the only discovery path.
+            let initial = run_session_retention_authorized(
+                &store.conn,
+                &store.storage_root,
+                "all",
+                None,
+                &config,
+                RetentionMode::Apply,
+                NOW,
+                &|_| Ok(()),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            assert_eq!(initial.dropped.acted + initial.offloaded.acted, 0);
+            make_projection_durable(&store.conn, local).await?;
+            make_projection_durable(&store.conn, other).await?;
+            let scoped = run_session_retention_authorized(
+                &store.conn,
+                &store.storage_root,
+                provider,
+                session_id,
+                &config,
+                RetentionMode::Apply,
+                NOW,
+                &|_| Ok(()),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            assert_eq!(scoped.dropped.acted + scoped.offloaded.acted, 1);
+            assert!(scoped.errors.is_empty(), "{:?}", scoped.errors);
+            let untouched = crate::raw::load_raw_message_by_identity(
+                &store.conn,
+                "codex",
+                "session-b",
+                "msg-2",
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("other owner's raw disappeared")?;
+            assert_eq!(untouched.content, "other old body");
+            assert_eq!(untouched.storage_kind, crate::LcmStorageKind::Inline);
+            let global = run_session_retention_authorized(
+                &store.conn,
+                &store.storage_root,
+                "all",
+                None,
+                &config,
+                RetentionMode::Apply,
+                NOW,
+                &|_| Ok(()),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            assert!(global.errors.is_empty(), "{:?}", global.errors);
+            assert_eq!(
+                global.dropped.acted + global.offloaded.acted,
+                1,
+                "scoped runs must not move the global cursor past another owner's new lineage"
+            );
+            assert_eq!(
+                count(&store.conn, "lcm_raw_messages").await?,
+                if drop_rows { 0 } else { 2 }
+            );
+            if !drop_rows {
+                assert_eq!(
+                    fetch_i64(
+                        &store.conn,
+                        "SELECT COUNT(*) FROM lcm_raw_messages WHERE storage_kind = 'external'",
+                        (),
+                    )
+                    .await?,
+                    2
+                );
+            }
+        }
+    }
     Ok(())
 }
 

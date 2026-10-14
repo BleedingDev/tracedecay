@@ -1141,3 +1141,71 @@ async fn parked_sessions_requeue_once_per_summarizer_binding_in_bounded_pages() 
     assert!(!restarted.has_more);
     assert_eq!(parked_count(&conn).await, 0);
 }
+
+#[tokio::test]
+async fn legacy_executor_failures_recover_once_without_requeuing_immutable_conflicts() {
+    let temp = tempfile::tempdir().unwrap();
+    let conn = parked_queue_store(&temp, &["transient-a", "immutable", "transient-b"]).await;
+    conn.execute_batch(
+        "UPDATE lcm_summary_convergence_queue
+         SET failure_code = CASE WHEN session_id = 'immutable'
+             THEN 'permanent_immutable_summary_conflict' ELSE 'codex_app_server_unavailable' END;",
+    )
+    .await
+    .unwrap();
+    let binding = "unchanged-executable-binding";
+    schema::set_gc_meta(&*conn, "summary_convergence_parked_binding_v1", binding)
+        .await
+        .unwrap();
+    schema::set_gc_meta(&*conn, "summary_convergence_parked_cursor_v1", "complete")
+        .await
+        .unwrap();
+    assert!(
+        summary_convergence::parked_requeue_has_work(&*conn, binding)
+            .await
+            .unwrap()
+    );
+    let first = summary_convergence::requeue_parked_page(&*conn, binding, 1)
+        .await
+        .unwrap();
+    assert_eq!(first.rows_requeued, 1);
+    assert!(first.has_more);
+    let second = summary_convergence::requeue_parked_page(&*conn, binding, 1)
+        .await
+        .unwrap();
+    assert_eq!(second.rows_requeued, 1);
+    summary_convergence::requeue_parked_page(&*conn, binding, 1)
+        .await
+        .unwrap();
+    assert_eq!(parked_count(&conn).await, 1);
+    assert_eq!(
+        fetch_i64(
+            &conn,
+            "SELECT COUNT(*) FROM lcm_summary_convergence_queue WHERE session_id = 'immutable'
+         AND state = 'unavailable' AND failure_code = 'permanent_immutable_summary_conflict'",
+            ()
+        )
+        .await,
+        1
+    );
+    // A genuine missing configuration still parks until the binding changes.
+    conn.execute_batch(
+        "UPDATE lcm_summary_convergence_queue SET state = 'unavailable',
+        failure_code = 'codex_app_server_unconfigured' WHERE session_id != 'immutable'",
+    )
+    .await
+    .unwrap();
+    assert!(
+        !summary_convergence::parked_requeue_has_work(&*conn, binding)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        summary_convergence::requeue_parked_page(&*conn, "configured-binding", 8)
+            .await
+            .unwrap()
+            .rows_requeued,
+        2
+    );
+    assert_eq!(parked_count(&conn).await, 1);
+}

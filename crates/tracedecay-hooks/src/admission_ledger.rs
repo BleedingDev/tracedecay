@@ -313,7 +313,7 @@ pub fn hook_admission_digest(
 #[derive(Debug)]
 pub struct HookAdmissionLedgerV1 {
     root: PathBuf,
-    _writer_lock: FileLease,
+    writer_lock: FileLease,
     host: NativeHostIdentityV1,
     limits: HookAdmissionLedgerLimitsV1,
     entries: BTreeMap<[u8; IDENTITY_BYTES], LedgerEntry>,
@@ -366,7 +366,7 @@ impl HookAdmissionLedgerV1 {
         let file = Arc::new(open_log_file(&path, log_exists)?);
         let mut ledger = Self {
             root,
-            _writer_lock: writer_lock,
+            writer_lock,
             host,
             limits,
             entries: BTreeMap::new(),
@@ -526,6 +526,57 @@ impl HookAdmissionLedgerV1 {
         self.completed_work.insert(identity);
         self.compact_if_sparse()?;
         Ok(Some(self.commit_ticket()))
+    }
+
+    /// Nonmutating root inspection shared by retained and unopened ledger readers.
+    pub fn root_exists(root: &Path) -> Result<bool, HookAdmissionLedgerError> {
+        tracedecay_private_fs::framed_log::validate_directory_or_missing(root).map_err(|error| {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput
+                    | io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::NotADirectory
+            ) {
+                HookAdmissionLedgerError::UnsafePath
+            } else {
+                HookAdmissionLedgerError::Io
+            }
+        })
+    }
+
+    /// Refuse a removed or substituted storage path even when its writer is retained.
+    pub fn validate_storage(&self) -> Result<(), HookAdmissionLedgerError> {
+        if !Self::root_exists(&self.root)? {
+            return Err(HookAdmissionLedgerError::Io);
+        }
+        for (path, retained) in [
+            (log_path(&self.root), self.file.as_ref()),
+            (self.root.join(LOCK_FILE), &*self.writer_lock),
+        ] {
+            tracedecay_private_fs::framed_log::validate_retained_file(&path, retained).map_err(
+                |error| {
+                    if error.kind() == io::ErrorKind::InvalidInput {
+                        HookAdmissionLedgerError::UnsafePath
+                    } else {
+                        HookAdmissionLedgerError::Io
+                    }
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Read the retained bounded index without opening, repairing or expiring it.
+    /// A write awaiting durability cannot certify producer completion yet.
+    pub fn pending_work_count(&self) -> Result<usize, HookAdmissionLedgerError> {
+        self.validate_storage()?;
+        if self.needs_reopen() {
+            return Err(HookAdmissionLedgerError::Io);
+        }
+        if self.commits_in_flight() {
+            return Err(HookAdmissionLedgerError::Busy);
+        }
+        Ok(self.pending_work.len())
     }
 
     /// Provider envelopes whose producer work is still owed, oldest admission

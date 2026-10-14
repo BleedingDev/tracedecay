@@ -16,6 +16,9 @@ use tracedecay_contracts::{RequestContext, SessionTemporalRefreshWakePort};
 use tracedecay_domain::ProjectId;
 
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
+use tracedecay_session_memory::context::{
+    RequestInterruption, run_application_request_interruptible,
+};
 use tracedecay_session_memory::session::{
     AuthorizationGrantId, SessionAuthorizationError, SessionAuthorizationGrant,
     SessionRefreshAction, SessionRefreshCommand, SessionRefreshConfiguration,
@@ -130,6 +133,33 @@ impl DaemonSessionRefreshService {
                     reason: SessionRefreshUnavailable::Configuration(error).to_string(),
                 };
             }
+        };
+        // Status remains a read. Begin/cancel share the exact generation owner
+        // with projection and compaction, including independently issued leases.
+        let _publication = if matches!(
+            command.action,
+            SessionRefreshAction::Begin | SessionRefreshAction::Cancel
+        ) {
+            Some(
+                match run_application_request_interruptible(
+                    &command.context,
+                    command.binding.cancellation(),
+                    self.database.session_publication_guard(),
+                    || {},
+                )
+                .await
+                {
+                    Ok(guard) => guard,
+                    Err(RequestInterruption::Cancelled) => {
+                        return SessionRefreshServiceOutcome::Aborted;
+                    }
+                    Err(RequestInterruption::DeadlineExceeded) => {
+                        return SessionRefreshServiceOutcome::DeadlineExceeded;
+                    }
+                },
+            )
+        } else {
+            None
         };
         let service = SessionRefreshService::new(
             DaemonSessionRefreshAuthorizer {

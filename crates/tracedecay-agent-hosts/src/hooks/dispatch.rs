@@ -136,7 +136,15 @@ pub fn worktree_id_for_layout(
 pub fn publish_daemon_bindings(
     runtime: &HookRuntimeV1,
     layout: &tracedecay_runtime_core::storage::StoreLayout,
-) -> tracedecay_domain::errors::Result<()> {
+) -> tracedecay_domain::errors::Result<Vec<tracedecay_hooks::OwnedHookConfigurationV1>> {
+    publish_daemon_bindings_for_open(runtime, layout, None)
+}
+
+pub fn publish_daemon_bindings_for_open(
+    runtime: &HookRuntimeV1,
+    layout: &tracedecay_runtime_core::storage::StoreLayout,
+    recovery: Option<&[tracedecay_hooks::HookConfigurationSnapshotV1]>,
+) -> tracedecay_domain::errors::Result<Vec<tracedecay_hooks::OwnedHookConfigurationV1>> {
     let project_key = layout.identity.project_id.as_deref().ok_or_else(|| {
         tracedecay_domain::errors::TraceDecayError::Config {
             message: "cannot publish Hook binding without typed project identity".to_owned(),
@@ -147,6 +155,19 @@ pub fn publish_daemon_bindings(
     let revision = now.0.max(1) as u64;
     let (project_id, repository_id, worktree_id, worktree_epoch) =
         binding_identity_from_scope(&scope, revision);
+    let mut publications = Vec::new();
+    let mut conditional = Vec::new();
+    if recovery.is_some_and(|recovery| recovery.len() != NATIVE_HOOK_HOSTS.len()) {
+        return Err(tracedecay_domain::errors::TraceDecayError::Config {
+            message: "automatic hook recovery requires every exact host publication".to_owned(),
+        });
+    }
+    let expires_at = now
+        .0
+        .checked_add(tracedecay_hooks::HOOK_BINDING_LEASE_MICROS)
+        .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+            message: "Hook binding lease timestamp overflow".to_owned(),
+        })?;
     for host in NATIVE_HOOK_HOSTS {
         // Publish a binding only after its transport is ready. Otherwise the
         // first live callback initializes the shared host spool while holding
@@ -232,19 +253,41 @@ pub fn publish_daemon_bindings(
             schema_version: tracedecay_hooks::HOOK_CONFIGURATION_SCHEMA_VERSION,
             revision,
             published_at: now,
-            expires_at: UtcMicros(now.0.saturating_add(24 * 60 * 60 * 1_000_000)),
+            expires_at: UtcMicros(expires_at),
             binding,
         };
-        tracedecay_hooks::HookConfigurationPublisherV1::new(writer)
-            .publish(snapshot)
-            .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
-                message: format!(
-                    "failed to publish {} Hook binding: {error}",
-                    host.hook_key()
-                ),
-            })?;
+        if let Some(recovery) = recovery {
+            let expected = recovery
+                .iter()
+                .find(|expected| expected.binding.host == *host)
+                .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+                    message: format!(
+                        "automatic hook recovery has no {} publication",
+                        host.hook_key()
+                    ),
+                })?;
+            conditional.push((writer, expected.clone(), snapshot));
+        } else {
+            let publication = tracedecay_hooks::HookConfigurationPublisherV1::new(writer)
+                .publish_owned(snapshot)
+                .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
+                    message: format!(
+                        "failed to publish {} Hook binding: {error}",
+                        host.hook_key()
+                    ),
+                })?;
+            publications.push(publication);
+        }
     }
-    Ok(())
+    if recovery.is_some() {
+        return tracedecay_hooks::HookConfigurationPublisherV1::publish_owned_batch_if_current(
+            conditional,
+        )
+        .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
+            message: format!("automatic hook publication recovery refused: {error}"),
+        });
+    }
+    Ok(publications)
 }
 
 fn binding_identity_from_scope(

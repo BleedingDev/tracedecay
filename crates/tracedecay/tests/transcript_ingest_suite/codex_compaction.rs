@@ -17,11 +17,8 @@ use tracedecay_domain::ObservationScopeV1;
 use tracedecay_domain::ProjectId;
 #[cfg(unix)]
 use tracedecay_lcm::{
-    LcmCompressionRequest, LcmContentSlice, LcmDescribeRequest, LcmDescribeTarget,
-    LcmExpandRequest, LcmExpandTarget, LcmSummarizerMode,
+    LcmContentSlice, LcmDescribeRequest, LcmDescribeTarget, LcmExpandRequest, LcmExpandTarget,
 };
-#[cfg(unix)]
-use tracedecay_project::project::TraceDecayOpenOptions;
 use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_runtime_core::config::ProfileRoot;
 #[cfg(unix)]
@@ -33,7 +30,7 @@ use tracedecay_sessions::runtime::hosts::codex::codex_observation_source_v2;
 use tracedecay_sessions::runtime::{SessionProvider, with_transcript_source_profile};
 
 #[cfg(unix)]
-use crate::common::{TestChildProcess, spawn_tracedecay_daemon, tracedecay_command_with_home};
+use crate::common::{TestChildProcess, spawn_tracedecay_daemon_with, tracedecay_command_with_home};
 #[cfg(unix)]
 use crate::restart_atomicity::mark_test_project;
 use crate::support::setup;
@@ -181,8 +178,11 @@ async fn codex_post_compact_defers_summary_to_the_lcm_owner() {
         &codex_bin,
         r#"#!/bin/sh
 while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$TRACEDECAY_TEST_CODEX_REQUESTS"
   case "$line" in
     *'"id":0'*) printf '%s\n' '{"id":0,"result":{}}' ;;
+    *'"id":3'*) printf '%s\n' '{"id":3,"result":{"config":{"mcp_servers":{},"profiles":{}}}}' ;;
+    *'"id":4'*) printf '%s\n' '{"id":4,"result":{"data":[{"skills":[],"errors":[]}]}}' ;;
     *'"id":1'*) printf '%s\n' '{"id":1,"result":{"thread":{"id":"thread-1","model":"codex-hook-test"}}}' ;;
     *'"id":2'*)
       printf '%s\n' '{"method":"item/completed","params":{"model":"codex-hook-test","item":{"content":[{"type":"output_text","text":"Codex authoritative hook summary"}]}}}'
@@ -212,7 +212,12 @@ done
     drop(enrollment);
     let rollout = write_codex_rollout_with_compaction(&home, &project, "codex-compact");
 
-    let daemon = spawn_tracedecay_daemon(&home);
+    // Record actor turns to prove the canonical daemon owner summarizes this
+    // exact admitted range once.
+    let requests = tmp.path().join("codex-requests.jsonl");
+    let daemon = spawn_tracedecay_daemon_with(&home, |command| {
+        command.env("TRACEDECAY_TEST_CODEX_REQUESTS", &requests);
+    });
     let event = serde_json::json!({
         "hook_event_name": "PostCompact",
         "session_id": "codex-compact",
@@ -245,6 +250,45 @@ done
         "the PostCompact hook must not fail open around canonical intake: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // Query the daemon's production read authority until its background owner
+    // publishes the summary; no foreground compression can mask broken routing.
+    let publication_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = publication_deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!remaining.is_zero(), "daemon LCM owner did not publish its summary");
+        let child = tracedecay_command_with_home(&home)
+            .current_dir(&project)
+            .args(["tool", "tracedecay_lcm_status", "--json", "--args"])
+            .arg(serde_json::json!({
+                "provider": "codex",
+                "session_id": "codex-compact"
+            }).to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let output = TestChildProcess::new(child)
+            .wait_with_output(remaining)
+            .expect("daemon status read must complete within the publication deadline");
+        assert!(
+            output.status.success(),
+            "daemon LCM status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let printed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let status: tracedecay_contracts::retained_surfaces::LcmStatusResultV1 =
+            serde_json::from_value(printed["structuredContent"]["outcome"]["value"]["payload"].clone())
+                .unwrap();
+        let lcm = status.lcm.expect("daemon status must retain its canonical LCM authority");
+        if lcm.summary_node_count > 0 {
+            assert_eq!(lcm.raw_message_count, 4);
+            assert_eq!(lcm.summary_node_count, 1);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     drop(daemon);
 
     let runtime = HostAdmissionTestRuntimeV1::project(&profile, &project, project_id.clone())
@@ -262,8 +306,8 @@ done
         std::fs::metadata(&rollout).unwrap().len()
     );
 
-    // PostCompact returns before projection settles. Drain its durable work
-    // after stopping the daemon, without rereading or admitting the rollout.
+    // Settle any remaining durable projection work after shutdown, without
+    // rereading or admitting the rollout.
     let drained = runtime
         .facade()
         .drain_projection_queue(
@@ -281,54 +325,17 @@ done
         .await
         .unwrap();
     assert_eq!(status.raw_message_count, 4);
-
-    // The real background owner may settle before the daemon stops. Otherwise
-    // drive its canonical LCM effect explicitly, without requiring the host
-    // callback to wait for the configured app-server.
-    if status.summary_node_count == 0 {
-        let _configuration_project = runtime
-            .open_project_graph_read_only_for_test(
-                &project,
-                TraceDecayOpenOptions::for_profile(&ProfileRoot::new(&profile).with_home(&home)),
-            )
-            .await
-            .unwrap();
-        let compressed = runtime
-            .lcm_compress_for_test(LcmCompressionRequest {
-                provider: "codex".to_string(),
-                session_id: "codex-compact".to_string(),
-                messages: Vec::new(),
-                current_tokens: Some(124_000),
-                focus_topic: None,
-                ignore_session_patterns: Vec::new(),
-                stateless_session_patterns: Vec::new(),
-                ignore_message_patterns: Vec::new(),
-                expected_current_frontier_store_id: None,
-                threshold_tokens: None,
-                max_assembly_tokens: None,
-                leaf_chunk_tokens: None,
-                max_source_messages: None,
-                summary_fan_in: None,
-                incremental_max_depth: None,
-                fresh_tail_count: None,
-                dynamic_leaf_chunk_enabled: None,
-                dynamic_leaf_chunk_max: None,
-                context_length: Some(128_000),
-                reserve_tokens_floor: None,
-                summarizer: LcmSummarizerMode::HermesAuxiliary,
-            })
-            .await
-            .unwrap();
-        assert_eq!(compressed.status, "ok");
-        assert_eq!(compressed.summary_nodes_created, 1);
-    }
-
-    let status = runtime
-        .lcm_status_for_test("codex", Some("codex-compact"))
-        .await
-        .unwrap();
-    assert_eq!(status.raw_message_count, 4);
     assert_eq!(status.summary_node_count, 1);
+    let recorded = std::fs::read_to_string(&requests).unwrap();
+    let turns = recorded
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|request| request["method"] == "turn/start")
+        .count();
+    assert_eq!(
+        turns, 1,
+        "the canonical daemon owner executes the summary exactly once"
+    );
     assert!(status.dag.depths.values().any(|depth| depth.count == 1));
 
     let description = runtime

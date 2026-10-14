@@ -362,6 +362,18 @@ impl McpServer {
         _deadline: tokio::time::Instant,
     ) -> Vec<String> {
         let mut failures = Vec::new();
+        // Closing the same admission branch swaps check under the graph lock
+        // makes this final snapshot stable even when a reopen is in flight.
+        self.background_tasks.close_admission();
+        // Join a registration that passed admission under the graph write
+        // lock before inspecting its receipt; it may still be recording it.
+        let graph = self.cg_snapshot().await;
+        if self.hook_replay_owned.swap(false, Ordering::AcqRel) {
+            crate::daemon::hook_v2_replay_consumer::shutdown_hook_v2_replay_consumer_for_graph(
+                &graph,
+            )
+            .await;
+        }
         #[cfg(feature = "memory-provider-host")]
         for outcome in futures_util::future::join_all(
             self._observation_journey_mount

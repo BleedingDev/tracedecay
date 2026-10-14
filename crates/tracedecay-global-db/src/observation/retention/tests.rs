@@ -212,6 +212,385 @@ async fn fetch_str(conn: &RetentionTestStore, sql: &str) -> Result<String, Strin
         .map_err(|e| e.to_string())
 }
 
+async fn seed_active_ledger(conn: &RetentionTestStore, count: i64) -> Result<(), String> {
+    conn.execute(
+        "WITH RECURSIVE numbers(n) AS (
+             SELECT 1 UNION ALL SELECT n + 1 FROM numbers WHERE n < ?1
+         )
+         INSERT INTO retrieval_anchors(anchor_id, anchor_json, owner_json, projection_generation)
+         SELECT printf('active-%06d', n), '{}', ?2, ?3 FROM numbers",
+        params![count, OWNER, GEN],
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    conn.execute(
+        "INSERT INTO retrieval_anchor_dispositions(disposition_id, anchor_id, owner_json,
+             state, reason_class, effective_at, record_json)
+         SELECT 'disp-' || anchor_id, anchor_id, owner_json,
+                'active', 'retention', ?1, '{}'
+         FROM retrieval_anchors WHERE anchor_id LIKE 'active-%' ORDER BY anchor_id",
+        params![NOW - 90 * DAY],
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn cursor(conn: &RetentionTestStore, pass: &str) -> Result<LedgerCursor, String> {
+    LedgerCursor::read(&conn.database().read_connection(), pass)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tokio::test]
+async fn active_ledger_pages_commit_progress_and_eventually_reach_late_releases()
+-> Result<(), String> {
+    let conn = test_store().await;
+    let config = ObservationRetentionConfig {
+        max_batch_size: 64,
+        ..released_config()
+    };
+    // Establish the aged frontier before the retroactively dated release is
+    // appended. Only the appended scan can discover that later release.
+    run_apply(&conn, None, &config).await?;
+    seed_active_ledger(&conn, 1024).await?;
+    seed_evidence(&conn, "late-release", GEN, 4096).await?;
+    set_disposition(&conn, "late-release", "deleted", NOW - 90 * DAY, None).await?;
+
+    for tick in 1..=17 {
+        let report = run_apply(&conn, None, &config).await?;
+        let expected = (tick * 64).min(1025);
+        for pass in ["anchor", "observation", "provenance"] {
+            assert_eq!(cursor(&conn, pass).await?.appended_through, expected);
+        }
+        assert_eq!(report.anchors_released.acted, u64::from(tick == 17));
+        assert_eq!(report.observations_released.acted, u64::from(tick == 17));
+        assert_eq!(report.provenance_released.acted, u64::from(tick == 17));
+        assert_eq!(
+            report.pending,
+            tick < 17,
+            "pending must include full active pages"
+        );
+    }
+    assert!(!run_apply(&conn, None, &config).await?.pending);
+    assert_eq!(
+        fetch_i64(
+            &conn,
+            "SELECT COUNT(*) FROM retrieval_anchors WHERE anchor_id LIKE 'active-%'
+         AND anchor_json = '{}'"
+        )
+        .await?,
+        1024
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn aging_releases_progress_while_appended_releases_fill_the_batch() -> Result<(), String> {
+    let conn = test_store().await;
+    let config = ObservationRetentionConfig {
+        max_batch_size: 1,
+        ..released_config()
+    };
+    seed_evidence(&conn, "z-aging", GEN, 4096).await?;
+    set_disposition(&conn, "z-aging", "deleted", NOW - 10 * DAY, None).await?;
+    assert_eq!(
+        run_apply(&conn, None, &config)
+            .await?
+            .anchors_released
+            .acted,
+        0
+    );
+    seed_evidence(&conn, "a-appended", GEN, 4096).await?;
+    set_disposition(&conn, "a-appended", "deleted", NOW - 90 * DAY, None).await?;
+    for id in ["a-appended", "z-aging"] {
+        let report = conn
+            .database()
+            .run_observation_retention(
+                None,
+                &config,
+                RetentionMode::Apply,
+                UtcMicros(NOW + 25 * DAY),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(report.anchors_released.acted, 1);
+        let mut rows = conn
+            .query(
+                "SELECT anchor_json FROM retrieval_anchors WHERE anchor_id = ?1",
+                params![id],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let row = rows
+            .next()
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or("anchor row")?;
+        assert!(is_released(
+            &row.get::<String>(0).map_err(|error| error.to_string())?
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_progress_reaches_late_evidence_without_changing_global_or_dry_run_cursors()
+-> Result<(), String> {
+    let conn = test_store().await;
+    let config = ObservationRetentionConfig {
+        max_batch_size: 16,
+        ..released_config()
+    };
+    run_apply(&conn, Some(OTHER_GEN), &config).await?;
+    seed_active_ledger(&conn, 80).await?;
+    run_apply(&conn, None, &config).await?;
+    let global = cursor(&conn, "anchor").await?;
+    seed_evidence(&conn, "scoped-late", OTHER_GEN, 4096).await?;
+    set_disposition(&conn, "scoped-late", "deleted", NOW - 90 * DAY, None).await?;
+    let scoped_pass = format!(
+        "scoped.{}",
+        serde_json::to_string(&("anchor", OTHER_GEN)).unwrap()
+    );
+    for tick in 1..=6 {
+        let report = run_apply(&conn, Some(OTHER_GEN), &config).await?;
+        assert_eq!(report.anchors_released.acted, u64::from(tick == 6));
+        assert_eq!(report.pending, tick < 6);
+        assert_eq!(cursor(&conn, "anchor").await?, global);
+    }
+    assert_eq!(cursor(&conn, &scoped_pass).await?.appended_through, 81);
+    assert!(is_released(
+        &fetch_str(
+            &conn,
+            "SELECT anchor_json FROM retrieval_anchors WHERE anchor_id = 'scoped-late'"
+        )
+        .await?
+    ));
+    let scoped_before = cursor(&conn, &scoped_pass).await?;
+    seed_evidence(&conn, "dry-run-late", OTHER_GEN, 4096).await?;
+    set_disposition(&conn, "dry-run-late", "deleted", NOW - 90 * DAY, None).await?;
+    let dry = conn
+        .database()
+        .run_observation_retention(
+            Some(OTHER_GEN),
+            &config,
+            RetentionMode::DryRun,
+            UtcMicros(NOW),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    assert_eq!(dry.anchors_released.eligible, 1);
+    assert_eq!(dry.anchors_released.acted, 0);
+    assert!(
+        !dry.pending,
+        "a dry run must not schedule applied continuation"
+    );
+    assert_eq!(cursor(&conn, &scoped_pass).await?, scoped_before);
+    assert_eq!(cursor(&conn, "anchor").await?, global);
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_release_keeps_payload_and_cursor_retryable() -> Result<(), String> {
+    let conn = test_store().await;
+    seed_evidence(&conn, "retry-release", GEN, 4096).await?;
+    set_disposition(&conn, "retry-release", "deleted", NOW - 90 * DAY, None).await?;
+    let before = cursor(&conn, "anchor").await?;
+    conn.execute_batch(
+        "CREATE TRIGGER reject_retention_test BEFORE UPDATE ON retrieval_anchors
+        BEGIN SELECT RAISE(ABORT, 'injected release failure'); END",
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let failed = run_apply(&conn, None, &released_config()).await?;
+    assert!(
+        failed
+            .errors
+            .iter()
+            .any(|error| error.contains("injected release failure"))
+    );
+    assert_eq!(failed.anchors_released.acted, 0);
+    assert!(failed.pending, "failed releases remain pending for retry");
+    assert_eq!(cursor(&conn, "anchor").await?, before);
+    assert!(!is_released(
+        &fetch_str(
+            &conn,
+            "SELECT anchor_json FROM retrieval_anchors WHERE anchor_id = 'retry-release'"
+        )
+        .await?
+    ));
+    conn.execute_batch("DROP TRIGGER reject_retention_test")
+        .await
+        .map_err(|error| error.to_string())?;
+    assert_eq!(
+        run_apply(&conn, None, &released_config())
+            .await?
+            .anchors_released
+            .acted,
+        1
+    );
+    assert_eq!(cursor(&conn, "anchor").await?.appended_through, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cursor_commit_failure_rolls_back_payload_release_and_immutable_guards()
+-> Result<(), String> {
+    let conn = test_store().await;
+    seed_evidence(&conn, "atomic-release", GEN, 4096).await?;
+    set_disposition(&conn, "atomic-release", "deleted", NOW - 90 * DAY, None).await?;
+    let before = cursor(&conn, "anchor").await?;
+    conn.execute_batch(
+        "CREATE TRIGGER reject_retention_cursor_test
+        BEFORE INSERT ON session_backfill_meta
+        WHEN NEW.key = 'observation_retention.anchor.ledger_cursor'
+        BEGIN SELECT RAISE(ABORT, 'injected cursor failure'); END",
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let error = run_apply(&conn, None, &released_config())
+        .await
+        .expect_err("cursor write must fail");
+    assert!(error.contains("injected cursor failure"));
+    assert_eq!(cursor(&conn, "anchor").await?, before);
+    assert!(!is_released(
+        &fetch_str(
+            &conn,
+            "SELECT anchor_json FROM retrieval_anchors WHERE anchor_id = 'atomic-release'"
+        )
+        .await?
+    ));
+    assert!(
+        conn.execute(
+            "UPDATE retrieval_anchors SET anchor_json = '{}' WHERE anchor_id = 'atomic-release'",
+            ()
+        )
+        .await
+        .is_err()
+    );
+    conn.execute_batch("DROP TRIGGER reject_retention_cursor_test")
+        .await
+        .map_err(|error| error.to_string())?;
+    assert_eq!(
+        run_apply(&conn, None, &released_config())
+            .await?
+            .anchors_released
+            .acted,
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn payload_batches_drain_both_ledger_sources_before_cursors_advance() -> Result<(), String> {
+    let conn = test_store().await;
+    let config = ObservationRetentionConfig {
+        max_batch_size: 2,
+        ..released_config()
+    };
+    for id in ["z-aging-1", "z-aging-2"] {
+        seed_evidence(&conn, id, GEN, 4096).await?;
+        set_disposition(&conn, id, "deleted", NOW - 10 * DAY, None).await?;
+    }
+    run_apply(&conn, None, &config).await?;
+    for id in ["a-appended-1", "a-appended-2"] {
+        seed_evidence(&conn, id, GEN, 4096).await?;
+        set_disposition(&conn, id, "deleted", NOW - 90 * DAY, None).await?;
+    }
+    // Each source contributes two distinct anchors, while each payload pass
+    // can release only two rows. Both pages must remain retryable after the
+    // first batch, including the aging candidates absent from the append page.
+    for expected_cursor in [2, 4] {
+        let report = conn
+            .database()
+            .run_observation_retention(
+                None,
+                &config,
+                RetentionMode::Apply,
+                UtcMicros(NOW + 25 * DAY),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(report.anchors_released.acted, 2);
+        assert_eq!(report.observations_released.acted, 2);
+        assert_eq!(report.provenance_released.acted, 2);
+        assert!(
+            report.pending,
+            "full pages and release overflow need continuation"
+        );
+        for pass in ["anchor", "observation", "provenance"] {
+            assert_eq!(cursor(&conn, pass).await?.appended_through, expected_cursor);
+        }
+    }
+    let exhausted = conn
+        .database()
+        .run_observation_retention(
+            None,
+            &config,
+            RetentionMode::Apply,
+            UtcMicros(NOW + 25 * DAY),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    assert!(!exhausted.pending);
+    assert_eq!(exhausted.observations_released.acted, 0);
+    assert_eq!(fetch_i64(&conn,
+        "SELECT COUNT(*) FROM observations WHERE observation_json = '{\"__retention_released\":\"observation\"}'"
+    ).await?, 4);
+    Ok(())
+}
+
+#[tokio::test]
+async fn aged_scan_seeks_past_examined_rows_without_repeating_the_prefix() -> Result<(), String> {
+    let store = test_store().await;
+    seed_active_ledger(&store, 20000).await?;
+    store
+        .execute(
+            "INSERT INTO retrieval_anchor_dispositions(disposition_id, anchor_id, owner_json,
+             state, reason_class, effective_at, record_json)
+         SELECT 'deleted-' || anchor_id, anchor_id, owner_json,
+                'deleted', 'retention', CAST(substr(anchor_id, 8) AS INTEGER), '{}'
+         FROM retrieval_anchors WHERE anchor_id LIKE 'active-%' ORDER BY anchor_id",
+            (),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    // Read the admitted fixture schema with SQLite's VM-work counter. No
+    // alternate schema or runtime participates in the retention calculation.
+    let conn = rusqlite::Connection::open_with_flags(
+        store.database().db_path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|error| error.to_string())?;
+    let sql = aged_dispositions_sql();
+    let mut steps = Vec::new();
+    for after in [0, 19000] {
+        let mut statement = conn.prepare(&sql).unwrap();
+        let mut rows = statement
+            .query(rusqlite::params![
+                30000,
+                after,
+                20000 + after,
+                DISPOSITION_SCAN_PAGE_ROWS
+            ])
+            .unwrap();
+        let mut examined = 0;
+        while let Some(row) = rows.next().unwrap() {
+            examined += 1;
+            assert_eq!(row.get::<_, i64>(0).unwrap(), 20000 + after + examined);
+        }
+        drop(rows);
+        assert_eq!(examined, DISPOSITION_SCAN_PAGE_ROWS);
+        steps.push(statement.get_status(rusqlite::StatementStatus::VmStep));
+    }
+    assert!(steps[0] > 0);
+    assert!(
+        steps[1] <= steps[0] * 2,
+        "page VM work grew with the visited prefix: {steps:?}"
+    );
+    Ok(())
+}
+
 /// A run resumes from its ledger cursor: a later run releases evidence whose
 /// disposition was appended after the previous run, or aged past the window
 /// since, and leaves what earlier runs already released alone.

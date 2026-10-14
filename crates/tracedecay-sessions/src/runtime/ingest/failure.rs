@@ -109,6 +109,10 @@ impl ProviderRunFailure for TranscriptCatchUpFailure {
     }
 }
 
+// Bound newly parsed nonempty failures. Cached outcomes and zero-byte files
+// do not spend this work allowance, so failed prefixes cannot starve peers.
+pub(super) const MAX_CODEX_SOURCE_FAILURES_PER_PASS: usize = 8;
+
 pub(in crate::runtime) type ProviderRunOutcome =
     GenericProviderRunOutcome<TranscriptCatchUpFailure>;
 pub(super) type ProviderRunFold = GenericProviderRunFold<TranscriptCatchUpFailure>;
@@ -358,6 +362,9 @@ pub fn classify_transcript_ingest_disposition(
         }
         source::TranscriptIngestError::Store(TranscriptStoreError::InvalidCursorPath) => {
             ("transcript_cursor_path_invalid", false, Degraded)
+        }
+        source::TranscriptIngestError::SourceMetadataPending { .. } => {
+            ("transcript_source_metadata_pending", true, Backpressured)
         }
         source::TranscriptIngestError::ScanIo { .. } => {
             ("transcript_source_io_failed", true, Unavailable)

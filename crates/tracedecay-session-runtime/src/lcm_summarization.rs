@@ -2,9 +2,12 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tracedecay_domain::CanonicalObservationEnvelopeV1;
-use tracedecay_domain::configuration::LcmSummarizerExecutablesV1;
+use tracedecay_domain::configuration::{
+    ConfigurationValueV1, LcmSummarizerExecutablesV1, USER_LCM_CODEX_SUMMARIZER_SETTING_KEY,
+};
 
 use tracedecay_global_db::RegisteredGlobalDb;
+use tracedecay_global_db::configuration::ProfileConfigurationStore;
 use tracedecay_global_db::observation::decode_observation_json;
 use tracedecay_lcm::raw::{
     LcmPredecessorRangeState, RAW_MESSAGE_SELECT_COLUMNS, predecessor_range_state,
@@ -25,7 +28,7 @@ mod provider_capabilities;
 mod summarizer_executable_tests;
 
 #[cfg(test)]
-use provider_capabilities::{CODEX_APP_SERVER_UNCONFIGURED, CURSOR_AGENT_UNCONFIGURED};
+use provider_capabilities::CODEX_APP_SERVER_UNCONFIGURED;
 use provider_capabilities::{
     NativeSummaryCandidate, authoritative_summarizer, native_summary_recognizers,
 };
@@ -55,6 +58,9 @@ pub(super) async fn resolve_authoritative_summary(
     timeout: Duration,
     required_native_source_range: Option<&LcmSummarySourceRange>,
 ) -> Result<AuthoritativeSummary, SummaryResolutionError> {
+    if request.provider != provider || request.session_id != session_id {
+        return Err(LcmError::SummarySourceNotOwnedBySession.into());
+    }
     if let Some(summary) =
         native_summary_evidence(database, provider, session_id, Some(request)).await?
         && required_native_source_range
@@ -72,26 +78,30 @@ async fn generate_provider_summary(
     request: &LcmSummaryRequest,
     timeout: Duration,
 ) -> Result<AuthoritativeSummary, SummaryResolutionError> {
-    let Some(summarizer) = authoritative_summarizer(provider) else {
+    let executor = if database.binding().shard_id.scope == StoreShardScopeV1::ProfileSessions {
+        "codex"
+    } else {
+        provider
+    };
+    let Some(summarizer) = authoritative_summarizer(executor) else {
         return Err(SummaryResolutionError::Unavailable(
             "authoritative_summarizer_unavailable",
         ));
     };
     // The binding is read before the summarizer runs, so an unconfigured or
     // unreadable setting is a typed pending reason and never a spawn.
-    let executables = summarizer_executables(database)?;
-    // Provider summarizers run on a blocking thread and need an owned request.
-    summarizer
-        .summarize(request.clone(), timeout, &executables)
-        .await
+    let executables = summarizer_executables(database).await?;
+    // The provider borrows until its executable is configured, then owns the
+    // bounded request for its blocking model turn.
+    summarizer.summarize(request, timeout, &executables).await
 }
 
 /// The summarizer executables configured for the shard `database` serves.
 ///
 /// Project shards read the daemon-published pin for their registered project.
-/// Profile-wide shards have no project configuration authority, so every
-/// provider is unconfigured there and their sessions stay pending.
-fn summarizer_executables(
+/// Profile sessions use their own explicit Codex executor for any source
+/// provider. The source provider remains the summary's provenance authority.
+async fn summarizer_executables(
     database: &RegisteredGlobalDb,
 ) -> Result<LcmSummarizerExecutablesV1, SummaryResolutionError> {
     match &database.binding().shard_id.scope {
@@ -109,9 +119,39 @@ fn summarizer_executables(
                 },
             )
         }
+        StoreShardScopeV1::ProfileSessions => {
+            let profile_id = &database.binding().shard_id.profile_id;
+            let store =
+                ProfileConfigurationStore::new_registered(database, profile_id).map_err(|_| {
+                    SummaryResolutionError::Unavailable(SUMMARIZER_CONFIGURATION_UNAVAILABLE)
+                })?;
+            let current = store
+                .read_or_initialize(tracedecay_contracts::try_now_micros().map_err(|error| {
+                    SummaryResolutionError::Storage(LcmError::Db(format!(
+                        "LCM profile configuration clock: {error}"
+                    )))
+                })?)
+                .await
+                .map_err(|_| {
+                    SummaryResolutionError::Unavailable(SUMMARIZER_CONFIGURATION_UNAVAILABLE)
+                })?;
+            let value = current
+                .value(USER_LCM_CODEX_SUMMARIZER_SETTING_KEY)
+                .map_err(|_| {
+                    SummaryResolutionError::Unavailable(SUMMARIZER_CONFIGURATION_UNAVAILABLE)
+                })?;
+            let ConfigurationValueV1::LcmSummarizerExecutable(codex) = value else {
+                return Err(SummaryResolutionError::Unavailable(
+                    SUMMARIZER_CONFIGURATION_UNAVAILABLE,
+                ));
+            };
+            Ok(LcmSummarizerExecutablesV1 {
+                codex: codex.clone(),
+                ..LcmSummarizerExecutablesV1::unconfigured()
+            })
+        }
         StoreShardScopeV1::Profile
         | StoreShardScopeV1::ProfileMemory
-        | StoreShardScopeV1::ProfileSessions
         | StoreShardScopeV1::RemoteNode { .. } => Ok(LcmSummarizerExecutablesV1::unconfigured()),
     }
 }
@@ -121,10 +161,10 @@ fn summarizer_executables(
 ///
 /// An unpublished pin is a binding of its own, so its publication counts as a
 /// change exactly like configuring an executable does.
-pub(super) fn summarizer_binding_identity(
+pub(super) async fn summarizer_binding_identity(
     database: &RegisteredGlobalDb,
 ) -> Result<String, LcmError> {
-    match summarizer_executables(database) {
+    match summarizer_executables(database).await {
         Ok(executables) => serde_json::to_string(&executables)
             .map_err(|error| LcmError::Db(format!("encode LCM summarizer binding: {error}"))),
         Err(SummaryResolutionError::Unavailable(reason)) => Ok(reason.to_owned()),

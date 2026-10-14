@@ -100,7 +100,7 @@ pub(crate) fn authority_fixture(
 
 /// Writes the receipt and observation rows exactly as the committing writer
 /// does, so the redundant authority columns start out agreeing with their JSON.
-pub(super) async fn seed_observation(
+pub(crate) async fn seed_observation(
     conn: &impl Executor,
     index: u64,
     label: &str,
@@ -151,7 +151,7 @@ pub(super) fn shift(cursor: &ObservationSourceCursorV1, delta: i64) -> Observati
     .expect("shifted source cursor")
 }
 
-pub(super) async fn write_cursor(conn: &impl Executor, cursor: &ObservationSourceCursorV1) {
+pub(crate) async fn write_cursor(conn: &impl Executor, cursor: &ObservationSourceCursorV1) {
     conn.execute(
         "INSERT INTO source_cursors(source_json, scope_json, cursor_json)
          VALUES (?1, ?2, ?3)",

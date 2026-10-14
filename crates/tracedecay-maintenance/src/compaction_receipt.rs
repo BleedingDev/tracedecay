@@ -12,6 +12,8 @@ pub fn record_live_compaction_outcome(
     match outcome {
         LiveStoreCompactionOutcomeV1::NotScheduled => true,
         LiveStoreCompactionOutcomeV1::Compacted {
+            page_count_before,
+            page_count_after,
             freelist_before,
             freelist_after,
         } => {
@@ -20,11 +22,35 @@ pub fn record_live_compaction_outcome(
                 &[
                     ("store", store_name.to_owned()),
                     (
-                        "freed_pages",
-                        freelist_before.saturating_sub(freelist_after).to_string(),
+                        "observed_page_count_reduction",
+                        page_count_before
+                            .saturating_sub(page_count_after)
+                            .to_string(),
                     ),
+                    ("freelist_before", freelist_before.to_string()),
+                    ("freelist_after", freelist_after.to_string()),
                 ],
             );
+            true
+        }
+        LiveStoreCompactionOutcomeV1::NoProgress {
+            page_count_before,
+            page_count_after,
+            freelist_before,
+            freelist_after,
+        } => {
+            log_daemon_event(
+                "retention_compaction_no_progress",
+                &[
+                    ("store", store_name.to_owned()),
+                    ("page_count_before", page_count_before.to_string()),
+                    ("page_count_after", page_count_after.to_string()),
+                    ("freelist_before", freelist_before.to_string()),
+                    ("freelist_after", freelist_after.to_string()),
+                ],
+            );
+            // A successful no-op needs the ordinary maintenance cadence, not
+            // a short retry loop that cannot change the store's vacuum mode.
             true
         }
         LiveStoreCompactionOutcomeV1::Failed(failure) => {

@@ -288,6 +288,7 @@ pub async fn ensure_observation_schema(
         .map_err(|error| global_db_operation_error(OBSERVATION_SCHEMA_OPERATION, error))?;
     }
     super::canonical_bodies::ensure_canonical_bodies_table(conn).await?;
+    super::canonical_lifecycle::ensure_schema(conn).await?;
     Ok(None)
 }
 

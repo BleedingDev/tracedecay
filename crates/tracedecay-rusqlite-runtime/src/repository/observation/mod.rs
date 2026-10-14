@@ -20,6 +20,8 @@ use tracedecay_store::{
     slim_stored_json,
 };
 
+use tracedecay_store::canonical_body::INSERT_OBSERVATION_BODY_REFERENCE_SQL;
+
 use crate::operation::StorageOperationError;
 
 use super::support::{decode, encode, invalid};
@@ -137,6 +139,12 @@ impl ObservationExecutor {
             ],
             |row| row.get(0),
         )?;
+        for hash in tracedecay_store::collect_body_refs(&observation_json).map_err(invalid)? {
+            savepoint.execute(
+                INSERT_OBSERVATION_BODY_REFERENCE_SQL,
+                params![observation.observation_id().as_str(), hash],
+            )?;
+        }
         persist_retrieval_anchor(savepoint, write.retrieval_anchor())?;
         savepoint.execute(
             "INSERT INTO observation_retrieval_anchors (observation_id, anchor_id)

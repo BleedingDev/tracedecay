@@ -14,13 +14,16 @@ use tracedecay_lcm::{
 pub enum RegisteredStoreRetentionErrorV1 {
     Observability { diagnostic: String },
     PayloadGc { diagnostic: String },
+    CanonicalGc { diagnostic: String },
 }
 
 impl RegisteredStoreRetentionErrorV1 {
     #[must_use]
     pub fn diagnostic(&self) -> &str {
         match self {
-            Self::Observability { diagnostic } | Self::PayloadGc { diagnostic } => diagnostic,
+            Self::Observability { diagnostic }
+            | Self::PayloadGc { diagnostic }
+            | Self::CanonicalGc { diagnostic } => diagnostic,
         }
     }
 }
@@ -34,6 +37,10 @@ pub struct RegisteredStoreRetentionReportV1 {
     /// Applied external-payload GC. It runs after session retention so the
     /// payloads of rows that pass just dropped are reconciled by the same tick.
     pub payload_gc: Result<LcmGcReport, RegisteredStoreRetentionErrorV1>,
+    pub canonical_gc: Result<
+        tracedecay_global_db::observation::canonical_lifecycle::CanonicalContentGcReport,
+        RegisteredStoreRetentionErrorV1,
+    >,
 }
 
 impl RegisteredStoreRetentionReportV1 {
@@ -55,6 +62,7 @@ impl RegisteredStoreRetentionReportV1 {
             && observations_succeeded
             && self.observability.is_ok()
             && payload_gc_succeeded
+            && self.canonical_gc.is_ok()
     }
 }
 
@@ -99,11 +107,17 @@ pub async fn run_registered_store_retention(
         .await
         .map_err(|diagnostic| RegisteredStoreRetentionErrorV1::Observability { diagnostic });
     let payload_gc = run_payload_gc(database, now).await;
+    let canonical_gc = database.run_canonical_content_gc().await.map_err(|error| {
+        RegisteredStoreRetentionErrorV1::CanonicalGc {
+            diagnostic: error.to_string(),
+        }
+    });
     RegisteredStoreRetentionReportV1 {
         session_lcm,
         observations,
         observability,
         payload_gc,
+        canonical_gc,
     }
 }
 

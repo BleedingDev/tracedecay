@@ -239,8 +239,9 @@ impl RegisteredGlobalDb {
         &self,
         request: &LcmCompressionRequest,
         control: &ExecutionControl,
+        source_guard: Option<(&tracedecay_lcm::LcmSummaryRequest, i64)>,
         before_commit: F,
-    ) -> Result<LcmCompressionResponse, LcmError>
+    ) -> Result<(LcmCompressionResponse, Option<i64>), LcmError>
     where
         F: FnOnce() -> Result<(), LcmError>,
     {
@@ -257,6 +258,20 @@ impl RegisteredGlobalDb {
             .begin_write_transaction()
             .await
             .map_err(|error| LcmError::Db(error.to_string()))?;
+        let raw_revision = tracedecay_lcm::summary_convergence::session_raw_revision(
+            &transaction,
+            &request.provider,
+            &request.session_id,
+        )
+        .await?;
+        if let Some((_, expected)) = source_guard
+            && raw_revision != Some(expected)
+        {
+            return Err(LcmError::StaleRawRevision {
+                expected,
+                actual: raw_revision,
+            });
+        }
         let mut payload_rollback =
             payload::PayloadFileRollback::begin_cancellation_safe(storage_root);
         let relation_projection = seed_session_relation_projection(
@@ -279,9 +294,16 @@ impl RegisteredGlobalDb {
             storage_root,
             request,
             &mut payload_rollback,
+            source_guard.map(|(range, _)| range),
         )
         .await?;
         check_execution(control)?;
+        let raw_revision = tracedecay_lcm::summary_convergence::session_raw_revision(
+            &transaction,
+            &request.provider,
+            &request.session_id,
+        )
+        .await?;
         before_commit()?;
         transaction.commit().await?;
         payload_rollback.disarm();
@@ -299,7 +321,7 @@ impl RegisteredGlobalDb {
             response.relation_projection_status = LcmRelationProjectionStatus::Applied;
             check_execution(control)?;
         }
-        Ok(response)
+        Ok((response, raw_revision))
     }
 
     pub async fn lcm_compress_retained_page_guarded<F>(
@@ -311,6 +333,7 @@ impl RegisteredGlobalDb {
         convergence_candidate: Option<
             &tracedecay_lcm::summary_convergence::LcmSummaryConvergenceCandidate,
         >,
+        expected_summary: Option<&tracedecay_lcm::LcmSummaryRequest>,
     ) -> Result<tracedecay_lcm::summary_convergence::LcmBoundedCompressionResponse, LcmError>
     where
         F: FnOnce() -> Result<(), LcmError>,
@@ -361,7 +384,7 @@ impl RegisteredGlobalDb {
             storage_root,
             request,
             &mut payload_rollback,
-            guard,
+            (guard, expected_summary),
         )
         .await?;
         if bounded.response.status != "needs_summary"

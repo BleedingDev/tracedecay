@@ -21,9 +21,10 @@ use crate::runtime::{
 };
 
 use super::failure::{
-    ProviderRunOutcome, TranscriptCatchUpFailure, cancelled_claude_provider_outcome,
-    cancelled_provider_outcome, classify_transcript_ingest_failure, claude_catch_up_failure,
-    failed_observation_run, warn_transcript_catch_up_failure,
+    MAX_CODEX_SOURCE_FAILURES_PER_PASS, ProviderRunOutcome, TranscriptCatchUpFailure,
+    cancelled_claude_provider_outcome, cancelled_provider_outcome,
+    classify_transcript_ingest_failure, claude_catch_up_failure, failed_observation_run,
+    warn_transcript_catch_up_failure,
 };
 
 pub(super) const PROJECT_CATCH_UP_PROVIDERS: &[SessionProvider] = &[
@@ -40,8 +41,6 @@ pub(super) const PROJECT_CATCH_UP_PROVIDERS: &[SessionProvider] = &[
     SessionProvider::Hermes,
     SessionProvider::Vibe,
 ];
-
-const MAX_CODEX_SOURCE_FAILURES_PER_PASS: usize = 8;
 
 fn cursor_composer_run_outcome(
     composer: &cursor_composer::CursorComposerSweepOutcome,
@@ -215,10 +214,11 @@ impl<'a> ProjectProviderRun<'a> {
                     );
                 }
             };
-        let frontier = stored.for_coverage(matches!(
-            stored_coverage,
-            Some(HostProviderCoverage::Complete)
-        ));
+        let complete = matches!(stored_coverage, Some(HostProviderCoverage::Complete));
+        let frontier = self.codex_discovery.map_or_else(
+            || stored.for_coverage(complete),
+            |(hub, consumer)| hub.coverage_frontier(consumer, stored, complete),
+        );
         let discovered = match self.codex_discovery {
             Some((hub, consumer)) => match hub
                 .discover(
@@ -268,6 +268,7 @@ impl<'a> ProjectProviderRun<'a> {
         let mut remaining = self.max_new_bytes;
         let mut deferred = discovery.is_truncated();
         let mut frontier_committable = true;
+        let mut metadata_failures = 0usize;
         // Out-of-scope rollouts consume no byte budget, so a newest-first page
         // would otherwise write a cursor for every older out-of-scope day
         // before the admitted window is projected into search. Once in-scope
@@ -297,6 +298,36 @@ impl<'a> ProjectProviderRun<'a> {
             else {
                 continue;
             };
+            let pending = match pending {
+                Ok(pending) => pending,
+                Err(error) => {
+                    if let Some(cancelled) = cancelled_provider_outcome(&error) {
+                        return cancelled;
+                    }
+                    let failure = warn_transcript_catch_up_failure(
+                        "codex",
+                        "observation",
+                        &error,
+                        "project Codex observation catch-up failed",
+                    );
+                    let stop = codex_source_failure_saturates_pass(
+                        outcome.failures.len().saturating_add(1),
+                        failure.retryable,
+                    );
+                    outcome.add_failure(failure);
+                    frontier_committable = false;
+                    if stop {
+                        deferred = true;
+                        break;
+                    }
+                    continue;
+                }
+            };
+            if let Some(failure) = pending.cached_source_failure(path) {
+                outcome.add_failure(failure);
+                deferred = true;
+                continue;
+            }
             if persisted_day.is_some_and(|day| path.parent() != Some(day)) {
                 let membership = run_blocking_transcript_section("codex", {
                     let path = path.clone();
@@ -327,40 +358,6 @@ impl<'a> ProjectProviderRun<'a> {
                     }
                 }
             }
-            let pending = match pending {
-                Ok(pending) => pending,
-                Err(error) => {
-                    if let Some(cancelled) = cancelled_provider_outcome(&error) {
-                        return cancelled;
-                    }
-                    let failure = warn_transcript_catch_up_failure(
-                        "codex",
-                        "observation",
-                        &error,
-                        "project Codex observation catch-up failed",
-                    );
-                    let stop = codex_source_failure_saturates_pass(
-                        outcome.failures.len().saturating_add(1),
-                        failure.retryable,
-                    );
-                    outcome.add_failure(failure);
-                    frontier_committable = false;
-                    if stop {
-                        deferred = true;
-                        break;
-                    }
-                    continue;
-                }
-            };
-            if let Some(failure) = pending.cached_source_failure(path) {
-                outcome.add_failure(failure);
-                frontier_committable = false;
-                if codex_source_failure_saturates_pass(outcome.failures.len(), failure.retryable) {
-                    deferred = true;
-                    break;
-                }
-                continue;
-            }
             match codex::try_admit_codex_jsonl_observations_for_project_window(
                 path,
                 self.project_root,
@@ -381,6 +378,9 @@ impl<'a> ProjectProviderRun<'a> {
                             &error,
                             "project Codex rollout convergence record failed",
                         ));
+                        deferred = true;
+                        frontier_committable = false;
+                        break;
                     }
                     if progress.frames_persisted > 0 && !progress.resumed {
                         persisted_day = path.parent();
@@ -413,10 +413,16 @@ impl<'a> ProjectProviderRun<'a> {
                         &error,
                         "project Codex observation catch-up failed",
                     );
-                    let stop = codex_source_failure_saturates_pass(
-                        outcome.failures.len().saturating_add(1),
-                        failure.retryable,
-                    );
+                    let source_disposition = error.is_source_disposition();
+                    metadata_failures += usize::from(error.consumes_metadata_failure_budget());
+                    let stop = if source_disposition {
+                        metadata_failures >= MAX_CODEX_SOURCE_FAILURES_PER_PASS
+                    } else {
+                        codex_source_failure_saturates_pass(
+                            outcome.failures.len().saturating_add(1),
+                            failure.retryable,
+                        )
+                    };
                     if let Err(record_error) = pending.record_source_failure(path, &error, failure)
                     {
                         outcome.add_failure(warn_transcript_catch_up_failure(
@@ -425,18 +431,53 @@ impl<'a> ProjectProviderRun<'a> {
                             &record_error,
                             "project Codex source failure retention failed",
                         ));
+                        frontier_committable = false;
+                        deferred = true;
+                        break;
                     }
                     outcome.add_failure(failure);
-                    frontier_committable = false;
+                    deferred = true;
+                    frontier_committable &= source_disposition;
                     if stop {
                         deferred = true;
+                        frontier_committable = false;
                         break;
                     }
                 }
             }
         }
+        if let Some((hub, consumer)) = self.codex_discovery {
+            for failure in hub.retained_source_failures(consumer) {
+                if !outcome.failures.contains(&failure) {
+                    outcome.add_failure(failure);
+                }
+            }
+            deferred |= !outcome.failures.is_empty();
+        }
         outcome.bytes_consumed = self.max_new_bytes.saturating_sub(remaining);
         outcome.add_deferred_units(u64::from(deferred));
+        // Persist incomplete coverage before an enumeration-complete frontier.
+        // A failed coverage write must leave the page unacknowledged.
+        if (deferred || !frontier_committable)
+            && let Err(error) = persist_host_provider_coverage(
+                self.facade,
+                self.scope,
+                "codex",
+                HostProviderCoverage::Partial,
+                1,
+                None,
+            )
+            .await
+        {
+            outcome.add_failure(warn_transcript_catch_up_failure(
+                "codex",
+                "coverage",
+                &error,
+                "project Codex coverage persistence failed",
+            ));
+            return outcome;
+        }
+
         let mut frontier_persisted = frontier_committable;
         if frontier_committable
             && next_frontier != stored
@@ -473,6 +514,7 @@ impl<'a> ProjectProviderRun<'a> {
                 &error,
                 "project Codex coverage persistence failed",
             ));
+            frontier_persisted = false;
         }
         if frontier_committable
             && frontier_persisted

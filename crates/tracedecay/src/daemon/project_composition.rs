@@ -860,11 +860,12 @@ impl ProjectOpenInputs<'_> {
             attempts.fetch_add(1, Ordering::Relaxed);
         }
         let cg = Arc::new(
-            open_project_for_handshake(
+            super::project_open_handshake::open_project_for_handshake_with_hook_recovery(
                 self.canonical_project_path,
                 self.handshake,
                 self.store_administration,
                 self.cancellation,
+                self.runtime.hook_recovery(),
             )
             .await?,
         );

@@ -8,12 +8,17 @@
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use tracedecay_runtime_core::cancellation::CancellationToken;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_lcm::LcmSummaryRequest;
-use tracedecay_sessions::runtime::hosts::codex_app_server::strip_reasoning_tags;
+use tracedecay_sessions::runtime::hosts::codex_app_server::{
+    strip_reasoning_tags, terminate_process_tree,
+};
 
 const CURSOR_SUMMARY_CHILD_ENV: &str = "TRACEDECAY_CURSOR_SUMMARY_CHILD";
 
@@ -29,11 +34,47 @@ pub(super) struct CursorAgentSummaryConfig {
 pub(super) fn summarize_with_cursor_agent(
     request: &LcmSummaryRequest,
     config: &CursorAgentSummaryConfig,
+    cancellation: &CancellationToken,
 ) -> Result<String> {
-    let prompt = build_cursor_summary_prompt(request);
     let workspace_dir = tempfile::Builder::new()
         .prefix("tracedecay-cursor-summary-")
         .tempdir()?;
+    let result = run_cursor_summary(request, config, cancellation, &workspace_dir);
+    match workspace_dir.close() {
+        Ok(()) => result,
+        Err(error) => {
+            tracing::error!(%error, "could not remove Cursor summary workspace");
+            match result {
+                Err(primary) => Err(primary),
+                Ok(_) => Err(error.into()),
+            }
+        }
+    }
+}
+
+struct CursorSummaryChild(Option<Child>);
+
+impl Drop for CursorSummaryChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            terminate_process_tree(child.id());
+            if let Err(error) = child.kill() {
+                tracing::debug!(%error, "Cursor summary child termination failed");
+            }
+            if let Err(error) = child.wait() {
+                tracing::warn!(%error, "Cursor summary child reap failed");
+            }
+        }
+    }
+}
+
+fn run_cursor_summary(
+    request: &LcmSummaryRequest,
+    config: &CursorAgentSummaryConfig,
+    cancellation: &CancellationToken,
+    workspace_dir: &tempfile::TempDir,
+) -> Result<String> {
+    let prompt = build_cursor_summary_prompt(request);
     let workspace = workspace_dir.path();
     let prompt_path = workspace.join("summary-input.txt");
     std::fs::write(&prompt_path, prompt)?;
@@ -43,6 +84,9 @@ pub(super) fn summarize_with_cursor_agent(
     );
 
     let mut command = Command::new(&config.cursor_agent_bin);
+    #[cfg(unix)]
+    command.process_group(0);
+
     command
         .arg("-p")
         .arg("--output-format")
@@ -63,20 +107,32 @@ pub(super) fn summarize_with_cursor_agent(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = command.spawn().map_err(|err| TraceDecayError::Config {
+    if cancellation.is_cancelled() {
+        return Err(TraceDecayError::Config {
+            message: "Cursor summary cancelled".to_owned(),
+        });
+    }
+    let child = command.spawn().map_err(|err| TraceDecayError::Config {
         message: format!(
             "failed to start `{}`: {err}",
             config.cursor_agent_bin.display()
         ),
     })?;
+    let mut child = CursorSummaryChild(Some(child));
     let deadline = Instant::now() + config.timeout;
     loop {
-        if child.try_wait()?.is_some() {
+        if cancellation.is_cancelled() {
+            return Err(TraceDecayError::Config {
+                message: "Cursor summary cancelled".to_owned(),
+            });
+        }
+        let process = child.0.as_mut().ok_or_else(|| TraceDecayError::Config {
+            message: "Cursor summary child missing".to_owned(),
+        })?;
+        if process.try_wait()?.is_some() {
             break;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
             return Err(TraceDecayError::Config {
                 message: format!(
                     "timed out waiting for `{}`",
@@ -87,7 +143,13 @@ pub(super) fn summarize_with_cursor_agent(
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    let output = child.wait_with_output()?;
+    let process = child.0.take().ok_or_else(|| TraceDecayError::Config {
+        message: "Cursor summary child missing".to_owned(),
+    })?;
+    // A completed leader may leave descendants holding its output pipes.
+    // Close the owned group before collecting, including the success path.
+    terminate_process_tree(process.id());
+    let output = process.wait_with_output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stderr = stderr.trim();

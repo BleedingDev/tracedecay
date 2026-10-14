@@ -23,7 +23,7 @@ use tracedecay_store::observation::ObservationCoverageReason;
 
 use super::PROVIDER;
 use super::context::CodexContextState;
-use super::meta::{CodexMetaWithProvenance, session_meta_with_provenance};
+use super::meta::{CodexMetaWithProvenance, CodexMetadataRead, session_meta_with_provenance};
 use crate::admission::HostAdmission;
 use crate::host_ports::unregistered_admission;
 use crate::observation::ObservationCancellation;
@@ -212,10 +212,22 @@ async fn fill_codex_session_meta(
         path: error_path.clone(),
         source,
     })?;
-    let parsed = Arc::new(parsed.ok_or(TranscriptIngestError::InvalidSourceIdentity {
-        provider: PROVIDER,
-        path: error_path,
-    })?);
+    let parsed = Arc::new(match parsed {
+        CodexMetadataRead::Ready(meta) => *meta,
+        CodexMetadataRead::Pending(reason) => {
+            return Err(TranscriptIngestError::SourceMetadataPending {
+                provider: PROVIDER,
+                path: error_path,
+                reason,
+            });
+        }
+        CodexMetadataRead::Invalid => {
+            return Err(TranscriptIngestError::InvalidSourceIdentity {
+                provider: PROVIDER,
+                path: error_path,
+            });
+        }
+    });
     if let Some(reservation) = &mut memory {
         reservation
             .shrink_to(parsed.retained_bytes())

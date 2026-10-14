@@ -965,13 +965,9 @@ impl StoreAdministration {
     )]
     pub(super) async fn mounted_registered_session_databases(
         &self,
-    ) -> Vec<tracedecay_global_db::RegisteredGlobalDbLeaseV1> {
-        let Ok(profile_root) = self
-            .profile_identity()
-            .and_then(|identity| authority::canonical_identity_path(identity.profile_root()))
-        else {
-            return Vec::new();
-        };
+    ) -> Result<Vec<tracedecay_global_db::RegisteredGlobalDbLeaseV1>> {
+        let profile_root =
+            authority::canonical_identity_path(self.profile_identity()?.profile_root())?;
         let registry = {
             let registries = self.session_runtime_registries.lock().await;
             registries
@@ -979,9 +975,9 @@ impl StoreAdministration {
                 .map(|entry| Arc::clone(&entry.registry))
         };
         let Some(registry) = registry.and_then(|registry| registry.get().cloned()) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        registry.mounted_session_databases().await
+        Ok(registry.mounted_session_databases().await)
     }
 
     /// The profile's session-runtime registry map and its canonical root,

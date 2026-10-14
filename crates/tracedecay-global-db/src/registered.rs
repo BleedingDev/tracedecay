@@ -79,6 +79,7 @@ pub struct RegisteredGlobalDbOwnerV1 {
     database: DatabaseOwnerV1,
     project_graph: Arc<OnceLock<VerifiedGraphRuntimeWeakProxyV1>>,
     session_relation_graph: Arc<SessionRelationGraphStateV1>,
+    session_publication: Arc<tokio::sync::Mutex<()>>,
     refused_authority: Option<RefusedAuthorityV1>,
 }
 
@@ -92,6 +93,7 @@ pub struct RegisteredGlobalDbWeakLeaseIssuerV1 {
     database: DatabaseOwnerWeakLeaseIssuerV1,
     project_graph: Arc<OnceLock<VerifiedGraphRuntimeWeakProxyV1>>,
     session_relation_graph: Weak<SessionRelationGraphStateV1>,
+    session_publication: Weak<tokio::sync::Mutex<()>>,
     refused_authority: Option<RefusedAuthorityV1>,
 }
 
@@ -140,6 +142,7 @@ impl RegisteredGlobalDbOwnerV1 {
             database,
             project_graph: Arc::new(OnceLock::new()),
             session_relation_graph: Arc::new(RwLock::new(None)),
+            session_publication: Arc::new(tokio::sync::Mutex::new(())),
             refused_authority,
         })
     }
@@ -175,6 +178,7 @@ impl RegisteredGlobalDbOwnerV1 {
                 database,
                 project_graph: Arc::new(OnceLock::new()),
                 session_relation_graph: Arc::new(RwLock::new(None)),
+                session_publication: Arc::new(tokio::sync::Mutex::new(())),
                 refused_authority,
             },
             convergence,
@@ -200,6 +204,7 @@ impl RegisteredGlobalDbOwnerV1 {
                 self.database.issue_lease()?,
                 Arc::clone(&self.project_graph),
                 Arc::clone(&self.session_relation_graph),
+                Arc::clone(&self.session_publication),
                 self.refused_authority,
             ),
         ))
@@ -219,6 +224,7 @@ impl RegisteredGlobalDbOwnerV1 {
                 self.database.issue_read_only_lease()?,
                 Arc::clone(&self.project_graph),
                 Arc::clone(&self.session_relation_graph),
+                Arc::clone(&self.session_publication),
                 self.refused_authority,
             ),
         ))
@@ -232,6 +238,7 @@ impl RegisteredGlobalDbOwnerV1 {
             database: self.database.weak_lease_issuer(),
             project_graph: Arc::clone(&self.project_graph),
             session_relation_graph: Arc::downgrade(&self.session_relation_graph),
+            session_publication: Arc::downgrade(&self.session_publication),
             refused_authority: self.refused_authority,
         }
     }
@@ -281,6 +288,9 @@ impl RegisteredGlobalDbWeakLeaseIssuerV1 {
                 self.database.issue_lease()?,
                 Arc::clone(&self.project_graph),
                 session_relation_graph,
+                self.session_publication
+                    .upgrade()
+                    .ok_or(DatabaseOwnerWeakLeaseIssuerErrorV1::Unavailable)?,
                 self.refused_authority,
             ),
         ))
@@ -349,10 +359,18 @@ pub struct RegisteredGlobalDb {
     database: Database,
     project_graph: Arc<OnceLock<VerifiedGraphRuntimeWeakProxyV1>>,
     session_relation_graph: Arc<SessionRelationGraphStateV1>,
+    session_publication: Arc<tokio::sync::Mutex<()>>,
     refused_authority: Option<RefusedAuthorityV1>,
 }
 
 impl RegisteredGlobalDb {
+    /// Coordinates mounted session-generation mutations and summary execution.
+    /// SQL transactions remain short; raw intake and reads do not take this gate.
+    /// Independently issued leases share the exact registered owner gate.
+    pub async fn session_publication_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.session_publication.lock().await
+    }
+
     #[tracing::instrument(name = "global_db.registered.schema", level = "trace", skip_all)]
     pub async fn converge_schema(
         &self,
@@ -394,6 +412,7 @@ impl RegisteredGlobalDb {
             database,
             Arc::new(OnceLock::new()),
             Arc::new(RwLock::new(None)),
+            Arc::new(tokio::sync::Mutex::new(())),
             None,
         )
     }
@@ -402,12 +421,14 @@ impl RegisteredGlobalDb {
         database: Database,
         project_graph: Arc<OnceLock<VerifiedGraphRuntimeWeakProxyV1>>,
         session_relation_graph: Arc<SessionRelationGraphStateV1>,
+        session_publication: Arc<tokio::sync::Mutex<()>>,
         refused_authority: Option<RefusedAuthorityV1>,
     ) -> Self {
         Self {
             database,
             project_graph,
             session_relation_graph,
+            session_publication,
             refused_authority,
         }
     }
@@ -623,6 +644,19 @@ impl RegisteredGlobalDb {
 
     pub async fn storage_page_counts(&self) -> tracedecay_domain::errors::Result<(u64, u64, u64)> {
         self.database.storage_page_counts().await
+    }
+
+    /// Advances bounded historical reference reconstruction, then collects
+    /// shared bodies and captures with no remaining canonical owners.
+    pub async fn run_canonical_content_gc(
+        &self,
+    ) -> tracedecay_domain::errors::Result<
+        super::observation::canonical_lifecycle::CanonicalContentGcReport,
+    > {
+        if let Some(error) = self.reset_required() {
+            return Err(error);
+        }
+        super::observation::canonical_lifecycle::run_tick(&self.database).await
     }
 
     #[tracing::instrument(name = "global_db.registered.compact", level = "trace", skip_all)]

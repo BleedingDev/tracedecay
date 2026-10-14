@@ -185,22 +185,70 @@ fn hook_replay_status(home: &Path, project: &Path) -> serde_json::Value {
     envelope["structuredContent"]["hook_replay"].clone()
 }
 
-/// The `hook_replay` status once it reads `expected`, or the last reading
-/// at `limit`.
+/// Waits for a semantic status condition without assuming transient producer
+/// admission and execution failures have identical descriptions.
 fn await_hook_replay_status(
     home: &Path,
     project: &Path,
-    expected: &serde_json::Value,
+    ready: impl Fn(&serde_json::Value) -> bool,
     limit: Duration,
 ) -> serde_json::Value {
     let started = Instant::now();
     loop {
         let status = hook_replay_status(home, project);
-        if &status == expected || started.elapsed() >= limit {
+        if ready(&status) || started.elapsed() >= limit {
             return status;
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+fn pending_producer_failure(status: &serde_json::Value) -> bool {
+    status["status"] == "failed"
+        && status["failures"].as_array().is_some_and(|failures| {
+            failures.iter().any(|failure| {
+                failure["host"] == "cursor_desktop"
+                    && failure["spool"] == "pending_work"
+                    && failure["cause"].as_str().is_some_and(|cause| {
+                        cause
+                            .split_once(" pending producer work item(s) stayed owed; ")
+                            .is_some_and(|(count, reason)| {
+                                count.parse::<usize>().is_ok_and(|count| count > 0)
+                                    && matches!(
+                                        reason,
+                                        "execution has not completed"
+                                            | "is queued for producer execution"
+                                            | "producer execution was unavailable"
+                                    )
+                            })
+                    })
+            })
+        })
+}
+
+/// Transport settlement does not complete Cursor's native producer prerequisite.
+/// These fixtures have no native conversation database to supply that work.
+fn assert_only_producer_work_owed(home: &Path, project: &Path) {
+    let status = await_hook_replay_status(
+        home,
+        project,
+        |status| {
+            pending_producer_failure(status)
+                && status["failures"]
+                    .as_array()
+                    .is_some_and(|failures| failures.len() == 1)
+        },
+        PROMPT_DRAIN,
+    );
+    assert!(
+        pending_producer_failure(&status),
+        "producer work must remain truthfully owed: {status}"
+    );
+    assert_eq!(
+        status["failures"].as_array().unwrap().len(),
+        1,
+        "settled transports must have no remaining failure: {status}"
+    );
 }
 
 fn latency_until(limit: Duration, drained: impl Fn() -> bool) -> Option<Duration> {
@@ -234,6 +282,8 @@ fn spooled_capture_events_drain_promptly_while_open_and_after_a_restart() {
         "spooled events on an open project must drain within {PROMPT_DRAIN:?}, not the 30 s sweep"
     );
 
+    assert_only_producer_work_owed(&home, &project);
+
     // Daemon down: captures still land in the spool.
     drop(daemon);
     for index in 0..5 {
@@ -251,12 +301,15 @@ fn spooled_capture_events_drain_promptly_while_open_and_after_a_restart() {
         "records spooled across a restart must drain within {PROMPT_DRAIN:?} without another client"
     );
 
+    assert_only_producer_work_owed(&home, &project);
+
     // The project the daemon opened for its spool keeps draining new appends.
     capture_edit(&home, &project, "after-restart");
     assert!(
         drain_latency(&records, PROMPT_DRAIN).is_some(),
         "an append after the restart must drain within {PROMPT_DRAIN:?}"
     );
+    assert_only_producer_work_owed(&home, &project);
 }
 
 #[test]
@@ -292,7 +345,7 @@ fn a_failed_receipt_drain_is_reported_on_status_and_clears_when_the_spool_drains
         }],
     });
     assert_eq!(
-        await_hook_replay_status(&home, &project, &failed, PROMPT_DRAIN),
+        await_hook_replay_status(&home, &project, |status| status == &failed, PROMPT_DRAIN),
         failed
     );
     assert!(
@@ -304,11 +357,8 @@ fn a_failed_receipt_drain_is_reported_on_status_and_clears_when_the_spool_drains
     // the failure clears.
     std::fs::remove_file(&corrupt).unwrap();
     capture_stop(&home, &project, "after-repair");
-    let drained = json!({ "status": "drained" });
-    assert_eq!(
-        await_hook_replay_status(&home, &project, &drained, PROMPT_DRAIN),
-        drained
-    );
+    assert!(receipt_drain_latency(&receipts, PROMPT_DRAIN).is_some());
+    assert_only_producer_work_owed(&home, &project);
     assert_eq!(published_receipts(&receipts), Vec::<PathBuf>::new());
 }
 
@@ -337,9 +387,30 @@ fn a_receipt_spool_root_that_is_not_a_directory_is_reported_on_status() {
             "cause": "hook delivery receipt spool path is unsafe",
         }],
     });
+    let status = await_hook_replay_status(
+        &home,
+        &project,
+        |status| {
+            pending_producer_failure(status)
+                && status["failures"].as_array().is_some_and(|failures| {
+                    failures.len() == 2 && failures.contains(&failed["failures"][0])
+                })
+        },
+        PROMPT_DRAIN,
+    );
+    assert!(
+        pending_producer_failure(&status),
+        "the edit's producer prerequisite remains owed: {status}"
+    );
+    let failures = status["failures"].as_array().unwrap();
     assert_eq!(
-        await_hook_replay_status(&home, &project, &failed, PROMPT_DRAIN),
-        failed
+        failures.len(),
+        2,
+        "both causal failures must be reported: {status}"
+    );
+    assert!(
+        failures.contains(&failed["failures"][0]),
+        "the unsafe receipt root must be reported: {status}"
     );
     assert!(
         receipts.is_file(),
@@ -348,7 +419,7 @@ fn a_receipt_spool_root_that_is_not_a_directory_is_reported_on_status() {
 }
 
 /// A receipt backlog larger than one drain batch settles in back-to-back
-/// sweeps, and status reads `drained` only once none is left.
+/// sweeps, while its unfinished native producer work remains visible.
 #[test]
 fn a_receipt_backlog_beyond_one_batch_drains_without_waiting_for_the_sweep() {
     const BACKLOG: usize = 65;
@@ -402,11 +473,7 @@ fn a_receipt_backlog_beyond_one_batch_drains_without_waiting_for_the_sweep() {
         "a {BACKLOG}-receipt backlog must drain within {PROMPT_DRAIN:?}, not one batch per 30 s sweep; {} left",
         published_receipts(&receipts).len()
     );
-    let drained = json!({ "status": "drained" });
-    assert_eq!(
-        await_hook_replay_status(&home, &project, &drained, PROMPT_DRAIN),
-        drained
-    );
+    assert_only_producer_work_owed(&home, &project);
 }
 
 #[test]
@@ -480,9 +547,225 @@ fn delivery_receipts_drain_promptly_after_the_last_append_and_after_a_restart() 
         receipt_drain_latency(&receipts, PROMPT_DRAIN).is_some(),
         "an acknowledged exact output retry must replay its durable settlement"
     );
-    let drained = json!({ "status": "drained" });
-    assert_eq!(
-        await_hook_replay_status(&home, &project, &drained, PROMPT_DRAIN),
-        drained
+    assert_only_producer_work_owed(&home, &project);
+}
+
+/// The maintained daemon admission path mints the durable identity. Inspecting
+/// the provider envelope directly in the ledger would check a different key.
+fn assert_canonical_duplicate(
+    home: &Path,
+    project: &Path,
+    envelope: &tracedecay_hooks::HookEventEnvelopeV2,
+    native_session: &str,
+) {
+    let output = tracedecay_command_with_home(home)
+        .args(["tool", "tracedecay_hook_runtime", "--json", "--args"])
+        .arg(
+            json!({
+                "action": "hook_v2_admit",
+                "envelope": envelope,
+                "native_session_id": native_session,
+            })
+            .to_string(),
+        )
+        .current_dir(project)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "canonical admission failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        response["structuredContent"]["status"], "exact_duplicate",
+        "the exact native envelope must have been admitted, never tombstoned: {response}"
+    );
+    assert_eq!(response["structuredContent"]["disposition"], "accepted");
+}
+
+/// Both restart discovery and an append beside a mounted sibling must reopen
+/// the exact enrolled linked checkout. A committed spool alone could conceal
+/// a foreign-scope tombstone, so the durable admission ledger is checked too.
+#[test]
+fn linked_worktree_spooled_events_reopen_after_restart_and_beside_a_mounted_peer() {
+    use tracedecay_domain::UtcMicros;
+    use tracedecay_hooks::{
+        HookBoundaryV1, HookConfigurationFileReaderV1, HookEventV2, HookSpoolConfigV1, HookSpoolV1,
+        hook_configuration_path, hook_v2_spool_root,
+    };
+
+    let home = tempfile::TempDir::new().unwrap();
+    let home = home.path().canonicalize().unwrap();
+    let primary = init_git_project(&home);
+    let sibling = home.join("sibling");
+    assert!(
+        Command::new(git_program())
+            .args(["worktree", "add", "-q", "-b", "sibling"])
+            .arg(&sibling)
+            .current_dir(&primary)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let sibling = sibling.canonicalize().unwrap();
+    let daemon = spawn_tracedecay_daemon(&home);
+    tracedecay(&home, &primary, &["init"]);
+    // Normal registered open enrolls this linked alias in the same project.
+    tracedecay(&home, &sibling, &["tool", "tracedecay_status", "--json"]);
+    let layout = tracedecay_runtime_core::storage::resolve_persisted_layout(
+        &sibling,
+        &home.join(".tracedecay"),
+    )
+    .unwrap()
+    .unwrap();
+    let host = NativeHostIdentityV1::CursorDesktop;
+    let spool_root = hook_v2_spool_root(&layout.data_root, host);
+    let records = spool_root.join("records.v1.bin");
+    drop(daemon);
+    // Read the durable registry after the opening daemon has exited. A normal
+    // profile mount does not enroll either project alias as a side effect.
+    crate::common::register_process_runtime_ports();
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let profile =
+            tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1::profile(
+                home.join(".tracedecay"),
+            )
+            .await
+            .unwrap();
+        let registry = profile.profile_database_for_test();
+        let enrolled_primary = registry
+            .resolve_project_store_by_alias(&primary)
+            .await
+            .unwrap();
+        let enrolled_sibling = registry
+            .resolve_project_store_by_alias(&sibling)
+            .await
+            .unwrap();
+        assert_eq!(
+            enrolled_sibling.project.project_id,
+            enrolled_primary.project.project_id
+        );
+        assert_eq!(enrolled_sibling.store, enrolled_primary.store);
+        assert_eq!(Path::new(&enrolled_sibling.project.canonical_root), primary);
+    });
+    let native_session = "sibling-restart-session";
+    run_hook(
+        &home,
+        &sibling,
+        "hook-cursor-session-start",
+        &json!({
+            "hook_event_name": "sessionStart",
+            "conversation_id": native_session,
+            "cwd": sibling,
+            "workspace_roots": [sibling],
+        }),
+    );
+    let now = UtcMicros(tracedecay_runtime_core::tracedecay::saturating_utc_now().0);
+    let (mut spool, _) =
+        HookSpoolV1::open(&spool_root, HookSpoolConfigV1::stock(host), now).unwrap();
+    let queued = spool
+        .pending_records()
+        .unwrap()
+        .into_iter()
+        .map(|record| record.envelope)
+        .collect::<Vec<_>>();
+    drop(spool);
+    assert_eq!(
+        queued.len(),
+        1,
+        "the offline native callback must retain one exact envelope"
+    );
+    assert!(matches!(
+        queued[0].event,
+        HookEventV2::SessionBoundary {
+            boundary: HookBoundaryV1::Start
+        }
+    ));
+    let publication = HookConfigurationFileReaderV1::new(hook_configuration_path(
+        &layout.data_root,
+        queued[0].worktree_id,
+        host,
+    ));
+    let before_restart = publication.load(host).unwrap().unwrap().revision;
+    let daemon = spawn_tracedecay_daemon(&home);
+    assert!(
+        latency_until(PROMPT_DRAIN, || publication
+            .load(host)
+            .unwrap()
+            .unwrap()
+            .revision
+            > before_restart)
+        .is_some(),
+        "startup must reopen the enrolled sibling without a request to that checkout"
+    );
+    assert!(drain_latency(&records, PROMPT_DRAIN).is_some());
+    assert_canonical_duplicate(&home, &sibling, &queued[0], native_session);
+    let receipts = hook_delivery_receipt_spool_root(&layout.data_root, host);
+    assert!(receipt_drain_latency(&receipts, PROMPT_DRAIN).is_some());
+    assert_eq!(
+        await_hook_replay_status(
+            &home,
+            &sibling,
+            |status| status == &json!({ "status": "drained" }),
+            PROMPT_DRAIN
+        ),
+        json!({ "status": "drained" }),
+        "a settled nonproducer callback leaves no native prerequisite"
+    );
+    drop(daemon);
+
+    // No backlog exists at this restart, and only the primary is mounted.
+    let _daemon = spawn_tracedecay_daemon(&home);
+    tracedecay(&home, &primary, &["tool", "tracedecay_status", "--json"]);
+    let before_append = publication.load(host).unwrap().unwrap().revision;
+    // Decode a fresh native callback through the maintained capture authorities.
+    // A live response hook would itself request B and hide an opener regression;
+    // retrying the first admitted event could hide a second-phase tombstone.
+    let now = UtcMicros(tracedecay_runtime_core::tracedecay::saturating_utc_now().0);
+    let snapshot = publication.load(host).unwrap().unwrap();
+    let appended_session = "sibling-beside-peer-session";
+    let native_payload = json!({
+        "hook_event_name": "sessionStart",
+        "conversation_id": appended_session,
+        "cwd": sibling,
+        "workspace_roots": [sibling],
+    })
+    .to_string();
+    let material = tracedecay_agent_hosts::hooks::native_capture_material(
+        tracedecay_hooks::NativeHookCaptureSourceV1::Host(host),
+        native_payload.as_bytes(),
+        now,
+    )
+    .unwrap();
+    let appended = tracedecay_hooks::decode_bound_native_hook_event(
+        host,
+        native_payload.as_bytes(),
+        &snapshot.binding,
+        material,
+    )
+    .unwrap();
+    assert_ne!(appended.event_id, queued[0].event_id);
+    assert_ne!(
+        appended.protected_session_id,
+        queued[0].protected_session_id
+    );
+    let (mut spool, _) =
+        HookSpoolV1::open(&spool_root, HookSpoolConfigV1::stock(host), now).unwrap();
+    spool
+        .append(appended.clone(), &snapshot.binding, now)
+        .unwrap();
+    spool.commit().unwrap();
+    assert!(
+        latency_until(PROMPT_DRAIN, || publication
+            .load(host)
+            .unwrap()
+            .unwrap()
+            .revision
+            > before_append)
+        .is_some(),
+        "a primary consumer must not suppress reopening an enrolled sibling"
+    );
+    assert!(drain_latency(&records, PROMPT_DRAIN).is_some());
+    assert_canonical_duplicate(&home, &sibling, &appended, appended_session);
 }

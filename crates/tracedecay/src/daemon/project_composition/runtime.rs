@@ -41,9 +41,33 @@ pub(in crate::daemon) enum ProductionProjectCompositionRuntime {
     Unix(Box<DaemonEngine>),
     #[cfg(any(not(unix), test, feature = "test-transport"))]
     Portable { startup_catch_up: bool },
+    HookReplay {
+        runtime: Box<ProductionProjectCompositionRuntime>,
+        publications: Arc<Vec<tracedecay_hooks::HookConfigurationSnapshotV1>>,
+    },
 }
 
 impl ProductionProjectCompositionRuntime {
+    pub(in crate::daemon) fn with_hook_recovery(
+        self,
+        publications: Option<Arc<Vec<tracedecay_hooks::HookConfigurationSnapshotV1>>>,
+    ) -> Self {
+        match publications {
+            Some(publications) => Self::HookReplay {
+                runtime: Box::new(self),
+                publications,
+            },
+            None => self,
+        }
+    }
+
+    pub(super) fn hook_recovery(&self) -> Option<&[tracedecay_hooks::HookConfigurationSnapshotV1]> {
+        match self {
+            Self::HookReplay { publications, .. } => Some(publications.as_slice()),
+            _ => None,
+        }
+    }
+
     pub(super) fn database_owner_reconciler(
         &self,
         _store_administration: &StoreAdministration,
@@ -54,6 +78,14 @@ impl ProductionProjectCompositionRuntime {
         handshake: DaemonHandshake,
     ) -> crate::mcp::DatabaseOwnerReconciler {
         match self {
+            Self::HookReplay { runtime, .. } => runtime.database_owner_reconciler(
+                _store_administration,
+                current_key,
+                current_project_path,
+                route_registered,
+                route_cancellation,
+                handshake,
+            ),
             #[cfg(unix)]
             Self::Unix(engine) => engine.database_owner_reconciler(
                 current_key,
@@ -84,6 +116,11 @@ impl ProductionProjectCompositionRuntime {
         handshake: DaemonHandshake,
     ) -> Option<tracedecay_dashboard_api::AutomationSchedulerReconciler> {
         match self {
+            Self::HookReplay { runtime, .. } => runtime.automation_scheduler_reconciler(
+                current_key,
+                current_project_path,
+                handshake,
+            ),
             #[cfg(unix)]
             Self::Unix(engine) => Some(engine.automation_scheduler_reconciler(
                 current_key,
@@ -95,8 +132,9 @@ impl ProductionProjectCompositionRuntime {
         }
     }
 
-    pub(super) const fn startup_catch_up(&self) -> bool {
+    pub(super) fn startup_catch_up(&self) -> bool {
         match self {
+            Self::HookReplay { runtime, .. } => runtime.startup_catch_up(),
             #[cfg(unix)]
             Self::Unix(_) => true,
             #[cfg(any(not(unix), test, feature = "test-transport"))]

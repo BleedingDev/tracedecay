@@ -91,6 +91,30 @@ impl McpServer {
         self.background_tasks.close_admission();
     }
 
+    pub(crate) async fn register_hook_replay_owner(
+        &self,
+        delivery: Arc<tracedecay_application::observability::DeliverySettlementAuthorityV1>,
+        sessions: RegisteredGlobalDbLeaseV1,
+        cpu: Arc<tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1>,
+    ) -> bool {
+        // Full is visible while dependent owners mount. Select the current
+        // graph and record ownership under the same lock as branch swaps.
+        let graph = self.cg.write().await;
+        if !self.background_tasks.admits() {
+            return false;
+        }
+        let registered = crate::daemon::hook_v2_replay_consumer::register_hook_v2_replay_consumer(
+            Arc::clone(&graph),
+            delivery,
+            sessions,
+            cpu,
+        );
+        if registered {
+            self.hook_replay_owned.store(true, Ordering::Release);
+        }
+        registered
+    }
+
     pub(crate) fn project_server_response_lifecycle(&self) -> ProjectServerResponseLifecycle {
         self.project_server_lifecycle.clone()
     }
@@ -196,6 +220,12 @@ impl McpServer {
         let cg_cell = Arc::clone(&self.cg);
         let completion = BranchReopenCompletion(Arc::clone(&self.branch_reopen_completions));
         let reconcile = self.database_owner_reconciler.clone();
+        let background_tasks = Arc::downgrade(&self.background_tasks);
+        let hook_replay_owned = Arc::clone(&self.hook_replay_owned);
+        let replay_dependencies = self
+            .project_session_db
+            .clone()
+            .zip(self.background_cpu.clone());
         // A drift observation is the only trigger for a retained reopen.
         let reason = "branch_drift";
         let _admitted = self.background_tasks.spawn(async move {
@@ -218,6 +248,22 @@ impl McpServer {
                     );
                     {
                         let mut guard = cg_cell.write().await;
+                        let Some(background_tasks) = background_tasks.upgrade() else {
+                            return;
+                        };
+                        if !background_tasks.admits() {
+                            return;
+                        }
+                        if hook_replay_owned.load(Ordering::Acquire)
+                            && let Some((sessions, cpu)) = &replay_dependencies
+                        {
+                            crate::daemon::hook_v2_replay_consumer::transfer_hook_v2_replay_consumer(
+                                &current,
+                                Arc::clone(&fresh),
+                                sessions.clone(),
+                                Arc::clone(cpu),
+                            );
+                        }
                         *guard = Arc::clone(&fresh);
                     }
                     // The owner reconcile runs here, after the swap, rather

@@ -1,9 +1,9 @@
 use super::schema_contract::{
     authority_invariant_triggers_intact, ensure_authority_audit_checkpoint_schema,
     ensure_authority_invariant_schema, ensure_authority_invariants,
-    ensure_fresh_authority_invariants, require_foreign_key_audit,
-    validate_authority_rows_exhaustive, validate_authority_schema_contract,
-    validate_registry_schema_contract, validate_remote_deletion_schema_contract,
+    ensure_fresh_authority_invariants, validate_authority_rows_exhaustive,
+    validate_authority_schema_contract, validate_registry_schema_contract,
+    validate_remote_deletion_schema_contract,
 };
 use super::{
     configuration, git_index_transactions, global_db_operation_error, global_db_operation_message,
@@ -863,6 +863,25 @@ async fn install_registered_schema_stage_sequence(
     force_exhaustive: bool,
 ) -> tracedecay_domain::errors::Result<Option<RefusedAuthorityV1>> {
     let is_fresh = configuration_fresh.is_some();
+    let canonical_reference_guard_damage = !is_fresh
+        && session_features != SessionFeatureSchema::NotHosted
+        && !crate::observation::canonical_lifecycle::reference_schema_intact(transaction).await?;
+    let force_exhaustive = force_exhaustive || canonical_reference_guard_damage;
+    if canonical_reference_guard_damage {
+        // Completion markers cannot authorize collection after their derived
+        // reference tables or guards were lost. Clear them before any DDL can
+        // recreate the lost evidence and make it appear intact.
+        transaction
+            .execute(
+                "DELETE FROM session_backfill_meta WHERE key LIKE 'canonical-reference-backfill-%'
+             OR key LIKE 'canonical-gc-%'",
+                (),
+            )
+            .await
+            .map_err(|error| {
+                global_db_operation_error("invalidate damaged canonical reference trust", error)
+            })?;
+    }
     configuration::ensure_configuration_schema(transaction, configuration_fresh)
         .await
         .map_err(configuration_schema_error(
@@ -873,7 +892,16 @@ async fn install_registered_schema_stage_sequence(
         // Persist the requirement before later schema work repairs the
         // trigger evidence that armed it. The progress row doubles as the
         // resumable cursor and is removed only by a completed FK sweep.
-        require_foreign_key_audit(transaction).await?;
+        transaction
+            .execute_batch(
+                "DELETE FROM authority_audit_checkpoints;
+             DELETE FROM authority_projection_repair_progress;",
+            )
+            .await
+            .map_err(|error| {
+                global_db_operation_error("invalidate damaged authority audit trust", error)
+            })?;
+        crate::schema_contract::invariants::reset_foreign_key_audit(transaction).await?;
     }
     if is_fresh {
         transaction
@@ -1927,6 +1955,26 @@ mod tests {
         let database_path = directory.path().join("sessions.db");
         install_registered_schema(&database_path).await;
         {
+            let connection = TestConnection::open(&database_path);
+            let (observation, cursor) =
+                crate::schema_contract::invariants::test_fixture::seed_observation(
+                    &connection,
+                    0,
+                    "rotation-refusal",
+                )
+                .await;
+            crate::schema_contract::invariants::test_fixture::write_cursor(&connection, &cursor)
+                .await;
+            connection
+                .execute(
+                    "INSERT INTO projection_queue(observation_id, observation_sequence)
+                 SELECT observation_id, sequence FROM observations WHERE observation_id = ?1",
+                    (observation.observation_id().as_str(),),
+                )
+                .await
+                .unwrap();
+        }
+        {
             let connection = rusqlite::Connection::open(&database_path).unwrap();
             connection
                 .execute_batch(
@@ -1935,8 +1983,6 @@ mod tests {
                  DROP TRIGGER IF EXISTS session_query_cursor_keys_insert_guard_v1;
                  DROP TRIGGER IF EXISTS session_query_cursor_keys_retire_update_v1;
                  DROP TRIGGER IF EXISTS session_query_cursor_keys_rotate_insert_v1;
-                 INSERT INTO projection_queue(observation_id, observation_sequence)
-                 VALUES ('orphaned-observation', 1);
                  INSERT INTO session_query_cursor_keys (
                     key_id, key_version, key_material, created_at, retired_at
                  ) VALUES
@@ -1967,7 +2013,7 @@ mod tests {
         assert_eq!(
             rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
             1,
-            "audit refusal must not repair queued rows before row admission"
+            "audit refusal must not process valid queued observations before row admission"
         );
         drop(rows);
         let mut rows = connection
@@ -1994,6 +2040,48 @@ mod tests {
         assert!(
             rows.next().await.unwrap().is_some(),
             "admission must restore the dropped guard trigger before refusing on rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_queue_identity_guard_refuses_orphans_without_deleting_them() {
+        let directory = TempDir::new().unwrap();
+        let database_path = directory.path().join("sessions.db");
+        install_registered_schema(&database_path).await;
+        {
+            let connection = rusqlite::Connection::open(&database_path).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA foreign_keys = OFF;
+                 DROP TRIGGER IF EXISTS projection_queue_identity_insert_v1;
+                 INSERT INTO projection_queue(observation_id, observation_sequence)
+                 VALUES ('orphaned-observation', 1);",
+                )
+                .unwrap();
+        }
+        for attempt in 1..=2u8 {
+            let error = registered_admission_error(&database_path).await;
+            assert!(
+                error
+                    .to_string()
+                    .contains("projection_queue contains an observation identity mismatch"),
+                "open attempt {attempt} must keep refusing the orphaned queue authority: {error}"
+            );
+        }
+        let connection = TestConnection::open(&database_path);
+        let mut rows = connection
+            .query(
+                "SELECT observation_id, observation_sequence FROM projection_queue",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "orphaned-observation");
+        assert_eq!(row.get::<i64>(1).unwrap(), 1);
+        assert!(
+            rows.next().await.unwrap().is_none(),
+            "audit refusal must preserve the exact queued row"
         );
     }
 

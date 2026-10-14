@@ -166,10 +166,11 @@ impl<S: TranscriptIngestStore> UserProviderUnit<'_, S> {
                     );
                 }
             };
-        let frontier = stored.for_coverage(matches!(
-            stored_coverage,
-            Some(HostProviderCoverage::Complete)
-        ));
+        let complete = matches!(stored_coverage, Some(HostProviderCoverage::Complete));
+        let frontier = self.codex_discovery.map_or_else(
+            || stored.for_coverage(complete),
+            |(hub, consumer)| hub.coverage_frontier(consumer, stored, complete),
+        );
         match try_ingest_user_codex_sessions_rotated(
             self.profile_root,
             None,
@@ -192,6 +193,28 @@ impl<S: TranscriptIngestStore> UserProviderUnit<'_, S> {
                 for failure in result.failures {
                     run.add_failure(failure);
                 }
+                // The partial record must precede a discovery-complete frontier,
+                // including when the only remaining work is source metadata.
+                if (outcome.deferred_by_byte_cap || result.committable_frontier.is_none())
+                    && let Err(error) = persist_host_provider_coverage(
+                        self.facade,
+                        &ObservationScopeV1::Profile,
+                        "codex",
+                        HostProviderCoverage::Partial,
+                        1,
+                        None,
+                    )
+                    .await
+                {
+                    run.add_failure(warn_transcript_catch_up_failure(
+                        "codex",
+                        "coverage",
+                        &error,
+                        "user Codex coverage persistence failed",
+                    ));
+                    return run;
+                }
+
                 let mut frontier_persisted = result.committable_frontier.is_some();
                 if let Some(next_frontier) = result
                     .committable_frontier
@@ -229,6 +252,7 @@ impl<S: TranscriptIngestStore> UserProviderUnit<'_, S> {
                         &coverage_error,
                         "user Codex coverage persistence failed",
                     ));
+                    frontier_persisted = false;
                 }
                 if frontier_persisted && let Some((hub, consumer)) = self.codex_discovery {
                     hub.acknowledge(consumer);

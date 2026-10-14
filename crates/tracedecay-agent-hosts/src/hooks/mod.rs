@@ -1453,3 +1453,5 @@ mod output_delivery_tests;
 
 #[cfg(test)]
 mod tests;
+
+pub use dispatch::publish_daemon_bindings_for_open as publish_hook_bindings_for_open;

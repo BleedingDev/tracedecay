@@ -1676,7 +1676,7 @@ async fn unenrolled_leaf_is_rejected_from_cache_and_direct_open() {
 
     let cancellation = CancellationToken::new();
     let open_error = match engine
-        .open_project_server_until_cancelled(&handshake, &cancellation)
+        .open_project_server_until_cancelled(&handshake, &cancellation, None)
         .await
     {
         Ok(_) => panic!("direct project open must enforce enrollment admission"),

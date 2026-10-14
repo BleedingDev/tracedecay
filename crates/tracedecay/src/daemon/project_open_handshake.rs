@@ -12,11 +12,12 @@ use crate::test_support::hold_after_project_sessions_for_test;
 /// `cancellation` from inside; the token is checked between them so a
 /// draining daemon waits for at most the unit in flight, not the whole open.
 #[tracing::instrument(name = "daemon.project.handshake.open", level = "trace", skip_all)]
-pub(super) async fn open_project_for_handshake(
+pub(super) async fn open_project_for_handshake_with_hook_recovery(
     project_path: &Path,
     handshake: &DaemonHandshake,
     store_administration: &StoreAdministration,
     cancellation: &CancellationToken,
+    hook_recovery: Option<&[tracedecay_hooks::HookConfigurationSnapshotV1]>,
 ) -> Result<tracedecay_project::project::TraceDecay> {
     let open_options = crate::daemon::handshake_open_options(handshake);
     let registry_database = store_administration.registered_profile_database().await?;
@@ -98,13 +99,14 @@ pub(super) async fn open_project_for_handshake(
     // and durable store authority; project composition schedules the maintained
     // bounded code-index owner after publication.
     let open_result = Box::pin(
-        tracedecay_project::project::TraceDecay::open_with_registered_configuration(
+        tracedecay_project::project::TraceDecay::open_with_registered_configuration_for_hook_replay(
             project_path,
             open_options.clone(),
             store_layout.clone(),
             configuration_database.clone(),
             registry_database.clone(),
             Arc::clone(&runtime_registry),
+            hook_recovery,
         ),
     )
     .await;

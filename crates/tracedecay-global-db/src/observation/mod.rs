@@ -1,4 +1,5 @@
 mod canonical_bodies;
+pub mod canonical_lifecycle;
 mod codec;
 mod persist;
 mod refusal_census;

@@ -490,16 +490,28 @@ async fn doctor_runtime_value_inner(
     let canonical_session_path = session_path
         .canonicalize()
         .unwrap_or_else(|_| session_path.clone());
-    let session_db = Box::pin(store_administration.mounted_registered_session_databases())
-        .await
-        .into_iter()
-        .find(|database| {
-            database
-                .db_path()
-                .canonicalize()
-                .unwrap_or_else(|_| database.db_path().to_path_buf())
-                == canonical_session_path
-        });
+    let session_databases =
+        match Box::pin(store_administration.mounted_registered_session_databases()).await {
+            Ok(databases) => databases,
+            Err(error) => {
+                value["session_temporal_health"] = doctor_runtime_temporal_unavailable(
+                    DoctorRuntimeUnavailableReason::SessionStoreUnavailable,
+                );
+                value["cursor_session_ingest"] = json!({
+                    "status": "unavailable",
+                    "reason": "session_registry_unavailable",
+                    "message": error.to_string(),
+                });
+                return value;
+            }
+        };
+    let session_db = session_databases.into_iter().find(|database| {
+        database
+            .db_path()
+            .canonicalize()
+            .unwrap_or_else(|_| database.db_path().to_path_buf())
+            == canonical_session_path
+    });
     if let Some(db) = session_db.as_ref() {
         let health_budget = Duration::from_secs(8);
         let session_temporal = SessionTemporalAccess::new(&**db);
@@ -1132,11 +1144,12 @@ mod doctor_runtime_route_tests {
             "status-published-core",
         )
         .expect("fixture daemon authority");
-        let graph = super::super::open_project_for_handshake(
+        let graph = super::super::open_project_for_handshake_with_hook_recovery(
             &project,
             &handshake,
             &administration,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect("fixture project graph");
@@ -1694,11 +1707,12 @@ mod doctor_runtime_route_tests {
             "core-doctor-fast-runtime-health",
         )
         .expect("enter daemon database scope");
-        let graph = super::super::open_project_for_handshake(
+        let graph = super::super::open_project_for_handshake_with_hook_recovery(
             &project,
             &handshake,
             &store_administration,
             &CancellationToken::new(),
+            None,
         )
         .await
         .expect("open retained project graph");

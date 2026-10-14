@@ -341,10 +341,15 @@ fn lcm_request(provider: &str, session_id: &str) -> LcmCompressionRequest {
 async fn lcm_compress(database: &RegisteredGlobalDb, provider: &str, session_id: &str) {
     let control = ExecutionControl::new(None);
     let response = database
-        .lcm_compress_guarded(&lcm_request(provider, session_id), &control, || Ok(()))
+        .lcm_compress_guarded(
+            &lcm_request(provider, session_id),
+            &control,
+            None,
+            || Ok(()),
+        )
         .await
         .unwrap();
-    assert_eq!(response.status, "ok");
+    assert_eq!(response.0.status, "ok");
 }
 
 async fn stored_project(

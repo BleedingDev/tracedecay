@@ -923,23 +923,28 @@ pub async fn record_outcome(
     Ok(affected == 1)
 }
 
+/// The canonical raw revision, independent of convergence queue scheduling state.
+pub async fn session_raw_revision(
+    conn: &(impl QueryExecutor + ?Sized),
+    provider: &str,
+    session_id: &str,
+) -> Result<Option<i64>, LcmError> {
+    let mut rows = conn.query(
+        "SELECT raw_revision_generation FROM lcm_summary_convergence_queue WHERE provider = ?1 AND session_id = ?2",
+        params![provider, session_id],
+    ).await?;
+    rows.next()
+        .await?
+        .map(|row| row.get::<i64>(0))
+        .transpose()
+        .map_err(Into::into)
+}
+
 pub async fn require_candidate_revision(
     conn: &(impl QueryExecutor + ?Sized),
     candidate: &LcmSummaryConvergenceCandidate,
 ) -> Result<(), LcmError> {
-    let mut rows = conn
-        .query(
-            "SELECT raw_revision_generation
-             FROM lcm_summary_convergence_queue
-             WHERE provider = ?1 AND session_id = ?2",
-            params![candidate.provider.as_str(), candidate.session_id.as_str()],
-        )
-        .await?;
-    let actual = rows
-        .next()
-        .await?
-        .map(|row| row.get::<i64>(0))
-        .transpose()?;
+    let actual = session_raw_revision(conn, &candidate.provider, &candidate.session_id).await?;
     if actual != Some(candidate.raw_revision_generation) {
         return Err(LcmError::StaleRawRevision {
             expected: candidate.raw_revision_generation,
@@ -955,6 +960,10 @@ const PARKED_REQUEUE_BINDING_KEY: &str = "summary_convergence_parked_binding_v1"
 /// remain, then [`PARKED_REQUEUE_COMPLETE`].
 const PARKED_REQUEUE_CURSOR_KEY: &str = "summary_convergence_parked_cursor_v1";
 const PARKED_REQUEUE_COMPLETE: &str = "complete";
+// Earlier releases parked configured provider failures as unavailable. A
+// one-time bounded drain lets those rows adopt the typed retry policy.
+const PARKED_FAILURE_CLASSIFICATION_KEY: &str = "summary_convergence_failure_classification";
+const PARKED_FAILURE_CLASSIFICATION: &str = "typed_executor_failure";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LcmParkedRequeuePage {
@@ -968,6 +977,13 @@ async fn parked_requeue_cursor(
     conn: &(impl QueryExecutor + ?Sized),
     binding: &str,
 ) -> Result<Option<i64>, LcmError> {
+    if schema::get_gc_meta(conn, PARKED_FAILURE_CLASSIFICATION_KEY)
+        .await?
+        .as_deref()
+        != Some(PARKED_FAILURE_CLASSIFICATION)
+    {
+        return Ok(Some(0));
+    }
     if schema::get_gc_meta(conn, PARKED_REQUEUE_BINDING_KEY)
         .await?
         .as_deref()
@@ -1010,6 +1026,12 @@ pub async fn requeue_parked_page(
     let Some(cursor) = parked_requeue_cursor(conn, binding).await? else {
         return Ok(LcmParkedRequeuePage::default());
     };
+    schema::set_gc_meta(
+        conn,
+        PARKED_FAILURE_CLASSIFICATION_KEY,
+        PARKED_FAILURE_CLASSIFICATION,
+    )
+    .await?;
     schema::set_gc_meta(conn, PARKED_REQUEUE_BINDING_KEY, binding).await?;
     let page_limit_usize = page_limit.max(1);
     let page_limit = i64::try_from(page_limit_usize)
@@ -1018,6 +1040,12 @@ pub async fn requeue_parked_page(
         .query(
             "SELECT queue_id FROM lcm_summary_convergence_queue
              WHERE state = 'unavailable' AND queue_id > ?1
+               AND failure_code IN (
+                   'summarizer_configuration_unavailable',
+                   'authoritative_summarizer_unavailable',
+                   'codex_app_server_unconfigured', 'cursor_agent_unconfigured',
+                   'codex_app_server_unavailable', 'cursor_agent_unavailable'
+               )
              ORDER BY queue_id
              LIMIT ?2",
             params![cursor, page_limit],
@@ -1037,7 +1065,13 @@ pub async fn requeue_parked_page(
                  failure_code = NULL,
                  failure_count = 0,
                  next_attempt_at_ms = 0
-             WHERE state = 'unavailable' AND queue_id > ?1 AND queue_id <= ?2",
+             WHERE state = 'unavailable' AND queue_id > ?1 AND queue_id <= ?2
+               AND failure_code IN (
+                   'summarizer_configuration_unavailable',
+                   'authoritative_summarizer_unavailable',
+                   'codex_app_server_unconfigured', 'cursor_agent_unconfigured',
+                   'codex_app_server_unavailable', 'cursor_agent_unavailable'
+               )",
             params![cursor, last_queue_id],
         )
         .await?;

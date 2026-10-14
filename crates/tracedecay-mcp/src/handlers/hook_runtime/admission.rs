@@ -159,12 +159,11 @@ pub fn hook_v2_pending_work_envelopes(
 ) -> std::result::Result<Vec<tracedecay_hooks::HookEventEnvelopeV2>, HookV2AdmissionLedgerUnavailable>
 {
     let ledger_root = hook_v2_admission_ledger_root(data_root, host);
-    let absent = |root: &Path| match std::fs::symlink_metadata(root) {
-        Ok(_) => Ok(false),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(_) => Err(tracedecay_hooks::HookAdmissionLedgerError::Io),
-    };
-    if absent(&ledger_root)? && absent(&pre_ledger_hook_v2_pending_work_root(data_root, host))? {
+    if !tracedecay_hooks::HookAdmissionLedgerV1::root_exists(&ledger_root)?
+        && !tracedecay_hooks::HookAdmissionLedgerV1::root_exists(
+            &pre_ledger_hook_v2_pending_work_root(data_root, host),
+        )?
+    {
         return Ok(Vec::new());
     }
     Ok(with_hook_v2_admission_ledger(
@@ -176,9 +175,36 @@ pub fn hook_v2_pending_work_envelopes(
     )??)
 }
 
+/// Read current producer-work status from the retained canonical index. A
+/// present unopened ledger needs its replay owner to establish an index;
+/// status never opens, repairs, expires or creates that durable authority.
+pub fn hook_v2_pending_work_count(
+    data_root: &Path,
+    host: tracedecay_domain::NativeHostIdentityV1,
+) -> std::result::Result<usize, HookV2AdmissionLedgerUnavailable> {
+    let root = hook_v2_admission_ledger_root(data_root, host);
+    let exists = tracedecay_hooks::HookAdmissionLedgerV1::root_exists(&root)?;
+    if tracedecay_hooks::HookAdmissionLedgerV1::root_exists(&pre_ledger_hook_v2_pending_work_root(
+        data_root, host,
+    ))? {
+        return Err(tracedecay_hooks::HookAdmissionLedgerError::ResetRequired.into());
+    }
+    let ledgers = HOOK_V2_ADMISSION_LEDGERS
+        .open
+        .lock()
+        .map_err(|_| HookV2AdmissionLedgerUnavailable::Poisoned)?;
+    match ledgers.get(&root) {
+        Some(ledger) => Ok(ledger.pending_work_count()?),
+        None if !exists => Ok(0),
+        None => Err(HookV2AdmissionLedgerUnavailable::Unopened),
+    }
+}
+
 /// Why the daemon could not use a Hook V2 admission ledger.
 #[derive(Debug, thiserror::Error)]
 pub enum HookV2AdmissionLedgerUnavailable {
+    #[error("the present admission ledger has no retained read authority")]
+    Unopened,
     #[error("the admission ledger owner is poisoned")]
     Poisoned,
     #[error("the daemon already holds its bound of open admission ledgers")]
@@ -243,6 +269,9 @@ impl HookV2AdmissionLedgers {
             .open
             .lock()
             .map_err(|_| HookV2AdmissionLedgerUnavailable::Poisoned)?;
+        if let Some(ledger) = ledgers.get(&ledger_root) {
+            ledger.validate_storage()?;
+        }
         if ledgers
             .get(&ledger_root)
             .is_some_and(tracedecay_hooks::HookAdmissionLedgerV1::needs_reopen)

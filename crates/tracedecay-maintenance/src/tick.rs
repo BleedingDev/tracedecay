@@ -7,6 +7,8 @@ use std::time::Duration;
 pub enum MaintenanceContinuation {
     /// Resume bounded code-generation retention over the normal graph window.
     CodeGenerationRetention,
+    /// Resume bounded observation policy, canonical references and content collection.
+    SessionContentRetention,
 }
 
 /// Outcome of one maintenance tick or per-store unit.
@@ -42,6 +44,9 @@ impl MaintenanceTickOutcome {
             Self::Complete => "complete",
             Self::Continue(MaintenanceContinuation::CodeGenerationRetention) => {
                 "code_generation_progress"
+            }
+            Self::Continue(MaintenanceContinuation::SessionContentRetention) => {
+                "session_content_progress"
             }
             Self::Retry => "retry",
         }

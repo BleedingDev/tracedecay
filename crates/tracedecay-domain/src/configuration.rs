@@ -67,6 +67,7 @@ pub const RETIRED_CORE_SETTING_KEYS_V1: &[&str] = &[
 /// Canonical user-profile settings.
 pub const USER_UPLOAD_ENABLED_SETTING_KEY: &str = "user.upload_enabled.v1";
 pub const USER_REPEATED_QUERY_HINTS_SETTING_KEY: &str = "user.repeated_query_hints.v1";
+pub const USER_LCM_CODEX_SUMMARIZER_SETTING_KEY: &str = "user.lcm_codex_summarizer.v1";
 pub const USER_CODE_INDEX_WORKERS_SETTING_KEY: &str = "user.code_index_workers.v1";
 pub const USER_WATCHER_DEBOUNCE_MS_SETTING_KEY: &str = "user.watcher_debounce_ms.v1";
 pub const USER_EXTRACTION_TIMEOUT_SECS_SETTING_KEY: &str = "user.extraction_timeout_secs.v1";
@@ -78,6 +79,7 @@ pub const USER_WORK_EXPERTISE_CONSENT_SETTING_KEY: &str = "user.work_expertise_c
 /// Work read pins it together with the project's consent in one revision.
 pub const PROFILE_SETTING_KEYS_V1: &[&str] = &[
     USER_CODE_INDEX_WORKERS_SETTING_KEY,
+    USER_LCM_CODEX_SUMMARIZER_SETTING_KEY,
     USER_UPLOAD_ENABLED_SETTING_KEY,
     USER_REPEATED_QUERY_HINTS_SETTING_KEY,
     USER_WATCHER_DEBOUNCE_MS_SETTING_KEY,
@@ -133,6 +135,7 @@ pub const CONFIGURATION_SETTING_KEYS_V1: &[&str] = &[
     USER_UPLOAD_ENABLED_SETTING_KEY,
     USER_REPEATED_QUERY_HINTS_SETTING_KEY,
     USER_CODE_INDEX_WORKERS_SETTING_KEY,
+    USER_LCM_CODEX_SUMMARIZER_SETTING_KEY,
     USER_WATCHER_DEBOUNCE_MS_SETTING_KEY,
     USER_EXTRACTION_TIMEOUT_SECS_SETTING_KEY,
     USER_WORK_EXPERTISE_CONSENT_SETTING_KEY,
@@ -565,6 +568,7 @@ pub enum ConfigurationValueKindV1 {
     ContextScoutSettings,
     AutomationSettings,
     LcmSummarizerExecutables,
+    LcmSummarizerExecutable,
 }
 
 /// Profile-level worker-count intent for the process-wide code-index pool.
@@ -1577,6 +1581,7 @@ pub enum ConfigurationValueV1 {
     ContextScoutSettings(ContextScoutSettingsV1),
     AutomationSettings(Box<AutomationSettingsV1>),
     LcmSummarizerExecutables(LcmSummarizerExecutablesV1),
+    LcmSummarizerExecutable(LcmSummarizerExecutableV1),
 }
 
 impl ConfigurationValueV1 {
@@ -1596,6 +1601,7 @@ impl ConfigurationValueV1 {
             Self::ContextScoutSettings(_) => ConfigurationValueKindV1::ContextScoutSettings,
             Self::AutomationSettings(_) => ConfigurationValueKindV1::AutomationSettings,
             Self::LcmSummarizerExecutables(_) => ConfigurationValueKindV1::LcmSummarizerExecutables,
+            Self::LcmSummarizerExecutable(_) => ConfigurationValueKindV1::LcmSummarizerExecutable,
         }
     }
 
@@ -1634,6 +1640,7 @@ impl ConfigurationValueV1 {
             Self::ContextScoutSettings(settings) => settings.validate(),
             Self::AutomationSettings(settings) => settings.validate(),
             Self::LcmSummarizerExecutables(executables) => executables.validate(),
+            Self::LcmSummarizerExecutable(executable) => executable.validate(),
         }
     }
 }

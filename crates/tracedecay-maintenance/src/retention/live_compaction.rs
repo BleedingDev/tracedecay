@@ -34,7 +34,20 @@ impl LiveStoreCompactionFailureV1 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LiveStoreCompactionOutcomeV1 {
     NotScheduled,
+    /// The observed logical database shrank. WAL checkpointing and filesystem
+    /// allocation are independent, so this does not claim reclaimed file bytes.
     Compacted {
+        page_count_before: u64,
+        page_count_after: u64,
+        freelist_before: u64,
+        freelist_after: u64,
+    },
+    /// The writer command succeeded without an observed page-count reduction.
+    /// SQLite permits this for legacy stores with `auto_vacuum=NONE`, and live
+    /// writes can also consume or add pages between the two samples.
+    NoProgress {
+        page_count_before: u64,
+        page_count_after: u64,
         freelist_before: u64,
         freelist_after: u64,
     },
@@ -117,12 +130,28 @@ async fn compact_store(
             LiveStoreCompactionFailureV1::IncrementalVacuumFailed,
         );
     }
-    let Ok((_, _, freelist_after)) = store.storage_page_counts().await else {
+    let Ok((page_size_after, page_count_after, freelist_after)) = store.storage_page_counts().await
+    else {
         return LiveStoreCompactionOutcomeV1::Failed(
             LiveStoreCompactionFailureV1::PostCompactionSampleFailed,
         );
     };
+    if page_size_after != page_size {
+        return LiveStoreCompactionOutcomeV1::Failed(
+            LiveStoreCompactionFailureV1::PostCompactionSampleFailed,
+        );
+    }
+    if page_count_after >= page_count {
+        return LiveStoreCompactionOutcomeV1::NoProgress {
+            page_count_before: page_count,
+            page_count_after,
+            freelist_before: freelist,
+            freelist_after,
+        };
+    }
     LiveStoreCompactionOutcomeV1::Compacted {
+        page_count_before: page_count,
+        page_count_after,
         freelist_before: freelist,
         freelist_after,
     }
@@ -177,6 +206,12 @@ fn store_size_sample_at(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use tracedecay_runtime_core::db::{
+        DatabaseAuthority, TestDatabaseRuntimeMode, TestDatabaseRuntimeScope,
+    };
+
     use super::*;
 
     fn config(threshold: f64, minimum_reclaimable_bytes: u64) -> CompactionThresholdConfig {
@@ -185,6 +220,144 @@ mod tests {
             minimum_reclaimable_bytes,
             max_pages_per_tick: 16,
         }
+    }
+
+    fn create_sqlite_fixture(path: &Path, auto_vacuum: &str) {
+        let mut connection = rusqlite::Connection::open(path).unwrap();
+        connection
+            .pragma_update(None, "auto_vacuum", auto_vacuum)
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE compaction_fixture (id INTEGER PRIMARY KEY, body BLOB NOT NULL)",
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        for id in 1..=128 {
+            transaction
+                .execute(
+                    "INSERT INTO compaction_fixture (id, body) VALUES (?1, zeroblob(4096))",
+                    [id],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        connection
+            .execute("DELETE FROM compaction_fixture WHERE id <= 120", [])
+            .unwrap();
+    }
+
+    async fn attach_fixture(path: &Path, mode: TestDatabaseRuntimeMode) -> Database {
+        let authority =
+            DatabaseAuthority::acquire_test(path, "live compaction SQLite fixture").unwrap();
+        Database::publish_registered_test_runtime(
+            path,
+            &authority,
+            mode,
+            TestDatabaseRuntimeScope::Profile,
+        )
+        .await
+        .unwrap()
+        .0
+    }
+
+    async fn assert_retained_rows(database: &Database) {
+        let mut rows = database
+            .read_connection()
+            .query(
+                "SELECT count(*), sum(length(body)) FROM compaction_fixture",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 8);
+        assert_eq!(row.get::<i64>(1).unwrap(), 8 * 4096);
+    }
+
+    #[tokio::test]
+    async fn legacy_none_auto_vacuum_reports_no_progress_and_preserves_file_pages() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("store.db");
+        create_sqlite_fixture(&path, "NONE");
+        let database = attach_fixture(&path, TestDatabaseRuntimeMode::Existing).await;
+        let before = database.storage_page_counts().await.unwrap();
+        let file_bytes_before = std::fs::metadata(&path).unwrap().len();
+        assert!(before.2 > 16, "the fixture must contain reclaimable pages");
+
+        let outcome = compact_project_store(&database, &config(0.01, 1)).await;
+
+        assert_eq!(
+            outcome,
+            LiveStoreCompactionOutcomeV1::NoProgress {
+                page_count_before: before.1,
+                page_count_after: before.1,
+                freelist_before: before.2,
+                freelist_after: before.2,
+            }
+        );
+        assert_eq!(database.storage_page_counts().await.unwrap(), before);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), file_bytes_before);
+        assert_retained_rows(&database).await;
+        assert!(crate::compaction_receipt::record_live_compaction_outcome(
+            "fixture", outcome
+        ));
+    }
+
+    #[tokio::test]
+    async fn incremental_auto_vacuum_reports_bounded_observed_page_reduction() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("store.db");
+        create_sqlite_fixture(&path, "INCREMENTAL");
+        let database = attach_fixture(&path, TestDatabaseRuntimeMode::Existing).await;
+        let before = database.storage_page_counts().await.unwrap();
+        assert!(before.2 > 16, "the fixture must contain reclaimable pages");
+        let mut policy = config(0.01, 1);
+        policy.max_pages_per_tick = 1;
+
+        let outcome = compact_project_store(&database, &policy).await;
+
+        let after = database.storage_page_counts().await.unwrap();
+        assert_eq!(after.0, before.0);
+        assert_eq!(before.1 - after.1, 1);
+        assert_eq!(before.2 - after.2, 1);
+        assert_eq!(
+            outcome,
+            LiveStoreCompactionOutcomeV1::Compacted {
+                page_count_before: before.1,
+                page_count_after: after.1,
+                freelist_before: before.2,
+                freelist_after: after.2,
+            }
+        );
+        assert_retained_rows(&database).await;
+        assert!(crate::compaction_receipt::record_live_compaction_outcome(
+            "fixture", outcome
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_only_compaction_reports_writer_failure_without_modifying_pages() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("store.db");
+        create_sqlite_fixture(&path, "INCREMENTAL");
+        let database = attach_fixture(&path, TestDatabaseRuntimeMode::ReadOnly).await;
+        let before = database.storage_page_counts().await.unwrap();
+        assert!(before.2 > 16, "the fixture must contain reclaimable pages");
+
+        let outcome = compact_project_store(&database, &config(0.01, 1)).await;
+
+        assert_eq!(
+            outcome,
+            LiveStoreCompactionOutcomeV1::Failed(
+                LiveStoreCompactionFailureV1::IncrementalVacuumFailed,
+            )
+        );
+        assert_eq!(database.storage_page_counts().await.unwrap(), before);
+        assert_retained_rows(&database).await;
+        assert!(!crate::compaction_receipt::record_live_compaction_outcome(
+            "fixture", outcome
+        ));
     }
 
     #[test]

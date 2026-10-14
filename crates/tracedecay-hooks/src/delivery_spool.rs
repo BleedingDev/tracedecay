@@ -341,6 +341,11 @@ impl HookDeliveryReceiptSpoolV1 {
 
     /// Whether `root` holds receipts, published or readied, for a drain.
     pub fn has_receipts(root: &Path) -> Result<bool, HookDeliverySpoolError> {
+        if !tracedecay_private_fs::framed_log::validate_directory_or_missing(root)
+            .map_err(map_read_error)?
+        {
+            return Ok(false);
+        }
         let entries = match fs::read_dir(root) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -742,7 +747,10 @@ fn decode_receipt(bytes: &[u8]) -> Result<HookDeliverySourceReceiptV1, HookDeliv
 }
 
 fn map_read_error(error: std::io::Error) -> HookDeliverySpoolError {
-    if error.kind() == std::io::ErrorKind::InvalidInput {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::NotADirectory
+    ) {
         HookDeliverySpoolError::UnsafePath
     } else {
         HookDeliverySpoolError::Io

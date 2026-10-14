@@ -8,6 +8,7 @@ use tracedecay_runtime_core::db::{
 };
 
 mod audit;
+mod foreign_keys;
 mod released_rendering;
 mod repair;
 mod rows;
@@ -20,17 +21,18 @@ pub(crate) use triggers::SOURCE_CURSOR_ADVANCE_DELETE_GUARD_SQL;
 
 use audit::{
     AuditCheckpoint, AuditProgress, audit_checkpoint_is_plausible, ensure_audit_checkpoint_schema,
-    read_audit_checkpoint, validate_projection_authority_chunk,
+    read_audit_checkpoint, read_audited_counts, validate_projection_authority_chunk,
     validate_projection_authority_suffix, write_audit_checkpoint,
 };
+use foreign_keys::{ForeignKeyPage, check_foreign_key_page};
 use released_rendering::ReleasedRenderingLedger;
 use repair::{
-    repair_committed_source_cursors, repair_projection_frontier,
-    validate_observation_cursor_coverage,
+    CursorAuditPage, clear_cursor_audit_pending_page, repair_pending_source_cursor_page,
+    repair_projection_frontier_page, validate_observation_cursor_coverage,
 };
 use rows::{
     audit_read_error, authority_violation, observation_row_audit_covers, query_has_rows,
-    validate_mutable_invariant_rows, validate_observation_authority_page,
+    validate_and_stage_observation_authority_page, validate_mutable_invariant_rows,
     validate_observation_authority_rows, validate_receipt_authority_page,
     validate_receipt_authority_rows, validate_source_cursor_authority_chunk,
     validate_source_cursor_authority_rows,
@@ -71,13 +73,27 @@ pub async fn require_foreign_key_audit(
     conn: &impl Executor,
 ) -> tracedecay_domain::errors::Result<()> {
     conn.execute(
-        "INSERT INTO authority_foreign_key_audit_progress (audit_name, last_table)
-         VALUES (?1, '')
-         ON CONFLICT(audit_name) DO NOTHING",
+        "INSERT INTO authority_foreign_key_audit_progress (audit_name, last_table, audit_generation)
+         VALUES (?1, '', lower(hex(randomblob(16))))
+         ON CONFLICT(audit_name) DO UPDATE SET
+            audit_generation = CASE WHEN audit_generation = '' THEN excluded.audit_generation ELSE audit_generation END",
         (FOREIGN_KEY_AUDIT_PROGRESS,),
     )
     .await
     .map_err(audit_read_error)?;
+    Ok(())
+}
+
+pub async fn reset_foreign_key_audit(
+    conn: &impl Executor,
+) -> tracedecay_domain::errors::Result<()> {
+    conn.execute(
+        "INSERT INTO authority_foreign_key_audit_progress (audit_name, last_table, last_rowid, audit_generation)
+         VALUES (?1, '', NULL, lower(hex(randomblob(16))))
+         ON CONFLICT(audit_name) DO UPDATE SET last_table = '', last_rowid = NULL,
+            audit_generation = excluded.audit_generation",
+        (FOREIGN_KEY_AUDIT_PROGRESS,),
+    ).await.map_err(audit_read_error)?;
     Ok(())
 }
 
@@ -125,6 +141,13 @@ pub async fn ensure_authority_invariant_schema(
     ensure_audit_checkpoint_schema(conn).await?;
     let trigger_contracts_were_intact = trigger_contracts_intact(conn).await?;
     if !trigger_contracts_were_intact {
+        conn.execute("DELETE FROM authority_audit_checkpoints", ())
+            .await
+            .map_err(audit_read_error)?;
+        conn.execute("DELETE FROM authority_projection_repair_progress", ())
+            .await
+            .map_err(audit_read_error)?;
+        reset_foreign_key_audit(conn).await?;
         for invariant in INVARIANTS {
             for trigger in invariant.triggers {
                 replace_trigger(conn, trigger).await?;
@@ -146,14 +169,15 @@ pub(crate) trait AuthorityInvariantTransactionProvider {
         operation: &'static str,
     ) -> tracedecay_domain::errors::Result<DatabaseWriteTransaction<'_>>;
 
-    /// `Some` when this provider can scan one table's foreign keys without
+    /// `Some` when this provider can scan one page of foreign keys without
     /// holding the canonical writer. `None` keeps the check inside the
     /// write step, which tests use and which blocks every other writer for
-    /// the whole scan.
-    async fn read_foreign_key_violation(
+    /// the page scan.
+    async fn read_foreign_key_page(
         &self,
         _table: &str,
-    ) -> tracedecay_domain::errors::Result<Option<bool>> {
+        _after_rowid: Option<i64>,
+    ) -> tracedecay_domain::errors::Result<Option<ForeignKeyPage>> {
         Ok(None)
     }
 }
@@ -166,20 +190,22 @@ impl AuthorityInvariantTransactionProvider for Database {
         self.begin_bulk_write_transaction(operation).await
     }
 
-    async fn read_foreign_key_violation(
+    async fn read_foreign_key_page(
         &self,
         table: &str,
-    ) -> tracedecay_domain::errors::Result<Option<bool>> {
-        // A table-wide `pragma_foreign_key_check` is a read. Running it inside
-        // the write step reserves the canonical writer until the scan returns,
-        // so historical ingest and refresh cannot commit for the whole table.
+        after_rowid: Option<i64>,
+    ) -> tracedecay_domain::errors::Result<Option<ForeignKeyPage>> {
+        // Historical validation reads bounded child pages without reserving
+        // the canonical writer. Enforced foreign keys protect intervening writes.
         let snapshot = self
             .read_connection()
             .background()
             .read_snapshot()
             .await
             .map_err(audit_read_error)?;
-        Ok(Some(foreign_key_table_violates(&snapshot, table).await?))
+        Ok(Some(
+            check_foreign_key_page(&snapshot, table, after_rowid).await?,
+        ))
     }
 }
 
@@ -198,7 +224,11 @@ pub(crate) async fn ensure_fresh_authority_invariants(
             aliases_audited: 0,
         },
     )
-    .await
+    .await?;
+    conn.execute("DELETE FROM authority_foreign_key_audit_progress", ())
+        .await
+        .map_err(audit_read_error)?;
+    Ok(())
 }
 
 #[tracing::instrument(
@@ -293,9 +323,14 @@ async fn converge_authority_invariants(
     let force_exhaustive = force_exhaustive || foreign_key_audit_is_required;
     let checkpoint =
         authority_invariant_step(provider, "read authority audit checkpoint", async |conn| {
-            if !force_exhaustive && trigger_contracts_were_intact {
+            if trigger_contracts_were_intact {
                 match read_audit_checkpoint(conn).await? {
-                    Some(checkpoint) if audit_checkpoint_is_plausible(conn, checkpoint).await? => {
+                    Some(checkpoint)
+                        if audit_checkpoint_is_plausible(conn, checkpoint).await?
+                            && (!force_exhaustive
+                                || checkpoint.bounded_passes_since_exhaustive
+                                    == INCOMPLETE_EXHAUSTIVE_PASS) =>
+                    {
                         Ok(Some(checkpoint))
                     }
                     _ => Ok(None),
@@ -305,39 +340,66 @@ async fn converge_authority_invariants(
             }
         })
         .await?;
-    let exhaustive = checkpoint.is_none_or(|checkpoint| {
+    let resuming = checkpoint.is_some_and(|checkpoint| {
         checkpoint.bounded_passes_since_exhaustive == INCOMPLETE_EXHAUSTIVE_PASS
     });
+    let exhaustive = checkpoint.is_none() || resuming;
+    if checkpoint.is_none() {
+        loop {
+            if authority_invariant_step(
+                provider,
+                "discard untrusted cursor audit work",
+                async |conn| {
+                    conn.execute("DELETE FROM authority_projection_repair_progress", ())
+                        .await
+                        .map_err(audit_read_error)?;
+                    clear_cursor_audit_pending_page(conn).await
+                },
+            )
+            .await?
+            {
+                break;
+            }
+        }
+    }
     let checkpoint = checkpoint.unwrap_or_default();
-
+    let counts = if resuming {
+        authority_invariant_step(provider, "read resumable audit counts", async |conn| {
+            read_audited_counts(conn).await
+        })
+        .await?
+    } else {
+        (0, 0, 0, 0, 0)
+    };
+    let mut receipts_audited = counts.0;
+    let mut observations_audited = counts.1;
+    let mut provenance_audited = counts.2;
+    let mut dispositions_audited = counts.3;
+    let mut aliases_audited = counts.4;
     let mut receipt_rowid = checkpoint.receipt_rowid;
-    let mut receipts_audited = 0;
     loop {
         let (next_rowid, page_audited, complete) = authority_invariant_step(
             provider,
             "audit sanitization receipt authority page",
             async |conn| {
-                let (next_rowid, page_audited, complete) =
-                    validate_receipt_authority_page(conn, receipt_rowid).await?;
-                if exhaustive {
-                    write_audit_checkpoint(
-                        conn,
-                        AuditProgress {
-                            checkpoint: AuditCheckpoint {
-                                receipt_rowid: next_rowid,
-                                bounded_passes_since_exhaustive: INCOMPLETE_EXHAUSTIVE_PASS,
-                                ..checkpoint
-                            },
-                            receipts_audited: receipts_audited + page_audited,
-                            observations_audited: 0,
-                            provenance_audited: 0,
-                            dispositions_audited: 0,
-                            aliases_audited: 0,
+                let result = validate_receipt_authority_page(conn, receipt_rowid).await?;
+                write_audit_checkpoint(
+                    conn,
+                    AuditProgress {
+                        checkpoint: AuditCheckpoint {
+                            receipt_rowid: result.0,
+                            bounded_passes_since_exhaustive: INCOMPLETE_EXHAUSTIVE_PASS,
+                            ..checkpoint
                         },
-                    )
-                    .await?;
-                }
-                Ok((next_rowid, page_audited, complete))
+                        receipts_audited: receipts_audited + result.1,
+                        observations_audited,
+                        provenance_audited,
+                        dispositions_audited,
+                        aliases_audited,
+                    },
+                )
+                .await?;
+                Ok(result)
             },
         )
         .await?;
@@ -348,44 +410,65 @@ async fn converge_authority_invariants(
         }
     }
 
-    // The cursor repair and coverage passes below reconcile the observation
-    // suffix committed since the last trusted audit, so they must keep the
-    // resume watermark this pass started from. `observation_sequence` and the
-    // `checkpoint` rebound after the source-cursor loop both carry the
-    // *advanced* watermark, which would skip every row this pass just audited.
-    let audited_from_sequence = checkpoint.observation_sequence;
     let mut observation_sequence = checkpoint.observation_sequence;
-    let mut observations_audited = 0;
     loop {
-        let (next_sequence, page_audited, complete) =
-            authority_invariant_step(provider, "audit observation authority page", async |conn| {
-                let (next_sequence, page_audited, complete) =
-                    validate_observation_authority_page(conn, observation_sequence).await?;
-                if exhaustive {
+        loop {
+            let (next_sequence, page_audited, complete) = authority_invariant_step(
+                provider,
+                "audit observation authority page",
+                async |conn| {
+                    let result =
+                        validate_and_stage_observation_authority_page(conn, observation_sequence)
+                            .await?;
                     write_audit_checkpoint(
                         conn,
                         AuditProgress {
                             checkpoint: AuditCheckpoint {
                                 receipt_rowid,
-                                observation_sequence: next_sequence,
+                                observation_sequence: result.0,
                                 bounded_passes_since_exhaustive: INCOMPLETE_EXHAUSTIVE_PASS,
                                 ..checkpoint
                             },
                             receipts_audited,
-                            observations_audited: observations_audited + page_audited,
-                            provenance_audited: 0,
-                            dispositions_audited: 0,
-                            aliases_audited: 0,
+                            observations_audited: observations_audited + result.1,
+                            provenance_audited,
+                            dispositions_audited,
+                            aliases_audited,
                         },
                     )
                     .await?;
-                }
-                Ok((next_sequence, page_audited, complete))
-            })
+                    Ok(result)
+                },
+            )
             .await?;
-        observation_sequence = next_sequence;
-        observations_audited += page_audited;
-        if complete {
+            observation_sequence = next_sequence;
+            observations_audited += page_audited;
+            if complete {
+                break;
+            }
+        }
+        loop {
+            match authority_invariant_step(
+                provider,
+                "repair committed source cursor authority page",
+                async |conn| repair_pending_source_cursor_page(conn, observation_sequence).await,
+            )
+            .await?
+            {
+                CursorAuditPage::ObservationsAppended => break,
+                CursorAuditPage::Continue => continue,
+                CursorAuditPage::Complete => break,
+            }
+        }
+        // The same writer transaction checks both the newest commit and empty
+        // pending journal before the audit moves to source/projection authority.
+        let complete = authority_invariant_step(
+            provider,
+            "finish source cursor reconciliation",
+            async |conn| repair_pending_source_cursor_page(conn, observation_sequence).await,
+        )
+        .await?;
+        if matches!(complete, CursorAuditPage::Complete) {
             break;
         }
     }
@@ -424,9 +507,9 @@ async fn converge_authority_invariants(
                             checkpoint: next,
                             receipts_audited,
                             observations_audited,
-                            provenance_audited: 0,
-                            dispositions_audited: 0,
-                            aliases_audited: 0,
+                            provenance_audited,
+                            dispositions_audited,
+                            aliases_audited,
                         },
                     )
                     .await?;
@@ -442,22 +525,10 @@ async fn converge_authority_invariants(
         }
     };
 
-    authority_invariant_step(provider, "repair committed source cursors", async |conn| {
-        repair_committed_source_cursors(conn, audited_from_sequence).await
-    })
-    .await?;
     authority_invariant_step(
         provider,
-        "validate observation cursor coverage",
-        async |conn| validate_observation_cursor_coverage(conn, audited_from_sequence).await,
-    )
-    .await?;
-
-    authority_invariant_step(
-        provider,
-        "repair observation projection frontier",
+        "validate mutable authority invariants",
         async |conn| {
-            repair_projection_frontier(conn, checkpoint.projection_checkpoint).await?;
             if exhaustive {
                 validate_invariant_rows(conn).await
             } else {
@@ -466,6 +537,19 @@ async fn converge_authority_invariants(
         },
     )
     .await?;
+    loop {
+        let complete = authority_invariant_step(
+            provider,
+            "repair observation projection frontier page",
+            async |conn| {
+                repair_projection_frontier_page(conn, checkpoint.projection_checkpoint).await
+            },
+        )
+        .await?;
+        if complete.is_some() {
+            break;
+        }
+    }
     let projection_start = AuditCheckpoint {
         receipt_rowid,
         observation_sequence,
@@ -476,57 +560,49 @@ async fn converge_authority_invariants(
         },
         ..checkpoint
     };
-    let (checkpoint, provenance_audited, dispositions_audited, aliases_audited) = if exhaustive {
-        let mut progress = projection_start;
-        let mut audited_counts = None;
-        loop {
-            let (next, provenance, dispositions, aliases, complete) = authority_invariant_step(
-                provider,
-                "audit observation projection authority page",
-                async |conn| {
-                    let released = ReleasedRenderingLedger::default();
-                    let result =
-                        validate_projection_authority_chunk(conn, progress, &released).await?;
-                    released.converge(conn).await?;
-                    write_audit_checkpoint(
-                        conn,
-                        AuditProgress {
-                            checkpoint: result.0,
-                            receipts_audited,
-                            observations_audited,
-                            provenance_audited: if result.4 { result.1 } else { 0 },
-                            dispositions_audited: if result.4 { result.2 } else { 0 },
-                            aliases_audited: if result.4 { result.3 } else { 0 },
-                        },
-                    )
-                    .await?;
-                    Ok(result)
-                },
-            )
-            .await?;
-            audited_counts.get_or_insert((provenance, dispositions, aliases));
-            progress = next;
-            if complete {
-                let (provenance, dispositions, aliases) = audited_counts.unwrap_or((0, 0, 0));
-                break (progress, provenance, dispositions, aliases);
-            }
-        }
-    } else {
-        authority_invariant_step(
+    let mut checkpoint = projection_start;
+    loop {
+        let (next, provenance, dispositions, aliases, complete) = authority_invariant_step(
             provider,
-            "audit observation projection authority suffix",
+            "audit observation projection authority page",
             async |conn| {
                 let released = ReleasedRenderingLedger::default();
-                let audited =
-                    validate_projection_authority_suffix(conn, projection_start, &released).await?;
+                let result =
+                    validate_projection_authority_chunk(conn, checkpoint, &released).await?;
                 released.converge(conn).await?;
-                Ok(audited)
+                write_audit_checkpoint(
+                    conn,
+                    AuditProgress {
+                        checkpoint: AuditCheckpoint {
+                            bounded_passes_since_exhaustive: INCOMPLETE_EXHAUSTIVE_PASS,
+                            ..result.0
+                        },
+                        receipts_audited,
+                        observations_audited,
+                        provenance_audited: provenance_audited + result.1,
+                        dispositions_audited: dispositions_audited + result.2,
+                        aliases_audited: aliases_audited + result.3,
+                    },
+                )
+                .await?;
+                Ok(result)
             },
         )
-        .await?
-    };
+        .await?;
+        checkpoint = next;
+        provenance_audited += provenance;
+        dispositions_audited += dispositions;
+        aliases_audited += aliases;
+        if complete {
+            break;
+        }
+    }
 
     if exhaustive && force_exhaustive {
+        authority_invariant_step(provider, "arm foreign key authority audit", async |conn| {
+            require_foreign_key_audit(conn).await
+        })
+        .await?;
         loop {
             let table = authority_invariant_step(
                 provider,
@@ -534,29 +610,27 @@ async fn converge_authority_invariants(
                 async |conn| foreign_key_audit_next_table(conn).await,
             )
             .await?;
-            let Some(table) = table else {
+            let Some((table, after_rowid, generation)) = table else {
                 break;
             };
-            let violation = match provider.read_foreign_key_violation(&table).await? {
-                Some(violation) => violation,
+            let page = match provider.read_foreign_key_page(&table, after_rowid).await? {
+                Some(page) => page,
                 None => {
                     authority_invariant_step(
                         provider,
-                        "audit global database foreign key table",
-                        async |conn| foreign_key_table_violates(conn, &table).await,
+                        "audit global database foreign key page",
+                        async |conn| check_foreign_key_page(conn, &table, after_rowid).await,
                     )
                     .await?
                 }
             };
-            if violation {
-                return Err(authority_violation(
-                    "global database contains a foreign-key violation",
-                ));
-            }
             authority_invariant_step(
                 provider,
-                "audit global database foreign key table",
-                async |conn| record_foreign_key_audit_table(conn, &table).await,
+                "record global database foreign key page",
+                async |conn| {
+                    record_foreign_key_audit_page(conn, &table, after_rowid, &generation, page)
+                        .await
+                },
             )
             .await?;
         }
@@ -566,7 +640,6 @@ async fn converge_authority_invariants(
     // watermark: admission-critical triggers guard that row immediately, and
     // this pass's later pages or the next bounded suffix pass audits it. Only
     // the final step below turns the in-progress marker trusted.
-    let mut checkpoint = checkpoint;
     checkpoint.bounded_passes_since_exhaustive = if exhaustive {
         0
     } else {
@@ -633,24 +706,21 @@ enum ForeignKeyAuditStep {
 
 async fn foreign_key_audit_next_table(
     conn: &impl Executor,
-) -> tracedecay_domain::errors::Result<Option<String>> {
+) -> tracedecay_domain::errors::Result<Option<(String, Option<i64>, String)>> {
     let mut rows = conn
         .query(
-            "SELECT COALESCE((
-                    SELECT last_table FROM authority_foreign_key_audit_progress
-                    WHERE audit_name = ?1
-                 ), '')",
+            "SELECT last_table, last_rowid, audit_generation
+         FROM authority_foreign_key_audit_progress WHERE audit_name = ?1",
             (FOREIGN_KEY_AUDIT_PROGRESS,),
         )
         .await
         .map_err(audit_read_error)?;
-    let last_table = rows
-        .next()
-        .await
-        .map_err(audit_read_error)?
-        .ok_or_else(|| authority_violation("foreign-key audit cursor disappeared"))?
-        .get::<String>(0)
-        .map_err(audit_read_error)?;
+    let Some(row) = rows.next().await.map_err(audit_read_error)? else {
+        return Ok(None);
+    };
+    let last_table = row.get::<String>(0).map_err(audit_read_error)?;
+    let after_rowid = row.get::<Option<i64>>(1).map_err(audit_read_error)?;
+    let generation = row.get::<String>(2).map_err(audit_read_error)?;
     drop(rows);
 
     let mut rows = conn
@@ -682,38 +752,61 @@ async fn foreign_key_audit_next_table(
         .map_err(audit_read_error)?;
         return Ok(None);
     };
-    Ok(Some(table))
+    Ok(Some((table, after_rowid, generation)))
 }
 
-async fn foreign_key_table_violates(
-    conn: &impl QueryExecutor,
-    table: &str,
-) -> tracedecay_domain::errors::Result<bool> {
-    let mut rows = conn
-        .query(
-            "SELECT 1 FROM pragma_foreign_key_check(?1) LIMIT 1",
-            (table,),
-        )
-        .await
-        .map_err(audit_read_error)?;
-    rows.next()
-        .await
-        .map(|row| row.is_some())
-        .map_err(audit_read_error)
-}
-
-async fn record_foreign_key_audit_table(
+async fn record_foreign_key_audit_page(
     conn: &impl Executor,
     table: &str,
+    expected_rowid: Option<i64>,
+    generation: &str,
+    page: ForeignKeyPage,
 ) -> tracedecay_domain::errors::Result<()> {
-    conn.execute(
-        "INSERT INTO authority_foreign_key_audit_progress (audit_name, last_table)
-         VALUES (?1, ?2)
-         ON CONFLICT(audit_name) DO UPDATE SET last_table = excluded.last_table",
-        params![FOREIGN_KEY_AUDIT_PROGRESS, table],
-    )
-    .await
-    .map_err(audit_read_error)?;
+    let current = foreign_key_audit_next_table(conn).await?;
+    if current
+        .as_ref()
+        .is_none_or(|(current_table, rowid, current_generation)| {
+            current_table != table || *rowid != expected_rowid || current_generation != generation
+        })
+    {
+        // A concurrent sweep or guard reset superseded this read snapshot.
+        return Ok(());
+    }
+    match page {
+        ForeignKeyPage::Complete => {
+            conn.execute(
+                "UPDATE authority_foreign_key_audit_progress SET last_table = ?2, last_rowid = NULL
+                 WHERE audit_name = ?1 AND audit_generation = ?3 AND last_rowid IS ?4",
+                params![
+                    FOREIGN_KEY_AUDIT_PROGRESS,
+                    table,
+                    generation,
+                    expected_rowid
+                ],
+            )
+            .await
+            .map_err(audit_read_error)?;
+        }
+        ForeignKeyPage::Progress { last_rowid } => {
+            conn.execute(
+                "UPDATE authority_foreign_key_audit_progress SET last_rowid = ?2
+                 WHERE audit_name = ?1 AND audit_generation = ?3 AND last_rowid IS ?4",
+                params![
+                    FOREIGN_KEY_AUDIT_PROGRESS,
+                    last_rowid,
+                    generation,
+                    expected_rowid
+                ],
+            )
+            .await
+            .map_err(audit_read_error)?;
+        }
+        ForeignKeyPage::Violation { .. } => {
+            return Err(authority_violation(
+                "global database contains a foreign-key violation",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -721,13 +814,14 @@ async fn record_foreign_key_audit_table(
 async fn audit_next_foreign_key_table(
     conn: &impl Executor,
 ) -> tracedecay_domain::errors::Result<ForeignKeyAuditStep> {
-    let Some(table) = foreign_key_audit_next_table(conn).await? else {
+    let Some((table, after_rowid, generation)) = foreign_key_audit_next_table(conn).await? else {
         return Ok(ForeignKeyAuditStep::Complete);
     };
-    if foreign_key_table_violates(conn, &table).await? {
+    let page = check_foreign_key_page(conn, &table, after_rowid).await?;
+    if matches!(page, ForeignKeyPage::Violation { .. }) {
         return Ok(ForeignKeyAuditStep::Violation);
     }
-    record_foreign_key_audit_table(conn, &table).await?;
+    record_foreign_key_audit_page(conn, &table, after_rowid, &generation, page).await?;
     Ok(ForeignKeyAuditStep::Continue)
 }
 
@@ -752,15 +846,13 @@ async fn foreign_key_violation_exists_read_only(
     drop(rows);
 
     for table in tables {
-        let mut rows = conn
-            .query(
-                "SELECT 1 FROM pragma_foreign_key_check(?1) LIMIT 1",
-                (table,),
-            )
-            .await
-            .map_err(audit_read_error)?;
-        if rows.next().await.map_err(audit_read_error)?.is_some() {
-            return Ok(true);
+        let mut after = None;
+        loop {
+            match check_foreign_key_page(conn, &table, after).await? {
+                ForeignKeyPage::Complete => break,
+                ForeignKeyPage::Progress { last_rowid } => after = Some(last_rowid),
+                ForeignKeyPage::Violation { .. } => return Ok(true),
+            }
         }
     }
     Ok(false)
@@ -809,7 +901,7 @@ mod tests {
 
     struct FailingTransactionProvider<'a> {
         database: &'a Database,
-        fail_at: usize,
+        fail_operation: &'static str,
         calls: AtomicUsize,
     }
 
@@ -819,7 +911,7 @@ mod tests {
             operation: &'static str,
         ) -> tracedecay_domain::errors::Result<DatabaseWriteTransaction<'_>> {
             let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
-            if call == self.fail_at {
+            if operation == self.fail_operation {
                 return Err(global_db_operation_message(
                     operation,
                     format!("injected transaction-provider failure at step {call}"),
@@ -907,7 +999,7 @@ mod tests {
 
         let provider = FailingTransactionProvider {
             database: fixture.database().runtime_database(),
-            fail_at: 10,
+            fail_operation: "validate mutable authority invariants",
             calls: AtomicUsize::new(0),
         };
         let error = ensure_authority_invariants(&provider, true, false)
@@ -916,7 +1008,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("injected transaction-provider failure at step 10"),
+                .contains("injected transaction-provider failure"),
             "unexpected injected failure: {error}"
         );
 
@@ -943,6 +1035,72 @@ mod tests {
             -1,
             "interrupted convergence must not publish a trusted checkpoint"
         );
+    }
+
+    #[tokio::test]
+    async fn cursor_repair_resumes_after_observation_watermark_commits() {
+        let (_directory, fixture) = open_registered().await;
+        let transaction = fixture.database().begin_write_transaction().await.unwrap();
+        let (_, committed) = seed_observation(&transaction, 0, "repair-resume").await;
+        transaction
+            .execute("DELETE FROM authority_audit_checkpoints", ())
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        let provider = FailingTransactionProvider {
+            database: fixture.database().runtime_database(),
+            fail_operation: "repair committed source cursor authority page",
+            calls: AtomicUsize::new(0),
+        };
+        ensure_authority_invariants(&provider, true, false)
+            .await
+            .unwrap_err();
+        let mut rows = fixture
+            .query(
+                "SELECT observation_sequence,
+            (SELECT COUNT(*) FROM authority_cursor_audit_pending)
+            FROM authority_audit_checkpoints",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 1);
+        assert_eq!(row.get::<i64>(1).unwrap(), 1);
+        drop(rows);
+        ensure_authority_invariants(fixture.database().runtime_database(), true, false)
+            .await
+            .unwrap();
+        let mut rows = fixture
+            .query("SELECT cursor_json FROM source_cursors", ())
+            .await
+            .unwrap();
+        let cursor: tracedecay_domain::ObservationSourceCursorV1 = serde_json::from_str(
+            &rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<String>(0)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cursor, committed);
+        drop(rows);
+        let mut rows = fixture.query("SELECT (SELECT COUNT(*) FROM authority_cursor_audit_pending),
+            (SELECT COUNT(*) FROM authority_projection_repair_progress),
+            last_observations_audited, bounded_passes_since_exhaustive FROM authority_audit_checkpoints", ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(
+            (row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap()),
+            (0, 0)
+        );
+        assert_eq!(
+            row.get::<i64>(2).unwrap(),
+            1,
+            "resume preserves page tally without a rescan"
+        );
+        assert_eq!(row.get::<i64>(3).unwrap(), 0);
     }
 
     #[tokio::test]
@@ -1142,6 +1300,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_foreign_key_pages_cannot_advance_another_table_or_a_new_sweep() {
+        let (_directory, fixture) = open_registered().await;
+        let transaction = fixture.database().begin_write_transaction().await.unwrap();
+        transaction
+            .execute_batch(
+                "CREATE TABLE zzzz_cas_parent(id INTEGER PRIMARY KEY);
+            CREATE TABLE zzzz_cas_child_a(parent_id INTEGER REFERENCES zzzz_cas_parent(id));
+            CREATE TABLE zzzz_cas_child_b(parent_id INTEGER REFERENCES zzzz_cas_parent(id));
+            INSERT INTO zzzz_cas_parent VALUES(1);
+            INSERT INTO zzzz_cas_child_a VALUES(1);
+            INSERT INTO zzzz_cas_child_b VALUES(1);",
+            )
+            .await
+            .unwrap();
+        super::require_foreign_key_audit(&transaction)
+            .await
+            .unwrap();
+        transaction.execute("UPDATE authority_foreign_key_audit_progress SET last_table = 'zzzz_cas', last_rowid = NULL", ()).await.unwrap();
+        let (table, after, generation) = super::foreign_key_audit_next_table(&transaction)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(table, "zzzz_cas_child_a");
+        let late_page = super::check_foreign_key_page(&transaction, &table, after)
+            .await
+            .unwrap();
+        super::record_foreign_key_audit_page(
+            &transaction,
+            &table,
+            after,
+            &generation,
+            late_page.clone(),
+        )
+        .await
+        .unwrap();
+        let (same_table, advanced, same_generation) =
+            super::foreign_key_audit_next_table(&transaction)
+                .await
+                .unwrap()
+                .unwrap();
+        let complete = super::check_foreign_key_page(&transaction, &same_table, advanced)
+            .await
+            .unwrap();
+        super::record_foreign_key_audit_page(
+            &transaction,
+            &same_table,
+            advanced,
+            &same_generation,
+            complete,
+        )
+        .await
+        .unwrap();
+        super::record_foreign_key_audit_page(
+            &transaction,
+            &table,
+            after,
+            &generation,
+            late_page.clone(),
+        )
+        .await
+        .unwrap();
+        let (next, next_after, _) = super::foreign_key_audit_next_table(&transaction)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next, "zzzz_cas_child_b");
+        assert_eq!(
+            next_after, None,
+            "a late child-a page cannot skip child-b's first row"
+        );
+        super::reset_foreign_key_audit(&transaction).await.unwrap();
+        transaction
+            .execute(
+                "UPDATE authority_foreign_key_audit_progress SET last_table = 'zzzz_cas'",
+                (),
+            )
+            .await
+            .unwrap();
+        let (_, reset_after, reset_generation) = super::foreign_key_audit_next_table(&transaction)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            generation, reset_generation,
+            "reset must identify a different sweep"
+        );
+        assert_eq!(reset_after, after);
+        super::record_foreign_key_audit_page(&transaction, &table, after, &generation, late_page)
+            .await
+            .unwrap();
+        let (_, unchanged_after, unchanged_generation) =
+            super::foreign_key_audit_next_table(&transaction)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            unchanged_after, None,
+            "old snapshot cannot advance a reset sweep at the same table/rowid"
+        );
+        assert_eq!(unchanged_generation, reset_generation);
+        transaction.commit().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn foreign_key_audit_finds_violations_by_child_table() {
         let directory = TempDir::new().unwrap();
         let database_path = directory.path().join("sessions.db");
@@ -1177,7 +1439,9 @@ mod tests {
                 "PRAGMA foreign_keys = OFF;
                  CREATE TABLE authority_foreign_key_audit_progress (
                     audit_name TEXT PRIMARY KEY,
-                    last_table TEXT NOT NULL
+                    last_table TEXT NOT NULL,
+                    last_rowid INTEGER,
+                    audit_generation TEXT NOT NULL DEFAULT ''
                  );
                  CREATE TABLE parent (id INTEGER PRIMARY KEY);
                  CREATE TABLE child_a (

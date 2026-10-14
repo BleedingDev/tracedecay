@@ -379,9 +379,63 @@ pub struct AdminCliStorageReportV1 {
     pub global_db_bytes: u64,
     #[serde(default)]
     pub user_sessions_db_bytes: u64,
+    /// Sampled once, on the first page. File sizes are logical bytes, not
+    /// allocated filesystem bytes or a physical reclamation estimate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_sessions_database: Option<SessionDatabaseSizeV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<StorageReportRegistryV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_profile_size: Option<Value>,
     pub coverage: Value,
+}
+
+/// Metadata-only measurements for one session database family. This never
+/// reads transcript bodies or attributes table payloads.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionDatabaseSizeV1 {
+    pub main: SessionDatabaseFileSizeV1,
+    pub wal: SessionDatabaseFileSizeV1,
+    pub shm: SessionDatabaseFileSizeV1,
+    pub pages: SessionDatabasePagesV1,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionDatabaseFileSizeV1 {
+    Observed {
+        logical_bytes: crate::StorageByteSizeV1,
+    },
+    Missing,
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionDatabasePagesV1 {
+    Observed {
+        sample: crate::StoreSizeSampleV1,
+        /// SQLite can reuse these pages. This is not physical disk space
+        /// recovered by deletion, checkpointing, or compaction.
+        reusable_bytes: crate::StorageByteSizeV1,
+    },
+    Missing,
+    Unavailable {
+        reason: String,
+    },
+}
+
+/// Availability of the project registry inventory. An unavailable inventory
+/// cannot classify any project directory as unregistered.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StorageReportRegistryV1 {
+    Available,
+    Missing,
+    Unavailable { reason: String },
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]

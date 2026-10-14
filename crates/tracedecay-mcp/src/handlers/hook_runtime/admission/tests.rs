@@ -504,3 +504,135 @@ fn an_admission_ledger_root_that_is_not_a_directory_is_unavailable_not_empty() {
         "an unusable admission ledger is a typed failure, not nothing owed: {pending:?}"
     );
 }
+
+#[test]
+fn producer_work_status_does_not_open_repair_or_expire_a_ledger() {
+    let data_root = tempfile::tempdir().unwrap();
+    let host = tracedecay_domain::NativeHostIdentityV1::ClaudeCode;
+    assert_eq!(
+        hook_v2_pending_work_count(data_root.path(), host).unwrap(),
+        0
+    );
+    let root = hook_v2_admission_ledger_root(data_root.path(), host);
+    assert!(!root.exists());
+    std::fs::create_dir_all(&root).unwrap();
+    let log = root.join("admissions.v2.log");
+    std::fs::write(&log, b"unopened torn log").unwrap();
+    assert!(matches!(
+        hook_v2_pending_work_count(data_root.path(), host),
+        Err(HookV2AdmissionLedgerUnavailable::Unopened)
+    ));
+    assert_eq!(std::fs::read(&log).unwrap(), b"unopened torn log");
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+
+    let retained_data = tempfile::tempdir().unwrap();
+    let envelope = admission_test_envelope(121, 7);
+    let staged = stage_hook_v2_admission(
+        retained_data.path(),
+        &envelope,
+        Some(&envelope),
+        UtcMicros(1_000),
+    )
+    .unwrap();
+    staged.commit.wait().unwrap();
+    let retained_root = hook_v2_admission_ledger_root(retained_data.path(), host);
+    let log = retained_root.join("admissions.v2.log");
+    let bytes = std::fs::read(&log).unwrap();
+    assert_eq!(
+        hook_v2_pending_work_count(retained_data.path(), host).unwrap(),
+        1
+    );
+    assert_eq!(std::fs::read(log).unwrap(), bytes);
+    assert_eq!(pending_work(retained_data.path()), vec![envelope.clone()]);
+    let completion = with_hook_v2_admission_ledger(
+        Some(retained_data.path()),
+        retained_root,
+        host,
+        UtcMicros(1_000),
+        |ledger| ledger.stage_work_completion(&envelope),
+    )
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        hook_v2_pending_work_count(retained_data.path(), host),
+        Err(HookV2AdmissionLedgerUnavailable::Ledger(
+            tracedecay_hooks::HookAdmissionLedgerError::Busy
+        ))
+    ));
+    completion.wait().unwrap();
+    assert_eq!(
+        hook_v2_pending_work_count(retained_data.path(), host).unwrap(),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn retained_producer_work_status_refuses_a_substituted_root() {
+    let data_root = tempfile::tempdir().unwrap();
+    let foreign = tempfile::tempdir().unwrap();
+    let envelope = admission_test_envelope(122, 7);
+    let host = envelope.producer;
+    record_hook_v2_admission(data_root.path(), &envelope, UtcMicros(1_000)).unwrap();
+    assert_eq!(
+        hook_v2_pending_work_count(data_root.path(), host).unwrap(),
+        0
+    );
+    let root = hook_v2_admission_ledger_root(data_root.path(), host);
+    std::fs::remove_dir_all(&root).unwrap();
+    std::os::unix::fs::symlink(foreign.path(), &root).unwrap();
+    assert!(matches!(
+        hook_v2_pending_work_count(data_root.path(), host),
+        Err(HookV2AdmissionLedgerUnavailable::Ledger(
+            tracedecay_hooks::HookAdmissionLedgerError::UnsafePath
+        ))
+    ));
+    assert!(matches!(
+        hook_v2_pending_work_envelopes(data_root.path(), host, UtcMicros(1_000)),
+        Err(HookV2AdmissionLedgerUnavailable::Ledger(
+            tracedecay_hooks::HookAdmissionLedgerError::UnsafePath
+        ))
+    ));
+    assert_eq!(std::fs::read_dir(foreign.path()).unwrap().count(), 0);
+    assert!(
+        std::fs::symlink_metadata(root)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn retained_producer_authority_refuses_a_replaced_writer_lease() {
+    let data_root = tempfile::tempdir().unwrap();
+    let envelope = admission_test_envelope(123, 7);
+    let host = envelope.producer;
+    record_hook_v2_admission(data_root.path(), &envelope, UtcMicros(1_000)).unwrap();
+    assert_eq!(
+        hook_v2_pending_work_count(data_root.path(), host).unwrap(),
+        0
+    );
+    let root = hook_v2_admission_ledger_root(data_root.path(), host);
+    let writer = root.join("admissions.v1.lock");
+    assert!(writer.exists());
+    let replacement = root.join("replacement");
+    std::fs::write(&replacement, b"foreign writer").unwrap();
+    std::fs::rename(replacement, &writer).unwrap();
+    assert!(matches!(
+        hook_v2_pending_work_count(data_root.path(), host),
+        Err(HookV2AdmissionLedgerUnavailable::Ledger(
+            tracedecay_hooks::HookAdmissionLedgerError::UnsafePath
+        ))
+    ));
+    assert!(
+        stage_hook_v2_admission(
+            data_root.path(),
+            &admission_test_envelope(124, 7),
+            None,
+            UtcMicros(1_000)
+        )
+        .is_none()
+    );
+    assert_eq!(std::fs::read(writer).unwrap(), b"foreign writer");
+}

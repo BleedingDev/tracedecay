@@ -10,15 +10,16 @@
 
 use serde_json::Value;
 use tracedecay_domain::{
-    DurableObservationV1, ObservationSourceCursorV1, ObservationSourceGenerationV1,
-    ObservationSourceRangeV1,
+    DurableObservationV1, ObservationIdentityMaterialV1, ObservationSourceCursorV1,
+    ObservationSourceGenerationV1, ObservationSourceRangeV1,
 };
 use tracedecay_store::SESSION_MESSAGE_PROJECTOR_VERSION;
 use tracedecay_store::observation::{ObservationCoverageReason, ObservationCoverageV1};
 
 use super::super::test_fixture::{open_registered, seed_observation, shift, write_cursor};
 use super::{
-    repair_committed_source_cursors, repair_projection_frontier,
+    CursorAuditPage, repair_committed_source_cursors, repair_pending_source_cursor_page,
+    repair_projection_frontier, repair_projection_frontier_page,
     validate_observation_cursor_coverage,
 };
 use tracedecay_runtime_core::db::engine::{Executor, QueryExecutor, params};
@@ -412,4 +413,122 @@ async fn checkpoint_with_a_missing_disposition_requeues_the_entire_suffix() {
         vec![3, 4],
         "the suffix after the gap is requeued whole"
     );
+}
+
+#[tokio::test]
+async fn pending_cursor_repair_audits_a_new_generation_before_reconciling() {
+    let (_directory, conn) = open_registered().await;
+    let (_, older) = seed_observation(&conn, 0, "concurrent-generation").await;
+    let (first, _, _) = super::super::rows::validate_and_stage_observation_authority_page(&conn, 0)
+        .await
+        .unwrap();
+    let (base, _) = super::super::test_fixture::authority_fixture(1, "concurrent-generation");
+    let generation = ObservationSourceGenerationV1::new(1).unwrap();
+    let newer = DurableObservationV1::new(
+        ObservationIdentityMaterialV1::for_native_record(
+            base.source().clone(),
+            base.scope().clone(),
+            generation,
+            base.identity().position(),
+            base.identity().ordering_domain(),
+            base.identity().native_record_id().unwrap().clone(),
+        )
+        .unwrap(),
+        base.receipt().clone(),
+        base.retention_class().clone(),
+        base.payload().clone(),
+    )
+    .unwrap();
+    let newer_cursor = ObservationSourceCursorV1::for_ordering(
+        older.source().clone(),
+        older.scope().clone(),
+        generation,
+        older.ordering_domain(),
+        newer.identity().position().end(),
+    )
+    .unwrap();
+    let receipt = newer.receipt();
+    conn.execute("INSERT INTO sanitization_receipts (receipt_id, sanitizer_version, payload_digest, receipt_json)
+        VALUES (?1, ?2, ?3, ?4)", params![receipt.receipt().receipt_id().as_str(),
+        receipt.receipt().sanitizer_version().as_str(), newer.payload_reference().digest().as_str(),
+        serde_json::to_string(receipt).unwrap()]).await.unwrap();
+    conn.execute("INSERT INTO observations (observation_id, payload_digest, receipt_id, observation_json, committed_cursor_json)
+        VALUES (?1, ?2, ?3, ?4, ?5)", params![newer.observation_id().as_str(), newer.payload_reference().digest().as_str(),
+        receipt.receipt().receipt_id().as_str(), serde_json::to_string(&newer).unwrap(),
+        serde_json::to_string(&newer_cursor).unwrap()]).await.unwrap();
+    write_cursor(&conn, &newer_cursor).await;
+    assert!(matches!(
+        repair_pending_source_cursor_page(&conn, first)
+            .await
+            .unwrap(),
+        CursorAuditPage::ObservationsAppended
+    ));
+    assert_eq!(stored_cursors(&conn).await, vec![newer_cursor.clone()]);
+    let (last, _, _) =
+        super::super::rows::validate_and_stage_observation_authority_page(&conn, first)
+            .await
+            .unwrap();
+    assert!(matches!(
+        repair_pending_source_cursor_page(&conn, last)
+            .await
+            .unwrap(),
+        CursorAuditPage::Continue
+    ));
+    assert!(matches!(
+        repair_pending_source_cursor_page(&conn, last)
+            .await
+            .unwrap(),
+        CursorAuditPage::Complete
+    ));
+    assert_eq!(stored_cursors(&conn).await, vec![newer_cursor]);
+}
+
+#[tokio::test]
+async fn projection_queue_repair_resumes_from_a_committed_page() {
+    let (_directory, fixture) = open_registered().await;
+    let transaction = fixture.database().begin_write_transaction().await.unwrap();
+    for index in 0..260 {
+        seed_observation(&transaction, index, "queue-page").await;
+    }
+    transaction.commit().await.unwrap();
+    for _ in 0..4 {
+        let transaction = fixture.database().begin_write_transaction().await.unwrap();
+        assert!(
+            repair_projection_frontier_page(&transaction, 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        transaction.commit().await.unwrap();
+    }
+    let mut rows = fixture
+        .query("SELECT COUNT(*) FROM projection_queue", ())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        128
+    );
+    drop(rows);
+    loop {
+        let transaction = fixture.database().begin_write_transaction().await.unwrap();
+        let done = repair_projection_frontier_page(&transaction, 0)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        if done.is_some() {
+            break;
+        }
+    }
+    let mut rows = fixture
+        .query(
+            "SELECT (SELECT COUNT(*) FROM projection_queue),
+        (SELECT COUNT(*) FROM authority_projection_repair_progress)",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 260);
+    assert_eq!(row.get::<i64>(1).unwrap(), 0);
 }

@@ -180,9 +180,13 @@ mod goal_event_tests {
         let renamed_native = native("Gauss", "reviewer");
         let first_path = write_rollout("first.jsonl", &first_native);
         let renamed_path = write_rollout("renamed.jsonl", &renamed_native);
-        let first_meta = session_meta_with_provenance(&first_path).unwrap().unwrap();
+        let first_meta = session_meta_with_provenance(&first_path)
+            .unwrap()
+            .ready()
+            .unwrap();
         let renamed_meta = session_meta_with_provenance(&renamed_path)
             .unwrap()
+            .ready()
             .unwrap();
         assert_eq!(first_meta.native_thread_id.as_deref(), Some("child-thread"));
         assert_eq!(
@@ -246,7 +250,10 @@ mod goal_event_tests {
         );
         std::fs::write(&path, contents).unwrap();
 
-        let meta = session_meta_with_provenance(&path).unwrap().unwrap();
+        let meta = session_meta_with_provenance(&path)
+            .unwrap()
+            .ready()
+            .unwrap();
         assert_eq!(meta.meta.session_id, "rollout-filename");
         assert!(meta.native_thread_id.is_none());
         assert_eq!(meta.meta.agent_id.as_deref(), Some("mutable-label"));
@@ -850,7 +857,10 @@ mod goal_event_tests {
                 + "\n",
         )
         .unwrap();
-        let parsed = session_meta_with_provenance(&transcript).unwrap().unwrap();
+        let parsed = session_meta_with_provenance(&transcript)
+            .unwrap()
+            .ready()
+            .unwrap();
         assert_eq!(parsed.meta.session_id, requested);
         assert!(parsed.native_thread_id.is_none());
         let lookup = CodexSource::with_home(&home)

@@ -362,20 +362,12 @@ pub(super) async fn validate_current_predecessor(
     }
 }
 
-#[tracing::instrument(
-    name = "session_temporal.persist.publish_generation",
-    level = "trace",
-    skip_all
-)]
-pub(super) async fn publish_candidate_generation(
-    conn: &impl crate::handle::SessionTemporalExec,
+/// Readiness under the mounted session-publication owner gate; final
+/// publication repeats this check under its writer transaction.
+pub async fn require_summary_publication_generation(
+    conn: &impl crate::handle::SessionTemporalQuery,
     session_id: &str,
-    summary_id: &str,
-    predecessor: Option<&str>,
-    source_horizon_json: &str,
-    now: i64,
-    relation_projection: &SessionRelationProjection,
-) -> Result<i64, LcmError> {
+) -> Result<Option<i64>, LcmError> {
     let active = active_generation(conn, session_id).await?;
     // Generations read every projection row numbered at or below them, so a
     // publication may not activate above a refresh or rebuild candidate that
@@ -395,6 +387,24 @@ pub(super) async fn publish_candidate_generation(
         });
     }
     drop(open_rows);
+    Ok(active)
+}
+
+#[tracing::instrument(
+    name = "session_temporal.persist.publish_generation",
+    level = "trace",
+    skip_all
+)]
+pub(super) async fn publish_candidate_generation(
+    conn: &impl crate::handle::SessionTemporalExec,
+    session_id: &str,
+    summary_id: &str,
+    predecessor: Option<&str>,
+    source_horizon_json: &str,
+    now: i64,
+    relation_projection: &SessionRelationProjection,
+) -> Result<i64, LcmError> {
+    let active = require_summary_publication_generation(conn, session_id).await?;
     let mut max_rows = conn
         .query(
             "SELECT COALESCE(MAX(generation), 0)
@@ -611,7 +621,7 @@ fn cycle(summary_id: &str) -> LcmError {
 }
 
 pub(super) async fn active_generation(
-    conn: &impl crate::handle::SessionTemporalExec,
+    conn: &impl crate::handle::SessionTemporalQuery,
     session_id: &str,
 ) -> Result<Option<i64>, LcmError> {
     let mut rows = conn

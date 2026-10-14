@@ -56,7 +56,10 @@ pub struct HookReplayPassReportV1 {
     pub duplicates: u32,
     pub tombstoned: u32,
     pub retained: u32,
+    /// Records owned by another worktree sharing this project transport.
+    pub scope_deferred: u32,
     pub binding_unavailable: bool,
+    pub more_in_scope: bool,
 }
 
 /// Typed admission result the drain understands. Callers map their own
@@ -167,7 +170,16 @@ where
 
     // Age-expired records are terminal regardless of binding state: the spool
     // keeps them durable precisely until the drain says otherwise.
-    let expired = spool.expired_records(now)?;
+    let expired = spool
+        .expired_records(now)?
+        .into_iter()
+        .filter(|record| {
+            binding.is_none_or(|binding| {
+                record.envelope.project_id != project_id
+                    || record.envelope.worktree_id == binding.worktree_id
+            })
+        })
+        .collect::<Vec<_>>();
     if !expired.is_empty() {
         let disposition = HookSpoolAckDispositionV1::TerminalTombstone;
         let acknowledgements = expired
@@ -194,7 +206,17 @@ where
         return Ok(pass);
     };
 
-    let batches = spool.claim_replay_batches(now, REPLAY_SESSIONS_PER_PASS)?;
+    pass.scope_deferred = u32::try_from(
+        spool
+            .pending_count()
+            .saturating_sub(spool.pending_scope_count(project_id, binding.worktree_id)),
+    )
+    .map_err(|_| HookSpoolError::ReplayBatchExceeded)?;
+    let batches = spool.claim_replay_batches_in_scope(
+        now,
+        REPLAY_SESSIONS_PER_PASS,
+        Some((project_id, binding.worktree_id)),
+    )?;
     let mut replay_batches = Vec::with_capacity(batches.len());
     for batch in batches {
         let record_count =
@@ -215,6 +237,12 @@ where
     let mut completions = Vec::new();
     for (records, record_count) in replay_batches {
         for (index, record) in records.into_iter().enumerate() {
+            if record.envelope.project_id == project_id
+                && record.envelope.worktree_id != binding.worktree_id
+            {
+                pass.scope_deferred = pass.scope_deferred.saturating_add(1);
+                continue;
+            }
             if record.envelope.project_id != project_id
                 || record.envelope.validate(binding).is_err()
             {
@@ -305,6 +333,7 @@ where
             }
         }
     }
+    pass.more_in_scope = spool.pending_scope_count(project_id, binding.worktree_id) > 0;
     Ok(pass)
 }
 
@@ -870,6 +899,279 @@ mod tests {
         let report = drain(root.path(), now, |_, _| async move { admitted() }).await;
         assert_eq!(report.committed, 2);
         assert_eq!(pending_records(root.path(), now), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_host_does_not_prevent_a_peer_spool_from_draining() {
+        let root = TestRoot::new("host-fairness");
+        let now = UtcMicros(10);
+        for host in [HOST, NativeHostIdentityV1::Codex] {
+            let mut scope = binding(7);
+            scope.host = host;
+            scope.capabilities = scope
+                .capabilities
+                .into_iter()
+                .map(|capability| HookCapabilityV1 {
+                    support: stock_event_support(host, capability.family),
+                    ..capability
+                })
+                .collect();
+            let mut queued = envelope(9, &scope);
+            queued.producer = host;
+            let spool_root = hook_v2_spool_root(root.path(), host);
+            let (mut spool, _) =
+                HookSpoolV1::open(&spool_root, HookSpoolConfigV1::stock(host), now).unwrap();
+            spool.append(queued, &scope, now).unwrap();
+            spool.commit().unwrap();
+            let report = drain_host_spool_once(
+                &spool_root,
+                HookSpoolConfigV1::stock(host),
+                PROJECT_ID,
+                Some(&scope),
+                now,
+                |_, _| async move {
+                    if host == HOST {
+                        HookReplayAdmissionOutcomeV1::Unavailable
+                    } else {
+                        HookReplayAdmissionOutcomeV1::Admitted
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            if host == HOST {
+                assert_eq!(report.retained, 1);
+                assert_eq!(pending_records(root.path(), now), 1);
+            } else {
+                assert_eq!(report.committed, 1);
+                assert!(!HookSpoolV1::has_records(&spool_root).unwrap());
+            }
+        }
+        assert_eq!(pending_records(root.path(), now), 1);
+    }
+
+    #[tokio::test]
+    async fn sibling_worktrees_renew_and_drain_their_shared_spool_without_tombstoning_peers() {
+        let root = TestRoot::new("sibling-worktrees");
+        let first = binding(7);
+        let mut second = binding(8);
+        second.worktree_id = [6; 16];
+        let mut owners = Vec::new();
+        for (id, scope) in [(9, first.clone()), (10, second.clone())] {
+            let writer = HookConfigurationFileWriterV1::new(hook_configuration_path(
+                root.path(),
+                scope.worktree_id,
+                HOST,
+            ));
+            owners.push(
+                HookConfigurationPublisherV1::new(writer)
+                    .publish_owned(HookConfigurationSnapshotV1 {
+                        schema_version: HOOK_CONFIGURATION_SCHEMA_VERSION,
+                        revision: scope.worktree_epoch,
+                        published_at: UtcMicros(1),
+                        expires_at: UtcMicros(100),
+                        binding: scope.clone(),
+                    })
+                    .unwrap(),
+            );
+            spool_envelopes(root.path(), &scope, &[envelope(id, &scope)], UtcMicros(99));
+        }
+        let later = UtcMicros(101);
+        for owner in &mut owners {
+            assert!(owner.renew(later).unwrap());
+        }
+        for scope in [&first, &second] {
+            assert_eq!(
+                published_hook_scope_binding(root.path(), scope.worktree_id, HOST, later),
+                Some(scope.clone())
+            );
+        }
+        let first_pass = drain_host_spool_once(
+            &hook_v2_spool_root(root.path(), HOST),
+            HookSpoolConfigV1::stock(HOST),
+            PROJECT_ID,
+            Some(&first),
+            later,
+            |offered, _| async move {
+                assert_eq!(offered.worktree_id, first.worktree_id);
+                HookReplayAdmissionOutcomeV1::Admitted
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                first_pass.committed,
+                first_pass.scope_deferred,
+                first_pass.tombstoned,
+                first_pass.retained
+            ),
+            (1, 1, 0, 0)
+        );
+        assert_eq!(pending_records(root.path(), later), 1);
+        let second_pass = drain_host_spool_once(
+            &hook_v2_spool_root(root.path(), HOST),
+            HookSpoolConfigV1::stock(HOST),
+            PROJECT_ID,
+            Some(&second),
+            later,
+            |offered, _| async move {
+                assert_eq!(offered.worktree_id, second.worktree_id);
+                HookReplayAdmissionOutcomeV1::Admitted
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                second_pass.committed,
+                second_pass.scope_deferred,
+                second_pass.tombstoned
+            ),
+            (1, 0, 0)
+        );
+        assert_eq!(pending_records(root.path(), later), 0);
+    }
+
+    #[tokio::test]
+    async fn sibling_scopes_each_progress_before_the_shared_session_bound() {
+        let root = TestRoot::new("sibling-session-fairness");
+        let first = binding(7);
+        let mut second = binding(8);
+        second.worktree_id = [6; 16];
+        let now = UtcMicros(99);
+        // B sorts before A, exactly the ordering that formerly handed each
+        // owner four foreign sessions after the other's cursor advance.
+        for (scope, start) in [(&second, 1u8), (&first, 20u8)] {
+            let events = (start..start + 7)
+                .map(|session| {
+                    let mut event = envelope(session, scope);
+                    event.protected_session_id = [session; 32];
+                    event
+                })
+                .collect::<Vec<_>>();
+            spool_envelopes(root.path(), scope, &events, now);
+        }
+        let mut admitted = [0u32; 2];
+        for _ in 0..2 {
+            for (index, scope) in [&first, &second].into_iter().enumerate() {
+                let pass = drain_host_spool_once(
+                    &hook_v2_spool_root(root.path(), HOST),
+                    HookSpoolConfigV1::stock(HOST),
+                    PROJECT_ID,
+                    Some(scope),
+                    now,
+                    |event, _| async move {
+                        assert_eq!(event.worktree_id, scope.worktree_id);
+                        HookReplayAdmissionOutcomeV1::Admitted
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(pass.committed > 0);
+                assert_eq!(pass.tombstoned, 0);
+                assert_eq!(pass.retained, 0);
+                admitted[index] += pass.committed;
+            }
+        }
+        assert_eq!(admitted, [7, 7]);
+        assert_eq!(pending_records(root.path(), now), 0);
+    }
+
+    #[tokio::test]
+    async fn renewal_replays_a_queued_envelope_without_changing_identity_or_epoch() {
+        let root = TestRoot::new("owned-renewal");
+        let scope = binding(7);
+        let writer = HookConfigurationFileWriterV1::new(hook_configuration_path(
+            root.path(),
+            scope.worktree_id,
+            HOST,
+        ));
+        let original = HookConfigurationSnapshotV1 {
+            schema_version: HOOK_CONFIGURATION_SCHEMA_VERSION,
+            revision: 17,
+            published_at: UtcMicros(1),
+            expires_at: UtcMicros(100),
+            binding: scope.clone(),
+        };
+        let mut owned = HookConfigurationPublisherV1::new(writer.clone())
+            .publish_owned(original.clone())
+            .unwrap();
+        let queued = envelope(9, &scope);
+        spool_envelopes(
+            root.path(),
+            &scope,
+            std::slice::from_ref(&queued),
+            UtcMicros(99),
+        );
+        let later = UtcMicros(101);
+        assert!(published_hook_scope_binding(root.path(), WORKTREE_ID, HOST, later).is_none());
+        let unavailable = drain(root.path(), later, |_, _| async {
+            panic!("expired binding cannot admit")
+        })
+        .await;
+        assert!(unavailable.binding_unavailable);
+        assert_eq!(pending_records(root.path(), later), 1);
+        assert!(owned.renew(later).unwrap());
+        let renewed = writer.reader().load(HOST).unwrap().unwrap();
+        assert_eq!(renewed.revision, original.revision);
+        assert_eq!(renewed.binding, original.binding);
+        for (state, expected) in [
+            (
+                crate::HookGuidanceStateV1::Paused,
+                crate::HookGuidanceDispositionV1::Paused,
+            ),
+            (
+                crate::HookGuidanceStateV1::Disabled,
+                crate::HookGuidanceDispositionV1::Disabled,
+            ),
+        ] {
+            let prior_control = crate::HookRuntimeControlV1::from_configuration(&original, state);
+            let control =
+                crate::HookRuntimeControlV1::from_configuration(&renewed, prior_control.guidance);
+            let finished = crate::finish_synchronous_hook(
+                &queued,
+                &scope,
+                control,
+                crate::HookImmediateAdmissionV1::Accepted {
+                    admitted_at: later,
+                    ready_guidance: Some(crate::HookReadyGuidanceV1 {
+                        guidance_id: [1; 16],
+                        event_id: queued.event_id,
+                        configuration_revision: original.revision,
+                        expires_at: renewed.expires_at,
+                        text: "approved guidance".to_owned(),
+                    }),
+                },
+                None,
+                later,
+                1,
+            )
+            .unwrap();
+            assert_eq!(finished.receipt.guidance, expected);
+            assert!(finished.rendered_guidance.is_none());
+        }
+        let first = drain(root.path(), later, {
+            let queued = queued.clone();
+            move |replayed, _| {
+                assert_eq!(replayed, queued);
+                async { HookReplayAdmissionOutcomeV1::Unavailable }
+            }
+        })
+        .await;
+        assert_eq!(first.retained, 1);
+        let second = drain(root.path(), later, move |replayed, _| {
+            assert_eq!(replayed, queued);
+            async { HookReplayAdmissionOutcomeV1::ExactDuplicate }
+        })
+        .await;
+        assert_eq!((second.duplicates, second.tombstoned), (1, 0));
+        assert_eq!(pending_records(root.path(), later), 0);
+        let third = drain(root.path(), later, |_, _| async {
+            panic!("acknowledged event cannot recur")
+        })
+        .await;
+        assert_eq!(third, HookReplayPassReportV1::default());
     }
 
     #[tokio::test]

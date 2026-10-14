@@ -212,6 +212,13 @@ pub(super) async fn revise_host_record(
         .await
 }
 
+/// Native metadata is not yet a complete durable JSONL frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TranscriptMetadataPendingReason {
+    Empty,
+    Unterminated,
+}
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum TranscriptIngestError {
@@ -264,6 +271,12 @@ pub enum TranscriptIngestError {
     },
     #[error("Codex discovery frontier is invalid: {detail}")]
     InvalidCodexDiscoveryFrontier { detail: &'static str },
+    #[error("{provider} transcript metadata is pending ({reason:?}): {path}")]
+    SourceMetadataPending {
+        provider: &'static str,
+        path: PathBuf,
+        reason: TranscriptMetadataPendingReason,
+    },
     #[error("{provider} transcript has no injective source identity: {path}")]
     InvalidSourceIdentity {
         provider: &'static str,
@@ -274,6 +287,28 @@ pub enum TranscriptIngestError {
 impl TranscriptIngestError {
     pub const fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled { .. })
+    }
+
+    /// These outcomes concern only this source's bytes, with no uncertain write fate.
+    pub(crate) fn is_source_disposition(&self) -> bool {
+        matches!(
+            self,
+            Self::SourceMetadataPending { .. }
+                | Self::InvalidSourceIdentity { .. }
+                | Self::Domain(_)
+                | Self::ObservationContract(_)
+        )
+    }
+
+    pub(crate) fn consumes_metadata_failure_budget(&self) -> bool {
+        self.is_source_disposition()
+            && !matches!(
+                self,
+                Self::SourceMetadataPending {
+                    reason: TranscriptMetadataPendingReason::Empty,
+                    ..
+                }
+            )
     }
 
     fn scan_io(operation: &'static str, path: &Path, source: std::io::Error) -> Self {

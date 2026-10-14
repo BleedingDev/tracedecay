@@ -55,7 +55,7 @@ mod observation;
 mod tests;
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -188,11 +188,13 @@ struct CodexDiscoveryConsumerState {
     /// reading. A retained source-contract failure avoids rereading bytes but
     /// continues to block coverage; it never proves admission or convergence.
     /// Reservations and records are released when the consumer deregisters.
-    read_outcomes: HashMap<PathBuf, TranscriptReadRecord>,
+    read_outcomes: BTreeMap<PathBuf, TranscriptReadRecord>,
+    next_failure_probe: Option<PathBuf>,
+    source_failure_paths: BTreeSet<PathBuf>,
 }
 
 struct TranscriptReadRecord {
-    witness: SettledFileWitness,
+    witness: Option<SettledFileWitness>,
     failure: Option<TranscriptCatchUpFailure>,
     _memory: ProcessSharedMemoryReservationV1,
 }
@@ -201,7 +203,7 @@ impl CodexDiscoveryConsumerState {
     fn holds_converged(&self, path: &Path, witness: SettledFileWitness) -> bool {
         self.read_outcomes
             .get(path)
-            .is_some_and(|recorded| recorded.witness == witness && recorded.failure.is_none())
+            .is_some_and(|recorded| recorded.witness == Some(witness) && recorded.failure.is_none())
     }
 }
 
@@ -238,7 +240,7 @@ impl SettledFileWitness {
 /// consumer, so one per-consumer record proves a file unchanged for all of
 /// them.
 pub(crate) struct PendingTranscript {
-    convergence: Option<(CodexDiscoveryHub, String, SettledFileWitness)>,
+    convergence: Option<(CodexDiscoveryHub, String, Option<SettledFileWitness>)>,
 }
 
 impl PendingTranscript {
@@ -279,15 +281,16 @@ impl PendingTranscript {
             return Ok(None);
         }
         Ok(Some(Self {
-            convergence: witness.map(|witness| (hub.clone(), consumer.to_string(), witness)),
+            convergence: Some((hub.clone(), consumer.to_string(), witness)),
         }))
     }
 
     pub(crate) fn cached_source_failure(&self, path: &Path) -> Option<TranscriptCatchUpFailure> {
         let (hub, consumer, witness) = self.convergence.as_ref()?;
+        let witness = (*witness)?;
         let inner = hub.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let recorded = inner.consumers.get(consumer)?.read_outcomes.get(path)?;
-        (recorded.witness == *witness)
+        (recorded.witness == Some(witness))
             .then_some(recorded.failure)
             .flatten()
     }
@@ -300,12 +303,8 @@ impl PendingTranscript {
         error: &TranscriptIngestError,
         failure: TranscriptCatchUpFailure,
     ) -> TranscriptIngestResult<()> {
-        if matches!(
-            error,
-            TranscriptIngestError::Domain(_)
-                | TranscriptIngestError::ObservationContract(_)
-                | TranscriptIngestError::InvalidSourceIdentity { .. }
-        ) && let Some((hub, consumer, witness)) = self.convergence
+        if error.is_source_disposition()
+            && let Some((hub, consumer, witness)) = self.convergence
         {
             hub.record_file_result(&consumer, path, witness, Some(failure))?;
         }
@@ -321,8 +320,8 @@ impl PendingTranscript {
         covered_through: u64,
     ) -> TranscriptIngestResult<()> {
         match self.convergence {
-            Some((hub, consumer, witness))
-                if !source_deferred && covered_through == witness.len =>
+            Some((hub, consumer, Some(witness)))
+                if !source_deferred && witness.len > 0 && covered_through == witness.len =>
             {
                 hub.record_file_converged(&consumer, path, witness)
             }
@@ -336,8 +335,10 @@ impl PendingTranscript {
     /// do not re-read it to decide again.
     pub(crate) fn finished(self, path: &Path) -> TranscriptIngestResult<()> {
         match self.convergence {
-            Some((hub, consumer, witness)) => hub.record_file_converged(&consumer, path, witness),
-            None => Ok(()),
+            Some((hub, consumer, Some(witness))) => {
+                hub.record_file_converged(&consumer, path, witness)
+            }
+            _ => Ok(()),
         }
     }
 
@@ -345,9 +346,11 @@ impl PendingTranscript {
     /// An unsettled change time cannot prove that, so a later pass reads the
     /// file again.
     pub(crate) fn admission_settles(&self, source_deferred: bool, covered_through: u64) -> bool {
-        self.convergence
-            .as_ref()
-            .is_some_and(|(_, _, witness)| !source_deferred && covered_through == witness.len)
+        self.convergence.as_ref().is_some_and(|(_, _, witness)| {
+            witness.is_some_and(|witness| {
+                !source_deferred && witness.len > 0 && covered_through == witness.len
+            })
+        })
     }
 
     /// Owned copy of the settled identity, so a caller can finish the file
@@ -355,10 +358,12 @@ impl PendingTranscript {
     pub(crate) fn settled(&self) -> Option<SettledTranscript> {
         self.convergence
             .as_ref()
-            .map(|(hub, consumer, witness)| SettledTranscript {
-                hub: hub.clone(),
-                consumer: consumer.clone(),
-                witness: *witness,
+            .and_then(|(hub, consumer, witness)| {
+                witness.map(|witness| SettledTranscript {
+                    hub: hub.clone(),
+                    consumer: consumer.clone(),
+                    witness,
+                })
             })
     }
 }
@@ -625,7 +630,9 @@ impl CodexDiscoveryHub {
                 mode,
                 awaiting_ack: None,
                 _memory: None,
-                read_outcomes: HashMap::new(),
+                read_outcomes: BTreeMap::new(),
+                next_failure_probe: None,
+                source_failure_paths: BTreeSet::new(),
             },
         );
     }
@@ -680,6 +687,7 @@ impl CodexDiscoveryHub {
         let source = source.clone();
         let (delivery, prefetch) = tokio::task::spawn_blocking(move || {
             let delivery = hub.discover_blocking(&discovery_consumer, &source, bounds, frontier)?;
+            let delivery = hub.probe_source_dispositions(&discovery_consumer, delivery, bounds)?;
             let prefetch = match &delivery {
                 CodexDiscoveryDelivery::Ready(pass) if pass._shared_page_pin.is_some() => {
                     hub.paths_needing_source_read(&discovery_consumer, &pass.report.paths)?
@@ -1154,7 +1162,7 @@ impl CodexDiscoveryHub {
                         state
                             .read_outcomes
                             .get(*path)
-                            .is_some_and(|recorded| recorded.witness == witness)
+                            .is_some_and(|recorded| recorded.witness == Some(witness))
                     })
                 })
             })
@@ -1171,14 +1179,14 @@ impl CodexDiscoveryHub {
         path: &Path,
         witness: SettledFileWitness,
     ) -> TranscriptIngestResult<()> {
-        self.record_file_result(consumer, path, witness, None)
+        self.record_file_result(consumer, path, Some(witness), None)
     }
 
     fn record_file_result(
         &self,
         consumer: &str,
         path: &Path,
-        witness: SettledFileWitness,
+        witness: Option<SettledFileWitness>,
         failure: Option<TranscriptCatchUpFailure>,
     ) -> TranscriptIngestResult<()> {
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1186,20 +1194,42 @@ impl CodexDiscoveryHub {
             return Ok(());
         };
         if let Some(recorded) = state.read_outcomes.get_mut(path) {
+            if witness.is_some() && recorded.witness == witness && recorded.failure.is_some() {
+                return Ok(());
+            }
             recorded.witness = witness;
             recorded.failure = failure;
+            if failure.is_some_and(|failure| failure.provider == PROVIDER) {
+                state.source_failure_paths.insert(path.to_path_buf());
+            } else {
+                state.source_failure_paths.remove(path);
+            }
             return Ok(());
         }
         let charge = candidate_charge(
             path,
-            u64::try_from(std::mem::size_of::<(PathBuf, TranscriptReadRecord)>())
-                .unwrap_or(u64::MAX),
+            u64::try_from(
+                std::mem::size_of::<(PathBuf, TranscriptReadRecord)>()
+                    + std::mem::size_of::<PathBuf>(),
+            )
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::try_from(path_byte_len(path)).unwrap_or(u64::MAX)),
         )?;
         let Some(reservation) =
             reserve_shared_jsonl_bytes(charge, "transcript read outcome capacity")?
         else {
-            return Ok(());
+            return if failure.is_some() {
+                Err(TranscriptIngestError::BackgroundResourceUnavailable {
+                    provider: PROVIDER,
+                    resource: "transcript source disposition capacity",
+                })
+            } else {
+                Ok(())
+            };
         };
+        if failure.is_some_and(|failure| failure.provider == PROVIDER) {
+            state.source_failure_paths.insert(path.to_path_buf());
+        }
         state.read_outcomes.insert(
             path.to_path_buf(),
             TranscriptReadRecord {
@@ -1209,6 +1239,117 @@ impl CodexDiscoveryHub {
             },
         );
         Ok(())
+    }
+
+    /// Coverage remains partial while any source has a pending or invalid outcome.
+    /// Returning only a bounded set of diagnostic examples keeps idle ticks bounded.
+    pub(crate) fn retained_source_failures(&self, consumer: &str) -> Vec<TranscriptCatchUpFailure> {
+        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        inner
+            .consumers
+            .get(consumer)
+            .map_or_else(Vec::new, |state| {
+                state
+                    .source_failure_paths
+                    .iter()
+                    .take(TranscriptDiscoveryBounds::default_walk().max_files)
+                    .filter_map(|path| {
+                        state
+                            .read_outcomes
+                            .get(path)
+                            .and_then(|record| record.failure)
+                    })
+                    .collect()
+            })
+    }
+
+    /// Process-retained dispositions make an enumeration frontier usable even
+    /// when host coverage is partial. After restart the partial coverage instead
+    /// forces enumeration to rediscover those sources.
+    pub(crate) fn coverage_frontier(
+        &self,
+        consumer: &str,
+        stored: CodexDiscoveryFrontier,
+        complete: bool,
+    ) -> CodexDiscoveryFrontier {
+        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let retained = inner.consumers.get(consumer).is_some_and(|state| {
+            !state.source_failure_paths.is_empty() || state.awaiting_ack.is_some()
+        });
+        stored.for_coverage(complete || retained)
+    }
+
+    /// Stat a fair bounded slice of unresolved sources, including old files
+    /// outside discovery's recent-file window. Unchanged outcomes retain their
+    /// cache; changed files join a page only within its remaining bounds.
+    fn probe_source_dispositions(
+        &self,
+        consumer: &str,
+        delivery: CodexDiscoveryDelivery,
+        bounds: TranscriptDiscoveryBounds,
+    ) -> TranscriptIngestResult<CodexDiscoveryDelivery> {
+        let CodexDiscoveryDelivery::Ready(original) = delivery else {
+            return Ok(delivery);
+        };
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(state) = inner.consumers.get_mut(consumer) else {
+            return Ok(CodexDiscoveryDelivery::Ready(original));
+        };
+        if state.source_failure_paths.is_empty() {
+            return Ok(CodexDiscoveryDelivery::Ready(original));
+        }
+        let lower = state
+            .next_failure_probe
+            .as_ref()
+            .map_or(Bound::Unbounded, Bound::Excluded);
+        let selected = state
+            .source_failure_paths
+            .range::<PathBuf, _>((lower, Bound::Unbounded))
+            .chain(state.source_failure_paths.iter())
+            .take(bounds.max_files.min(state.source_failure_paths.len()))
+            .filter_map(|path| {
+                state
+                    .read_outcomes
+                    .get(path)
+                    .map(|record| (path.clone(), record.witness))
+            })
+            .collect::<Vec<_>>();
+        let mut pass = (*original).clone();
+        for (path, witness) in selected {
+            state.next_failure_probe = Some(path.clone());
+            let Some(metadata) = stat_if_present(&path, "probe unresolved Codex transcript")?
+            else {
+                state.read_outcomes.remove(&path);
+                state.source_failure_paths.remove(&path);
+                pass.report.paths.retain(|delivered| delivered != &path);
+                continue;
+            };
+            let changed = change_stamp(&path, &metadata);
+            let identity = codex_corpus_identity(&path, &metadata, changed)?;
+            if metadata.is_file()
+                && changed.is_settled()
+                && witness.is_some_and(|witness| witness.identity == identity)
+            {
+                continue;
+            }
+            let charge = candidate_charge(&path, std::mem::size_of::<std::fs::Metadata>() as u64)?;
+            if !pass.report.paths.contains(&path)
+                && pass.report.paths.len() < bounds.max_files
+                && path_byte_len(&path) <= bounds.max_path_bytes
+                && pass.report.bytes_charged.saturating_add(charge) <= bounds.max_discovery_bytes
+            {
+                pass.report.bytes_charged = pass.report.bytes_charged.saturating_add(charge);
+                pass.report.paths.push(path);
+            }
+        }
+        if pass.report == original.report {
+            return Ok(CodexDiscoveryDelivery::Ready(original));
+        }
+        let pass = std::sync::Arc::new(pass);
+        if let Some(awaiting) = &mut state.awaiting_ack {
+            awaiting.pass = std::sync::Arc::clone(&pass);
+        }
+        Ok(CodexDiscoveryDelivery::Ready(pass))
     }
 
     pub(crate) fn acknowledge(&self, consumer: &str) {

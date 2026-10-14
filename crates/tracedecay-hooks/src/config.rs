@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracedecay_domain::{UtcMicros, encode_lowercase_hex};
+use tracedecay_private_fs::FileLease;
 use tracedecay_private_fs::framed_log::{DirectorySyncPolicy, atomic_write, read_bounded};
 
 use crate::HookScopeBindingV1;
@@ -17,6 +18,8 @@ use tracedecay_domain::NativeHostIdentityV1;
 
 pub const HOOK_CONFIGURATION_SCHEMA_VERSION: u16 = 1;
 pub const MAX_HOOK_CONFIGURATION_BYTES: usize = 64 * 1024;
+pub const HOOK_BINDING_LEASE_MICROS: i64 = 24 * 60 * 60 * 1_000_000;
+const RENEW_BEFORE_MICROS: i64 = 60 * 60 * 1_000_000;
 const DIRECTORY_SYNC_POLICY: DirectorySyncPolicy = DirectorySyncPolicy::TolerateUnsupported;
 
 pub fn hook_configuration_path(
@@ -82,6 +85,8 @@ pub enum HookConfigurationPublicationError {
     InvalidSnapshot,
     #[error("hook configuration JSON is malformed or exceeds its bound")]
     Corrupted,
+    #[error("hook configuration publication ownership changed or was revoked")]
+    OwnershipLost,
     #[error("hook configuration publication authority is unavailable")]
     Unavailable,
 }
@@ -103,6 +108,112 @@ impl HookConfigurationPublisherV1 {
     ) -> Result<HookConfigurationPublicationOutcomeV1, HookConfigurationPublicationError> {
         snapshot.validate()?;
         self.store.publish(snapshot)
+    }
+
+    /// Reopens one exact worktree's existing host publications. All comparisons
+    /// happen under the same canonical publisher leases before any write, so
+    /// one revoked host refuses the automatic recovery of the entire graph.
+    pub fn publish_owned_batch_if_current(
+        mut publications: Vec<(
+            HookConfigurationFileWriterV1,
+            HookConfigurationSnapshotV1,
+            HookConfigurationSnapshotV1,
+        )>,
+    ) -> Result<Vec<OwnedHookConfigurationV1>, HookConfigurationPublicationError> {
+        if publications.is_empty() {
+            return Err(HookConfigurationPublicationError::InvalidSnapshot);
+        }
+        publications.sort_by(|left, right| left.0.path.cmp(&right.0.path));
+        if publications
+            .windows(2)
+            .any(|pair| pair[0].0.path == pair[1].0.path)
+        {
+            return Err(HookConfigurationPublicationError::InvalidSnapshot);
+        }
+        let mut leases = Vec::with_capacity(publications.len());
+        for (store, _, snapshot) in &publications {
+            snapshot.validate()?;
+            leases.push(store.acquire_lease(true)?);
+        }
+        for (store, expected, snapshot) in &publications {
+            if read_snapshot(&store.path)?.as_ref() != Some(expected)
+                || snapshot.binding != expected.binding
+                || snapshot.revision <= expected.revision
+            {
+                return Err(HookConfigurationPublicationError::OwnershipLost);
+            }
+        }
+        let mut owned = Vec::with_capacity(publications.len());
+        for (store, _, snapshot) in publications {
+            store.write_snapshot(&snapshot)?;
+            owned.push(OwnedHookConfigurationV1 { store, snapshot });
+        }
+        drop(leases);
+        Ok(owned)
+    }
+
+    pub fn publish_owned(
+        &self,
+        snapshot: HookConfigurationSnapshotV1,
+    ) -> Result<OwnedHookConfigurationV1, HookConfigurationPublicationError> {
+        match self.publish(snapshot.clone())? {
+            HookConfigurationPublicationOutcomeV1::Published
+            | HookConfigurationPublicationOutcomeV1::Duplicate => Ok(OwnedHookConfigurationV1 {
+                store: self.store.clone(),
+                snapshot,
+            }),
+            HookConfigurationPublicationOutcomeV1::StaleRejected => {
+                Err(HookConfigurationPublicationError::OwnershipLost)
+            }
+        }
+    }
+}
+
+/// A successful publication's exact receipt. Renewal cannot adopt a binding
+/// read from disk, because its deterministic identity does not prove ownership.
+#[derive(Debug)]
+pub struct OwnedHookConfigurationV1 {
+    store: HookConfigurationFileWriterV1,
+    snapshot: HookConfigurationSnapshotV1,
+}
+
+impl OwnedHookConfigurationV1 {
+    /// The exact publication still owned by this receipt, including renewals.
+    pub fn snapshot(&self) -> &HookConfigurationSnapshotV1 {
+        &self.snapshot
+    }
+
+    pub fn host(&self) -> NativeHostIdentityV1 {
+        self.snapshot.binding.host
+    }
+
+    pub fn renewal_due(&self, now: UtcMicros) -> bool {
+        self.snapshot.expires_at.0.saturating_sub(now.0) <= RENEW_BEFORE_MICROS
+    }
+
+    pub fn renew(&mut self, now: UtcMicros) -> Result<bool, HookConfigurationPublicationError> {
+        let _lease = self.store.acquire_lease(false)?;
+        if read_snapshot(&self.store.path)?.as_ref() != Some(&self.snapshot) {
+            return Err(HookConfigurationPublicationError::OwnershipLost);
+        }
+        if now.0 <= 0 || now.0 < self.snapshot.published_at.0 {
+            return Err(HookConfigurationPublicationError::InvalidSnapshot);
+        }
+        if self.snapshot.expires_at.0.saturating_sub(now.0) > RENEW_BEFORE_MICROS {
+            return Ok(false);
+        }
+        let expires_at = now
+            .0
+            .checked_add(HOOK_BINDING_LEASE_MICROS)
+            .ok_or(HookConfigurationPublicationError::InvalidSnapshot)?;
+        let renewed = HookConfigurationSnapshotV1 {
+            published_at: now,
+            expires_at: UtcMicros(expires_at),
+            ..self.snapshot.clone()
+        };
+        self.store.write_snapshot(&renewed)?;
+        self.snapshot = renewed;
+        Ok(true)
     }
 }
 
@@ -132,7 +243,8 @@ impl HookConfigurationSubscriberV1 {
             | Err(HookConfigurationPublicationError::InvalidSnapshot) => {
                 return HookConfigurationReadOutcomeV1::Corrupted;
             }
-            Err(HookConfigurationPublicationError::Unavailable) => {
+            Err(HookConfigurationPublicationError::Unavailable)
+            | Err(HookConfigurationPublicationError::OwnershipLost) => {
                 return HookConfigurationReadOutcomeV1::Unavailable;
             }
         };
@@ -173,6 +285,7 @@ impl HookConfigurationFileWriterV1 {
         std::fs::create_dir_all(parent)
             .and_then(|_| tracedecay_private_fs::make_private_directory(parent))
             .map_err(|_| HookConfigurationPublicationError::Unavailable)?;
+        let _lease = self.acquire_lease(true)?;
         let current = match read_snapshot(&self.path) {
             Ok(current) => current,
             // This writer is the sole daemon-owned publication authority. A
@@ -191,14 +304,48 @@ impl HookConfigurationFileWriterV1 {
                 return Ok(HookConfigurationPublicationOutcomeV1::StaleRejected);
             }
         }
-        let bytes = serde_json::to_vec(&snapshot)
+        self.write_snapshot(&snapshot)?;
+        Ok(HookConfigurationPublicationOutcomeV1::Published)
+    }
+
+    fn acquire_lease(&self, create: bool) -> Result<FileLease, HookConfigurationPublicationError> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or(HookConfigurationPublicationError::Unavailable)?;
+        tracedecay_private_fs::validate_private_directory(parent)
+            .map_err(|_| HookConfigurationPublicationError::Unavailable)?;
+        let path = self.path.with_extension("lock");
+        let file = if create {
+            match tracedecay_private_fs::create_private_file(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    tracedecay_private_fs::open_private_file(&path)
+                        .map_err(|_| HookConfigurationPublicationError::Unavailable)?
+                }
+                Err(_) => return Err(HookConfigurationPublicationError::Unavailable),
+            }
+        } else {
+            tracedecay_private_fs::open_private_file(&path)
+                .map_err(|_| HookConfigurationPublicationError::Unavailable)?
+        };
+        file.lock()
+            .map_err(|_| HookConfigurationPublicationError::Unavailable)?;
+        Ok(FileLease::held(file, "hooks.configuration.publisher"))
+    }
+
+    fn write_snapshot(
+        &self,
+        snapshot: &HookConfigurationSnapshotV1,
+    ) -> Result<(), HookConfigurationPublicationError> {
+        snapshot.validate()?;
+        let bytes = serde_json::to_vec(snapshot)
             .map_err(|_| HookConfigurationPublicationError::InvalidSnapshot)?;
         if bytes.is_empty() || bytes.len() > MAX_HOOK_CONFIGURATION_BYTES {
             return Err(HookConfigurationPublicationError::InvalidSnapshot);
         }
         atomic_write(&self.path, "hook-config", &bytes, DIRECTORY_SYNC_POLICY)
-            .map_err(|_| HookConfigurationPublicationError::Unavailable)?;
-        Ok(HookConfigurationPublicationOutcomeV1::Published)
+            .map_err(|_| HookConfigurationPublicationError::Unavailable)
     }
 }
 
@@ -293,6 +440,139 @@ mod tests {
                 }],
             },
         }
+    }
+
+    #[test]
+    fn lease_renewal_preserves_exact_authority_and_leaves_fresh_files_untouched() {
+        let directory = TestDir::new();
+        let path = directory.path.join("hook-config.json");
+        let writer = HookConfigurationFileWriterV1::new(&path);
+        let original = snapshot(17, HOOK_BINDING_LEASE_MICROS + 1);
+        let mut owned = HookConfigurationPublisherV1::new(writer.clone())
+            .publish_owned(original.clone())
+            .unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(!owned.renew(UtcMicros(2)).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        let expired_at = UtcMicros(original.expires_at.0 + 1);
+        assert!(owned.renew(expired_at).unwrap());
+        let renewed = writer
+            .reader()
+            .load(original.binding.host)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            renewed,
+            HookConfigurationSnapshotV1 {
+                published_at: expired_at,
+                expires_at: UtcMicros(expired_at.0 + HOOK_BINDING_LEASE_MICROS),
+                ..original
+            }
+        );
+    }
+
+    #[test]
+    fn renewal_refuses_revocation_corruption_and_every_changed_publication() {
+        for mutation in 0..7 {
+            let directory = TestDir::new();
+            let path = directory.path.join("hook-config.json");
+            let original = snapshot(17, 100);
+            let publisher =
+                HookConfigurationPublisherV1::new(HookConfigurationFileWriterV1::new(&path));
+            let mut owned = publisher.publish_owned(original.clone()).unwrap();
+            match mutation {
+                0 => fs::remove_file(&path).unwrap(),
+                1 => fs::write(&path, b"corrupt").unwrap(),
+                _ => {
+                    let mut changed = original.clone();
+                    match mutation {
+                        2 => changed.revision += 1,
+                        3 => changed.binding.binding_token = [9; 32],
+                        4 => changed.binding.worktree_id = [9; 16],
+                        5 => changed.published_at = UtcMicros(2),
+                        _ => changed.binding.capabilities.clear(),
+                    }
+                    fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+                }
+            }
+            let before = fs::read(&path).ok();
+            assert!(owned.renew(UtcMicros(101)).is_err());
+            assert_eq!(fs::read(&path).ok(), before);
+        }
+        let directory = TestDir::new();
+        let parent = directory.path.join("owned");
+        let path = parent.join("hook-config.json");
+        let mut owned =
+            HookConfigurationPublisherV1::new(HookConfigurationFileWriterV1::new(&path))
+                .publish_owned(snapshot(17, 100))
+                .unwrap();
+        fs::remove_dir_all(&parent).unwrap();
+        assert!(owned.renew(UtcMicros(101)).is_err());
+        assert!(!parent.exists());
+    }
+
+    #[test]
+    fn reopening_transfers_ownership_and_stale_publication_cannot_acquire_it() {
+        let directory = TestDir::new();
+        let path = directory.path.join("hook-config.json");
+        let publisher =
+            HookConfigurationPublisherV1::new(HookConfigurationFileWriterV1::new(&path));
+        let mut old = publisher.publish_owned(snapshot(17, 100)).unwrap();
+        let mut successor = publisher.publish_owned(snapshot(18, 100)).unwrap();
+        assert_eq!(
+            old.renew(UtcMicros(101)),
+            Err(HookConfigurationPublicationError::OwnershipLost)
+        );
+        assert!(successor.renew(UtcMicros(101)).unwrap());
+        assert!(matches!(
+            publisher.publish_owned(snapshot(17, 100)),
+            Err(HookConfigurationPublicationError::OwnershipLost)
+        ));
+        assert_eq!(
+            publisher
+                .store
+                .reader()
+                .load(NativeHostIdentityV1::ClaudeCode)
+                .unwrap()
+                .unwrap()
+                .revision,
+            18
+        );
+    }
+
+    #[test]
+    fn publication_and_renewal_share_the_same_file_lease() {
+        let directory = TestDir::new();
+        let path = directory.path.join("hook-config.json");
+        let writer = HookConfigurationFileWriterV1::new(&path);
+        let mut owned = HookConfigurationPublisherV1::new(writer.clone())
+            .publish_owned(snapshot(17, 100))
+            .unwrap();
+        let held = writer.acquire_lease(false).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let competitor = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = HookConfigurationPublisherV1::new(writer).publish(snapshot(18, 100));
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        held.release().unwrap();
+        assert_eq!(
+            done_rx.recv().unwrap().unwrap(),
+            HookConfigurationPublicationOutcomeV1::Published
+        );
+        competitor.join().unwrap();
+        assert_eq!(
+            owned.renew(UtcMicros(101)),
+            Err(HookConfigurationPublicationError::OwnershipLost)
+        );
     }
 
     #[test]
@@ -401,7 +681,9 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
-        assert_eq!(entries, vec![std::ffi::OsString::from("hook-config.json")]);
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains(&std::ffi::OsString::from("hook-config.json")));
+        assert!(entries.contains(&std::ffi::OsString::from("hook-config.lock")));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -454,6 +736,69 @@ mod tests {
                 "worktree {:?} must keep its own live binding",
                 expected.binding.worktree_id
             );
+        }
+    }
+    #[test]
+    fn guarded_recovery_refuses_a_peer_revocation_under_the_canonical_publisher_leases() {
+        for mutation in ["missing", "corrupt", "foreign"] {
+            let directory = TestDir::new();
+            let first_writer = HookConfigurationFileWriterV1::new(directory.path.join("a.json"));
+            let peer_writer = HookConfigurationFileWriterV1::new(directory.path.join("b.json"));
+            let first = snapshot(1, 100);
+            let mut peer = snapshot(1, 100);
+            peer.binding.host = NativeHostIdentityV1::Codex;
+            HookConfigurationPublisherV1::new(first_writer.clone())
+                .publish(first.clone())
+                .unwrap();
+            HookConfigurationPublisherV1::new(peer_writer.clone())
+                .publish(peer.clone())
+                .unwrap();
+            let first_bytes = fs::read(&first_writer.path).unwrap();
+            let lease = first_writer.acquire_lease(false).unwrap();
+            let task = std::thread::spawn({
+                let first_writer = first_writer.clone();
+                let peer_writer = peer_writer.clone();
+                let first = first.clone();
+                let peer = peer.clone();
+                move || {
+                    let renewed_first = HookConfigurationSnapshotV1 {
+                        revision: 2,
+                        published_at: UtcMicros(2),
+                        expires_at: UtcMicros(102),
+                        ..first.clone()
+                    };
+                    let renewed_peer = HookConfigurationSnapshotV1 {
+                        revision: 2,
+                        published_at: UtcMicros(2),
+                        expires_at: UtcMicros(102),
+                        ..peer.clone()
+                    };
+                    HookConfigurationPublisherV1::publish_owned_batch_if_current(vec![
+                        (first_writer, first, renewed_first),
+                        (peer_writer, peer, renewed_peer),
+                    ])
+                }
+            });
+            // The recovery is fenced behind A's canonical lease. Revoke or
+            // replace B after the caller captured both expected snapshots.
+            match mutation {
+                "missing" => fs::remove_file(&peer_writer.path).unwrap(),
+                "corrupt" => fs::write(&peer_writer.path, b"revoked peer publication").unwrap(),
+                "foreign" => {
+                    let mut foreign = peer;
+                    foreign.revision = 3;
+                    foreign.binding.binding_token = [77; 32];
+                    HookConfigurationPublisherV1::new(peer_writer.clone())
+                        .publish(foreign)
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let peer_bytes = fs::read(&peer_writer.path).ok();
+            drop(lease);
+            assert!(task.join().unwrap().is_err());
+            assert_eq!(fs::read(&first_writer.path).unwrap(), first_bytes);
+            assert_eq!(fs::read(&peer_writer.path).ok(), peer_bytes);
         }
     }
 }

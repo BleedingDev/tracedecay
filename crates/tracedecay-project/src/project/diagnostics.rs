@@ -72,13 +72,23 @@ impl TraceDecay {
     /// bound to the correct branch DB. Use after [`branch_drifted`](Self::branch_drifted)
     /// reports drift so subsequent reads and writes target the right DB.
     pub async fn reopen_for_current_branch(&self) -> Result<Self> {
-        Self::open_with_registered_configuration(
+        let publications = self
+            .hook_publications
+            .lock()
+            .map_err(|_| TraceDecayError::Config {
+                message: "Hook publication ownership is poisoned".to_owned(),
+            })?
+            .iter()
+            .map(|publication| publication.snapshot().clone())
+            .collect::<Vec<_>>();
+        Self::open_with_registered_configuration_for_hook_replay(
             &self.project_root,
             self.open_options.clone(),
             self.store_layout.clone(),
             self.configuration_runtime.registered_database(),
             self.profile_database.clone(),
             self.store_runtime_registry.clone(),
+            Some(&publications),
         )
         .await
     }

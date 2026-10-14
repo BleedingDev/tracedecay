@@ -1780,7 +1780,7 @@ mod reconcile_tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_temp_firmlink_projection_matches_runtime_session_identity() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::TempDir::new_in("/var/tmp").unwrap();
         let project = tmp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let host = project.to_string_lossy().into_owned();

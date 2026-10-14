@@ -1639,3 +1639,118 @@ pub(crate) async fn open_registered_test_fixture(
         _owner: owner,
     })
 }
+
+#[cfg(test)]
+mod session_publication_tests {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    use tracedecay_runtime_core::cancellation::CancellationToken;
+
+    use super::RegisteredGlobalDbHarness;
+
+    #[tokio::test]
+    async fn independently_issued_leases_share_session_publication_ownership() {
+        let harness =
+            RegisteredGlobalDbHarness::open_without_relation_graph("session-publication-leases")
+                .await;
+        let independent = harness._database.issue_lease().unwrap();
+        let cloned = harness.registered.clone();
+        let read_only = harness._database.issue_read_only_lease().unwrap();
+        let weak_issued = harness._database.weak_lease_issuer().issue_lease().unwrap();
+        assert!(!harness.registered.shares_client_with(&independent));
+        assert!(harness.registered.shares_client_with(&cloned));
+        assert!(!harness.registered.shares_client_with(&read_only));
+        assert!(!harness.registered.shares_client_with(&weak_issued));
+
+        let held = harness.registered.session_publication_guard().await;
+        let leases = [independent, cloned, read_only, weak_issued];
+        let mut waiters = leases
+            .iter()
+            .map(|lease| Box::pin(lease.session_publication_guard()))
+            .collect::<Vec<_>>();
+        let mut context = Context::from_waker(Waker::noop());
+        for waiter in &mut waiters {
+            assert!(waiter.as_mut().poll(&mut context).is_pending());
+        }
+        drop(held);
+
+        while !waiters.is_empty() {
+            let mut next = waiters.remove(0);
+            let Poll::Ready(held) = next.as_mut().poll(&mut context) else {
+                panic!("the next independently issued lease must acquire the released gate");
+            };
+            for waiter in &mut waiters {
+                assert!(
+                    waiter.as_mut().poll(&mut context).is_pending(),
+                    "only one lease may publish a session generation at a time"
+                );
+            }
+            drop(held);
+        }
+    }
+
+    #[tokio::test]
+    async fn separate_registered_owners_publish_sessions_independently() {
+        let first =
+            RegisteredGlobalDbHarness::open_without_relation_graph("session-publication-first")
+                .await;
+        let second =
+            RegisteredGlobalDbHarness::open_without_relation_graph("session-publication-second")
+                .await;
+        assert_ne!(first.registered.binding(), second.registered.binding());
+        let first_held = first.registered.session_publication_guard().await;
+        let mut second_waiter = Box::pin(second.registered.session_publication_guard());
+        let mut context = Context::from_waker(Waker::noop());
+        let Poll::Ready(second_held) = second_waiter.as_mut().poll(&mut context) else {
+            panic!("one registered owner must not block another owner's session publication");
+        };
+        drop(second_held);
+        drop(first_held);
+    }
+
+    #[tokio::test]
+    async fn cancelled_session_publication_waiters_preserve_current_and_next_owner() {
+        let harness =
+            RegisteredGlobalDbHarness::open_without_relation_graph("session-publication-cancel")
+                .await;
+        let dropped_lease = harness._database.issue_lease().unwrap();
+        let cancelled_lease = harness._database.issue_lease().unwrap();
+        let surviving_lease = harness._database.issue_lease().unwrap();
+        let held = harness.registered.session_publication_guard().await;
+        let cancellation = CancellationToken::new();
+        let mut dropped_waiter = Box::pin(dropped_lease.session_publication_guard());
+        let mut cancelled_waiter = Box::pin(async {
+            tokio::select! {
+                _ = cancellation.cancelled() => None,
+                guard = cancelled_lease.session_publication_guard() => Some(guard),
+            }
+        });
+        let mut surviving_waiter = Box::pin(surviving_lease.session_publication_guard());
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(dropped_waiter.as_mut().poll(&mut context).is_pending());
+        assert!(cancelled_waiter.as_mut().poll(&mut context).is_pending());
+        assert!(surviving_waiter.as_mut().poll(&mut context).is_pending());
+
+        drop(dropped_waiter);
+        cancellation.cancel();
+        assert!(matches!(
+            cancelled_waiter.as_mut().poll(&mut context),
+            Poll::Ready(None)
+        ));
+        drop(cancelled_waiter);
+        assert!(
+            surviving_waiter.as_mut().poll(&mut context).is_pending(),
+            "cancelling queued work must not release the current publisher's guard"
+        );
+        drop(held);
+        let Poll::Ready(surviving_held) = surviving_waiter.as_mut().poll(&mut context) else {
+            panic!("cancelled waiters must not prevent the next live publisher from acquiring");
+        };
+
+        let mut original_waiter = Box::pin(harness.registered.session_publication_guard());
+        assert!(original_waiter.as_mut().poll(&mut context).is_pending());
+        drop(surviving_held);
+        assert!(original_waiter.as_mut().poll(&mut context).is_ready());
+    }
+}

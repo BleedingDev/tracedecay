@@ -3,11 +3,17 @@ use std::time::Duration;
 use tracedecay_contracts::{CancellationSignal, Deadline};
 use tracedecay_temporal_query::execution::ExecutionControl;
 
+use super::session_temporal_refresh_scheduler::projector::{
+    CanonicalSessionTemporalProjector, SessionTemporalRefreshEffect,
+    SessionTemporalRefreshProjector,
+};
+use tracedecay_domain::SessionId;
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 use tracedecay_lcm::{LcmCompressionRequest, LcmCompressionResponse, LcmError, LcmSummarizerMode};
 #[cfg(any(test, feature = "test-helpers"))]
 use tracedecay_lcm::{LcmSessionBoundaryRequest, LcmSessionBoundaryResponse};
-use tracedecay_session_temporal_store::SessionTemporalAccess;
+use tracedecay_session_temporal_store::{SessionRefreshRestartStateV1, SessionTemporalAccess};
+use tracedecay_store::SessionRefreshCompletionRequestV1;
 
 pub(super) const LCM_EFFECT_CEILING: Duration =
     tracedecay_daemon_protocol::DEFAULT_DAEMON_OPERATION_DEADLINE;
@@ -79,6 +85,24 @@ impl LcmEffectControl {
         control
     }
 
+    async fn interruptible<T>(
+        &self,
+        future: impl std::future::Future<Output = T>,
+    ) -> Result<T, LcmError> {
+        self.checkpoint()?;
+        tokio::select! {
+            biased;
+            () = async {
+                match &self.cancellation {
+                    Some(signal) => signal.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => Err(LcmError::Cancelled),
+            () = tokio::time::sleep_until(self.expires_at) => Err(LcmError::DeadlineExceeded),
+            value = future => Ok(value),
+        }
+    }
+
     fn remaining(&self) -> Result<Duration, LcmError> {
         self.checkpoint()?;
         Ok(self
@@ -103,6 +127,24 @@ impl DaemonLcmEffectService {
         &self,
         mut request: LcmCompressionRequest,
     ) -> Result<LcmCompressionResponse, LcmError> {
+        let _publication = self
+            .control
+            .interruptible(self.db.session_publication_guard())
+            .await?;
+        self.control
+            .interruptible(self.settle_session_projection(&request.session_id))
+            .await??;
+        let snapshot = self
+            .db
+            .read_snapshot()
+            .await
+            .map_err(|error| LcmError::Db(error.to_string()))?;
+        tracedecay_session_temporal_store::operations::require_summary_publication_generation(
+            &snapshot,
+            &request.session_id,
+        )
+        .await?;
+        drop(snapshot);
         // Observation-projected sessions land raw rows without ingest
         // protection; the verified raw loads inside compression reject them.
         // Hydrate the canonical sanitization receipts first so the daemon
@@ -123,28 +165,33 @@ impl DaemonLcmEffectService {
             LcmSummarizerMode::Provided { summary_text, .. } if !summary_text.trim().is_empty()
         ) || matches!(&request.summarizer, LcmSummarizerMode::Fake { .. })
         {
-            return self.commit_compression(&request).await;
+            return self
+                .commit_compression(&request, None)
+                .await
+                .map(|(response, _)| response);
         }
 
         // The message corpus is owned once by `request`; only `summarizer`
         // changes between the planning pass and the final commit.
         request.summarizer = LcmSummarizerMode::HermesAuxiliary;
-        let pending = self.commit_compression(&request).await?;
+        let (pending, raw_revision) = self.commit_compression(&request, None).await?;
         if pending.status != "needs_summary" {
             return Ok(pending);
         }
         let Some(summary_request) = pending.summary_request.as_ref() else {
             return Ok(pending);
         };
-        let summary = match super::lcm_summarization::resolve_authoritative_summary(
-            &self.db,
-            &request.provider,
-            &request.session_id,
-            summary_request,
-            self.control.remaining()?,
-            None,
-        )
-        .await
+        let summary = match self
+            .control
+            .interruptible(super::lcm_summarization::resolve_authoritative_summary(
+                &self.db,
+                &request.provider,
+                &request.session_id,
+                summary_request,
+                self.control.remaining()?,
+                None,
+            ))
+            .await?
         {
             Ok(summary) => summary,
             Err(super::lcm_summarization::SummaryResolutionError::Storage(error)) => {
@@ -160,7 +207,12 @@ impl DaemonLcmEffectService {
             summary_text: summary.text,
             route: Some(summary.route),
         };
-        self.commit_compression(&request).await
+        let revision = raw_revision.ok_or_else(|| {
+            LcmError::Db("summary planning has no canonical raw revision".to_owned())
+        })?;
+        self.commit_compression(&request, Some((summary_request, revision)))
+            .await
+            .map(|(response, _)| response)
     }
 
     pub(super) async fn compress_retained_page(
@@ -168,6 +220,24 @@ impl DaemonLcmEffectService {
         mut request: LcmCompressionRequest,
         convergence_candidate: &tracedecay_lcm::summary_convergence::LcmSummaryConvergenceCandidate,
     ) -> Result<tracedecay_lcm::summary_convergence::LcmBoundedCompressionResponse, LcmError> {
+        let _publication = self
+            .control
+            .interruptible(self.db.session_publication_guard())
+            .await?;
+        self.control
+            .interruptible(self.settle_session_projection(&request.session_id))
+            .await??;
+        let snapshot = self
+            .db
+            .read_snapshot()
+            .await
+            .map_err(|error| LcmError::Db(error.to_string()))?;
+        tracedecay_session_temporal_store::operations::require_summary_publication_generation(
+            &snapshot,
+            &request.session_id,
+        )
+        .await?;
+        drop(snapshot);
         if matches!(
             &request.summarizer,
             LcmSummarizerMode::Provided { summary_text, .. } if !summary_text.trim().is_empty()
@@ -192,15 +262,17 @@ impl DaemonLcmEffectService {
         // when its evidence binds the exact raw source range selected by this
         // page. Otherwise the provider authority summarizes source_messages.
         let required_native_source_range = summary_request.source_range.clone();
-        let summary = match super::lcm_summarization::resolve_authoritative_summary(
-            &self.db,
-            &request.provider,
-            &request.session_id,
-            summary_request,
-            self.control.remaining()?,
-            Some(&required_native_source_range),
-        )
-        .await
+        let summary = match self
+            .control
+            .interruptible(super::lcm_summarization::resolve_authoritative_summary(
+                &self.db,
+                &request.provider,
+                &request.session_id,
+                summary_request,
+                self.control.remaining()?,
+                Some(&required_native_source_range),
+            ))
+            .await?
         {
             Ok(summary)
                 if summary.source_range.interval() == Some(&required_native_source_range) =>
@@ -240,7 +312,7 @@ impl DaemonLcmEffectService {
             .commit_retained_compression(
                 &request,
                 Some(convergence_candidate),
-                Some(&required_native_source_range),
+                Some(summary_request),
             )
             .await?;
         committed.rows_scanned = committed.rows_scanned.saturating_add(pending.rows_scanned);
@@ -251,19 +323,115 @@ impl DaemonLcmEffectService {
         Ok(committed)
     }
 
+    // Compaction joins only its selected session's already-owned refresh. One
+    // canonical page is the foreground work bound; larger refreshes remain
+    // owned by background convergence and never launch a summarizer here.
+    async fn settle_session_projection(&self, session: &str) -> Result<(), LcmError> {
+        let session =
+            SessionId::new(session.to_owned()).map_err(|error| LcmError::Db(error.to_string()))?;
+        let access = SessionTemporalAccess::new(self.db.as_ref());
+        let map_error = |error| LcmError::Db(format!("settle summary session projection: {error}"));
+        let Some(mut recovery) = access
+            .session_refresh_recovery_result(&session)
+            .await
+            .map_err(map_error)?
+        else {
+            return Ok(());
+        };
+        if recovery.restart_state() != SessionRefreshRestartStateV1::ReadyToComplete {
+            match CanonicalSessionTemporalProjector
+                .project(&self.db, recovery.clone())
+                .await
+            {
+                Ok(SessionTemporalRefreshEffect::Projection { progress, batch }) => {
+                    access
+                        .persist_session_refresh_projection_batch_controlled_result(
+                            progress,
+                            batch,
+                            self.control.execution_control(),
+                        )
+                        .await
+                        .map_err(map_error)?;
+                }
+                Err(error) => {
+                    tracing::warn!(reason_code = error.code.as_str(), class = ?error.class, "selected session projection failed");
+                    return Err(LcmError::Db(
+                        "selected session projection failed".to_owned(),
+                    ));
+                }
+                Ok(SessionTemporalRefreshEffect::Fail(request)) => {
+                    access
+                        .fail_session_refresh_result(request)
+                        .await
+                        .map_err(map_error)?;
+                    return Err(LcmError::Db(
+                        "selected session projection terminally failed".to_owned(),
+                    ));
+                }
+                Ok(SessionTemporalRefreshEffect::Deferred) => {
+                    return Err(LcmError::StaleSummaryGeneration {
+                        expected: i64::try_from(
+                            recovery.frozen_watermarks().active_generation().value(),
+                        )
+                        .map_err(|error| LcmError::Db(error.to_string()))?,
+                        actual: i64::try_from(recovery.candidate_generation().value())
+                            .map_err(|error| LcmError::Db(error.to_string()))?,
+                    });
+                }
+            }
+            let updated = access
+                .session_refresh_recovery_result(&session)
+                .await
+                .map_err(map_error)?
+                .ok_or_else(|| {
+                    LcmError::Db("selected refresh ownership changed during projection".to_owned())
+                })?;
+            recovery = updated;
+        }
+        if recovery.restart_state() != SessionRefreshRestartStateV1::ReadyToComplete {
+            return Err(LcmError::StaleSummaryGeneration {
+                expected: i64::try_from(recovery.frozen_watermarks().active_generation().value())
+                    .map_err(|error| LcmError::Db(error.to_string()))?,
+                actual: i64::try_from(recovery.candidate_generation().value())
+                    .map_err(|error| LcmError::Db(error.to_string()))?,
+            });
+        }
+        let progress = recovery
+            .progress()
+            .ok_or_else(|| LcmError::Db("ready refresh lacks durable progress".to_owned()))?;
+        let request = SessionRefreshCompletionRequestV1::new(
+            recovery.operation_id().clone(),
+            session,
+            progress.frontier(),
+            *progress.coverage(),
+        )
+        .map_err(|error| LcmError::Db(error.to_string()))?;
+        let request = match progress.source_coverage() {
+            Some(coverage) => request.with_source_coverage(coverage.clone()),
+            None => request,
+        };
+        access
+            .complete_session_refresh_result(request, self.control.execution_control())
+            .await
+            .map_err(map_error)?;
+        self.control.checkpoint()
+    }
+
     async fn commit_compression(
         &self,
         request: &LcmCompressionRequest,
-    ) -> Result<LcmCompressionResponse, LcmError> {
+        source_guard: Option<(&tracedecay_lcm::LcmSummaryRequest, i64)>,
+    ) -> Result<(LcmCompressionResponse, Option<i64>), LcmError> {
         let execution = self.control.execution_control();
         let before_commit = self.control.clone();
         self.control
             .execute(
                 &execution,
                 tracing::Instrument::instrument(
-                    self.db.lcm_compress_guarded(request, &execution, move || {
-                        before_commit.checkpoint()
-                    }),
+                    self.db
+                        .lcm_compress_guarded(request, &execution, source_guard, move || {
+                            before_commit.checkpoint()
+                        }),
                     tracing::trace_span!("daemon.lcm.commit"),
                 ),
             )
@@ -276,7 +444,7 @@ impl DaemonLcmEffectService {
         convergence_candidate: Option<
             &tracedecay_lcm::summary_convergence::LcmSummaryConvergenceCandidate,
         >,
-        expected_summary_source_range: Option<&tracedecay_lcm::LcmSummarySourceRange>,
+        expected_summary: Option<&tracedecay_lcm::LcmSummaryRequest>,
     ) -> Result<tracedecay_lcm::summary_convergence::LcmBoundedCompressionResponse, LcmError> {
         // A retained pass can perform one planning scan and one commit scan.
         // Split the existing page budgets between those phases so the whole
@@ -296,9 +464,11 @@ impl DaemonLcmEffectService {
                         tracedecay_lcm::compression::RetainedCompressionGuard {
                             row_limit: RETAINED_PHASE_ROWS,
                             byte_limit: RETAINED_PHASE_BYTES,
-                            expected_summary_source_range: expected_summary_source_range.cloned(),
+                            expected_summary_source_range: expected_summary
+                                .map(|summary| summary.source_range.clone()),
                         },
                         convergence_candidate,
+                        expected_summary,
                     ),
                     tracing::trace_span!("daemon.lcm.retained_commit"),
                 ),

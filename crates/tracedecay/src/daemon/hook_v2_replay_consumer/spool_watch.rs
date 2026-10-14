@@ -39,7 +39,19 @@ struct WatchTargets {
 
 struct WatchedSpool {
     project: SpooledProject,
-    consumer: Option<Arc<Notify>>,
+    consumers: BTreeMap<PathBuf, Arc<Notify>>,
+}
+
+impl WatchedSpool {
+    fn detach(&mut self, project_root: &Path, consumer: &Arc<Notify>) {
+        if self
+            .consumers
+            .get(project_root)
+            .is_some_and(|current| Arc::ptr_eq(current, consumer))
+        {
+            self.consumers.remove(project_root);
+        }
+    }
 }
 
 struct SpoolWatch {
@@ -86,8 +98,10 @@ pub(super) fn watch_project(project: &SpooledProject, consumer: Option<Arc<Notif
             };
             if let Some(watched) = targets.spools.get_mut(&project.data_root) {
                 watched.project = project.clone();
-                if consumer.is_some() {
-                    watched.consumer = consumer;
+                if let Some(consumer) = consumer {
+                    watched
+                        .consumers
+                        .insert(project.project_root.clone(), consumer);
                 }
                 return;
             }
@@ -121,7 +135,10 @@ pub(super) fn watch_project(project: &SpooledProject, consumer: Option<Arc<Notif
                 project.data_root.clone(),
                 WatchedSpool {
                     project: project.clone(),
-                    consumer,
+                    consumers: consumer
+                        .into_iter()
+                        .map(|consumer| (project.project_root.clone(), consumer))
+                        .collect(),
                 },
             );
         }
@@ -167,12 +184,15 @@ fn wake_for_append(targets: &StdMutex<WatchTargets>, event: &notify::Event) {
         else {
             continue;
         };
-        match (&watched.consumer, &targets.opener) {
-            (Some(consumer), _) => consumer.notify_one(),
-            (None, Some(opener)) => {
-                let _ = opener.send(watched.project.clone());
+        if !watched.consumers.is_empty() {
+            for consumer in watched.consumers.values() {
+                consumer.notify_one();
             }
-            (None, None) => {}
+        }
+        // A mounted sibling does not own every scope in this shared spool.
+        // The opener resolves the exact owed scopes through registry authority.
+        if let Some(opener) = &targets.opener {
+            let _ = opener.send(watched.project.clone());
         }
     }
 }
@@ -189,7 +209,7 @@ pub(super) fn attach_consumer(data_root: &Path, project_root: &Path, consumer: A
 }
 
 /// Once its consumer stops, a project's next append opens it again.
-pub(super) fn detach_consumer(data_root: &Path) {
+pub(super) fn detach_consumer(data_root: &Path, project_root: &Path, consumer: &Arc<Notify>) {
     let Ok(watch) = spool_watch().lock() else {
         return;
     };
@@ -199,8 +219,24 @@ pub(super) fn detach_consumer(data_root: &Path) {
     if let Ok(mut targets) = watch.targets.lock()
         && let Some(watched) = targets.spools.get_mut(data_root)
     {
-        watched.consumer = None;
+        watched.detach(project_root, consumer);
     }
+}
+
+/// Settlement changed shared owed state. Peers refresh their status once,
+/// without a watch on cursor, compaction, or acknowledgement writes.
+pub(super) fn wake_peer_consumers(data_root: &Path, project_root: &Path) {
+    with_watch(|watch| {
+        if let Ok(targets) = watch.targets.lock()
+            && let Some(watched) = targets.spools.get(data_root)
+        {
+            for (root, consumer) in &watched.consumers {
+                if root != project_root {
+                    consumer.notify_one();
+                }
+            }
+        }
+    });
 }
 
 pub(super) fn install_opener(opener: mpsc::UnboundedSender<SpooledProject>) {
@@ -211,15 +247,101 @@ pub(super) fn install_opener(opener: mpsc::UnboundedSender<SpooledProject>) {
     });
 }
 
-pub(super) fn consumer_attached(data_root: &Path) -> bool {
+pub(super) fn consumer_attached(data_root: &Path, project_root: &Path) -> bool {
     spool_watch().lock().is_ok_and(|watch| {
         watch.as_ref().is_some_and(|watch| {
             watch.targets.lock().is_ok_and(|targets| {
                 targets
                     .spools
                     .get(data_root)
-                    .is_some_and(|watched| watched.consumer.is_some())
+                    .is_some_and(|watched| watched.consumers.contains_key(project_root))
             })
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shared_spool_append_wakes_siblings_and_an_old_detach_preserves_its_successor() {
+        let root = PathBuf::from("hook-watch-fixture");
+        let first = root.join("first");
+        let sibling = root.join("sibling");
+        let old = Arc::new(Notify::new());
+        let successor = Arc::new(Notify::new());
+        let peer = Arc::new(Notify::new());
+        let watched = WatchedSpool {
+            project: SpooledProject {
+                project_root: first.clone(),
+                data_root: root.clone(),
+            },
+            consumers: BTreeMap::from([
+                (first.clone(), Arc::clone(&old)),
+                (sibling.clone(), Arc::clone(&peer)),
+            ]),
+        };
+        let (opener, mut requests) = mpsc::unbounded_channel();
+        let targets = Arc::new(StdMutex::new(WatchTargets {
+            spools: BTreeMap::from([(root.clone(), watched)]),
+            opener: Some(opener),
+        }));
+        let installed = Arc::new(std::sync::Barrier::new(2));
+        let obsolete_detach = std::thread::spawn({
+            let targets = Arc::clone(&targets);
+            let installed = Arc::clone(&installed);
+            let first = first.clone();
+            let root = root.clone();
+            let old = Arc::clone(&old);
+            move || {
+                installed.wait();
+                targets
+                    .lock()
+                    .unwrap()
+                    .spools
+                    .get_mut(&root)
+                    .unwrap()
+                    .detach(&first, &old);
+            }
+        });
+        targets
+            .lock()
+            .unwrap()
+            .spools
+            .get_mut(&root)
+            .unwrap()
+            .consumers
+            .insert(first.clone(), Arc::clone(&successor));
+        installed.wait();
+        obsolete_detach.join().unwrap();
+        let event = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Content,
+        )))
+        .add_path(
+            root.join("hook-v2-spool/codex")
+                .join(HOOK_SPOOL_RECORDS_FILE),
+        );
+        wake_for_append(&targets, &event);
+        assert_eq!(requests.try_recv().unwrap().data_root, root);
+        tokio::time::timeout(std::time::Duration::from_millis(100), successor.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(100), peer.notified())
+            .await
+            .unwrap();
+        assert_eq!(targets.lock().unwrap().spools[&root].consumers.len(), 2);
+        targets
+            .lock()
+            .unwrap()
+            .spools
+            .get_mut(&root)
+            .unwrap()
+            .detach(&first, &successor);
+        wake_for_append(&targets, &event);
+        tokio::time::timeout(std::time::Duration::from_millis(100), peer.notified())
+            .await
+            .unwrap();
+        assert_eq!(targets.lock().unwrap().spools[&root].consumers.len(), 1);
+    }
 }

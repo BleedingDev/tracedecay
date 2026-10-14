@@ -6614,6 +6614,7 @@ dependencies = [
  "tracedecay-code-index-retention",
  "tracedecay-code-index-runtime",
  "tracedecay-contracts",
+ "tracedecay-daemon-identity",
  "tracedecay-domain",
  "tracedecay-global-db",
  "tracedecay-graph-db",

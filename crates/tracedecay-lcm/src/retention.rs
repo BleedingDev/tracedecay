@@ -1,7 +1,7 @@
 //! Projection-durability-aware session retention (plan 38 §3 and §4).
 //!
-//! `lcm_raw_messages` is the one stored copy of each message body; session
-//! message readers and the FTS index read that same row. Plan 38 §3
+//! Raw rows own either inline content or a reference to a shared, compressed
+//! canonical body; session readers hydrate through that same authority. Plan 38 §3
 //! ("session retention policy") keeps raw rows only until their LCM
 //! summary lineage is durable, then offloads or drops them under a
 //! configurable window.
@@ -27,11 +27,15 @@
 //! 1. **Drop** (terminal, longest window): projection-durable raw rows past
 //!    `drop_after_days` are deleted. Any now unreferenced external payload is
 //!    reaped by the existing payload GC.
-//! 2. **Offload** (recoverable, shorter window): projection-durable *inline*
-//!    raw rows past `offload_after_days` have their bulky `content`
-//!    externalized to the content-addressed store (deduplicated by hash) and
+//! 2. **Offload** (recoverable, shorter window): projection-durable raw rows
+//!    past `offload_after_days` with content stored directly in their `content`
+//!    column have that content externalized to the content-addressed store
+//!    (deduplicated by hash) and
 //!    replaced with a recoverable placeholder, reclaiming the inline column and
 //!    its FTS shadow.
+//!    Canonical bodies already live once by hash, compressed when smaller, and
+//!    remain there until their last owner releases them. Offloading them would
+//!    create another plaintext copy without reclaiming the shared body.
 //!
 //! Every pass is bounded (`max_batch_size`) and incremental so the daemon can
 //! schedule it off the hot path without competing with foreground writes, and a

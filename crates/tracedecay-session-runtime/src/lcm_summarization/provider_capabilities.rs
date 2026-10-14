@@ -11,8 +11,10 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use serde_json::Value;
+use tracedecay_contracts::automation::AgentTaskFailureClass;
 use tracedecay_domain::configuration::{LcmSummarizerExecutableV1, LcmSummarizerExecutablesV1};
 use tracedecay_domain::{CanonicalObservationEnvelopeV1, CanonicalObservationFactV1};
+use tracedecay_sessions::runtime::hosts::codex_app_server::CodexAppServerError;
 
 use tracedecay_lcm::{LcmError, LcmSummaryRequest};
 use tracedecay_runtime_core::db::{
@@ -253,8 +255,8 @@ async fn claude_summary_pair_is_exact(
     Ok(anchor == Some(summary_id.as_str()))
 }
 
-type AuthoritativeSummaryFuture =
-    Pin<Box<dyn Future<Output = Result<AuthoritativeSummary, SummaryResolutionError>> + Send>>;
+type AuthoritativeSummaryFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<AuthoritativeSummary, SummaryResolutionError>> + Send + 'a>>;
 
 /// One provider's ability to be asked for a summary it has not already stored.
 ///
@@ -262,12 +264,12 @@ type AuthoritativeSummaryFuture =
 /// provider is unconfigured returns its typed `*_unconfigured` reason without
 /// spawning anything; there is no ambient executable lookup behind it.
 pub(super) trait AuthoritativeSummarizerV1: Sync {
-    fn summarize(
+    fn summarize<'a>(
         &self,
-        request: LcmSummaryRequest,
+        request: &'a LcmSummaryRequest,
         timeout: Duration,
         executables: &LcmSummarizerExecutablesV1,
-    ) -> AuthoritativeSummaryFuture;
+    ) -> AuthoritativeSummaryFuture<'a>;
 }
 
 /// Reason reported while a provider's summarizer executable is unconfigured.
@@ -286,19 +288,26 @@ fn configured_timeout(executable: &LcmSummarizerExecutableV1, caller: Duration) 
 struct CursorAgentSummarizerV1;
 
 impl AuthoritativeSummarizerV1 for CursorAgentSummarizerV1 {
-    fn summarize(
+    fn summarize<'a>(
         &self,
-        request: LcmSummaryRequest,
+        request: &'a LcmSummaryRequest,
         timeout: Duration,
         executables: &LcmSummarizerExecutablesV1,
-    ) -> AuthoritativeSummaryFuture {
+    ) -> AuthoritativeSummaryFuture<'a> {
         let executable = executables.cursor_agent.clone();
         Box::pin(cursor_agent_summary(request, timeout, executable))
     }
 }
 
+struct CancelCursorSummaryOnDrop(tracedecay_runtime_core::cancellation::CancellationToken);
+impl Drop for CancelCursorSummaryOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 async fn cursor_agent_summary(
-    request: LcmSummaryRequest,
+    request: &LcmSummaryRequest,
     timeout: Duration,
     executable: LcmSummarizerExecutableV1,
 ) -> Result<AuthoritativeSummary, SummaryResolutionError> {
@@ -313,10 +322,16 @@ async fn cursor_agent_summary(
         timeout: configured_timeout(&executable, timeout),
     };
     let source_range = request.source_range.clone();
-    let text = tokio::task::spawn_blocking(move || summarize_with_cursor_agent(&request, &config))
-        .await
-        .map_err(|_| SummaryResolutionError::Unavailable("cursor_agent_unavailable"))?
-        .map_err(|_| SummaryResolutionError::Unavailable("cursor_agent_unavailable"))?;
+    let request = request.clone();
+    let cancellation = tracedecay_runtime_core::cancellation::CancellationToken::new();
+    let cancel_on_drop = CancelCursorSummaryOnDrop(cancellation.clone());
+    let text = tokio::task::spawn_blocking(move || {
+        summarize_with_cursor_agent(&request, &config, &cancellation)
+    })
+    .await
+    .map_err(|_| SummaryResolutionError::Unavailable("cursor_agent_unavailable"))?
+    .map_err(|_| SummaryResolutionError::Unavailable("cursor_agent_unavailable"))?;
+    drop(cancel_on_drop);
     Ok(AuthoritativeSummary {
         text,
         route: "cursor_agent".to_string(),
@@ -327,19 +342,29 @@ async fn cursor_agent_summary(
 struct CodexAppServerSummarizerV1;
 
 impl AuthoritativeSummarizerV1 for CodexAppServerSummarizerV1 {
-    fn summarize(
+    fn summarize<'a>(
         &self,
-        request: LcmSummaryRequest,
+        request: &'a LcmSummaryRequest,
         timeout: Duration,
         executables: &LcmSummarizerExecutablesV1,
-    ) -> AuthoritativeSummaryFuture {
+    ) -> AuthoritativeSummaryFuture<'a> {
         let executable = executables.codex.clone();
         Box::pin(codex_app_server_summary(request, timeout, executable))
     }
 }
 
+struct CancelCodexSummaryOnDrop(
+    tracedecay_sessions::runtime::hosts::codex_app_server::CodexAppServerCancellation,
+);
+
+impl Drop for CancelCodexSummaryOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 async fn codex_app_server_summary(
-    request: LcmSummaryRequest,
+    request: &LcmSummaryRequest,
     timeout: Duration,
     executable: LcmSummarizerExecutableV1,
 ) -> Result<AuthoritativeSummary, SummaryResolutionError> {
@@ -350,19 +375,25 @@ async fn codex_app_server_summary(
     };
     let mut config =
         tracedecay_sessions::runtime::hosts::codex_app_server::CodexAppServerSummaryConfig::for_executable(codex_bin);
-    if let Some(model) = executable.model() {
-        config.model = Some(model.to_owned());
-    }
+    config.model = executable.model().map(str::to_owned);
     config.timeout = configured_timeout(&executable, timeout);
     let source_range = request.source_range.clone();
+    let request = request.clone();
+    let cancellation =
+        tracedecay_sessions::runtime::hosts::codex_app_server::CodexAppServerCancellation::default(
+        );
+    let cancel_on_drop = CancelCodexSummaryOnDrop(cancellation.clone());
     let result = tokio::task::spawn_blocking(move || {
         tracedecay_sessions::runtime::hosts::codex_app_server::summarize_with_codex_app_server(
-            &request, &config,
+            &request,
+            &config,
+            Some(&cancellation),
         )
     })
     .await
-    .map_err(|_| SummaryResolutionError::Unavailable("codex_app_server_unavailable"))?
-    .map_err(|_| SummaryResolutionError::Unavailable("codex_app_server_unavailable"))?;
+    .map_err(|_| codex_summary_failure_class(AgentTaskFailureClass::Retryable))?
+    .map_err(codex_summary_failure)?;
+    drop(cancel_on_drop);
     Ok(AuthoritativeSummary {
         text: result.text,
         route: result.model.map_or_else(
@@ -371,6 +402,24 @@ async fn codex_app_server_summary(
         ),
         source_range: LcmPredecessorRangeState::Interval(source_range),
     })
+}
+
+fn codex_summary_failure(error: CodexAppServerError) -> SummaryResolutionError {
+    codex_summary_failure_class(error.class)
+}
+
+fn codex_summary_failure_class(class: AgentTaskFailureClass) -> SummaryResolutionError {
+    let reason = match class {
+        AgentTaskFailureClass::Retryable => "codex_app_server_retryable",
+        AgentTaskFailureClass::Permanent => "codex_app_server_permanent",
+        AgentTaskFailureClass::Timeout => "codex_app_server_timeout",
+        AgentTaskFailureClass::Unavailable => "codex_app_server_unavailable",
+        AgentTaskFailureClass::Denied => "codex_app_server_denied",
+        AgentTaskFailureClass::Disconnected => "codex_app_server_disconnected",
+        AgentTaskFailureClass::MalformedOutput => "codex_app_server_malformed_output",
+        AgentTaskFailureClass::InputTooLarge => "codex_app_server_input_too_large",
+    };
+    SummaryResolutionError::Storage(LcmError::SummarizerFailed { class, reason })
 }
 
 /// The on-demand summarizer registry. A provider absent from this table has no

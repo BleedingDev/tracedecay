@@ -422,6 +422,23 @@ pub(super) const TABLES: &[Table] = &[
         []
     ),
     table!(
+        "session_canonical_body_references",
+        [
+            column("owner_kind", "TEXT", true, None, 1),
+            column("owner_key", "TEXT", true, None, 2),
+            column("content_hash", "TEXT", true, None, 3),
+        ],
+        []
+    ),
+    table!(
+        "observation_repository_capture_references",
+        [
+            column("observation_id", "TEXT", false, None, 1),
+            column("capture_id", "TEXT", true, None, 0),
+        ],
+        []
+    ),
+    table!(
         "retrieval_anchor_aliases",
         [
             column("owner_json", "TEXT", true, None, 1),
@@ -490,6 +507,40 @@ pub(super) const TABLES: &[Table] = &[
                 Some("0"),
                 0
             ),
+        ],
+        []
+    ),
+    table!(
+        "authority_cursor_audit_pending",
+        [
+            column("source_json", "TEXT", true, None, 1),
+            column("scope_json", "TEXT", true, None, 2),
+            column("observation_sequence", "INTEGER", true, None, 0),
+            column("cursor_json", "TEXT", true, None, 0),
+        ],
+        []
+    ),
+    table!(
+        "authority_projection_repair_progress",
+        [
+            column("audit_name", "TEXT", false, None, 1),
+            column("original_checkpoint", "INTEGER", true, None, 0),
+            column("observation_frontier", "INTEGER", true, None, 0),
+            column("scan_sequence", "INTEGER", true, None, 0),
+            column("repaired_checkpoint", "INTEGER", true, None, 0),
+            column("queue_rowid", "INTEGER", true, None, 0),
+            column("enqueue_sequence", "INTEGER", true, None, 0),
+            column("stage", "TEXT", true, None, 0),
+        ],
+        []
+    ),
+    table!(
+        "authority_foreign_key_audit_progress",
+        [
+            column("audit_name", "TEXT", false, None, 1),
+            column("audit_generation", "TEXT", true, Some("''"), 0),
+            column("last_table", "TEXT", true, None, 0),
+            column("last_rowid", "INTEGER", false, None, 0),
         ],
         []
     ),
@@ -1697,6 +1748,20 @@ pub(super) const INDEX_DESCENDING_COLUMNS: &[(&str, &[&str])] = &[
 pub(super) const INDEX_EXPRESSION_COLUMN: &str = "<expression>";
 
 pub(super) const INDEXES: &[Index] = &[
+    Index {
+        table: "session_canonical_body_references",
+        name: Some("idx_session_canonical_body_references_hash"),
+        unique: false,
+        origin: "c",
+        columns: &["content_hash"],
+    },
+    Index {
+        table: "observation_repository_capture_references",
+        name: Some("idx_observation_repository_capture_references_capture"),
+        unique: false,
+        origin: "c",
+        columns: &["capture_id"],
+    },
     Index {
         table: "code_projects",
         name: Some("idx_code_projects_last_seen_project"),
