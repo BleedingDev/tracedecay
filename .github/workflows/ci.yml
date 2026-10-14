@@ -378,10 +378,10 @@ jobs:
           test-tools: "true"
           save-download-caches: ${{ matrix.shard == 'root-b' }}
 
-      # Compile latency-sensitive root journeys before any test starts.
+      # Materialize build outputs before deadline-bearing tests: remote-cache
+      # downloads otherwise compete for disk even with HOST_CPUS reserved.
       # ort-sys needs an explicit cache directory in Depot's macOS sandbox.
-      - name: Build root suite binaries
-        if: ${{ startsWith(matrix.shard, 'root-') }}
+      - name: Build this shard's test binaries
         shell: bash
         run: >-
           bazel build --config=ci --action_env=ORT_CACHE_DIR=/tmp/ort.pyke.io
