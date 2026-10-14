@@ -34,6 +34,9 @@ build "--strategy_regexp=Compiling Rust bin build_script_build_.*=local"
 build --strategy=Rustc=local
 build --strategy=RustcMetadata=local
 build --jobs=4
+# Depot's Windows runners carry no runner bazelrc, so the local ceiling above
+# binds there and held an 8-vCPU runner at four actions. Use the cores.
+build:windows --jobs=HOST_CPUS
 build:linux "--@rules_rust//rust/settings:extra_rustc_flag=-Csplit-debuginfo=unpacked"
 # Skip LLVM bitcode in rlibs. Thin LTO (dist) re-enables it below; other
 # configs never ran LTO, so the bitcode was paid compile cost with no

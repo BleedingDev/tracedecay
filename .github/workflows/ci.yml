@@ -545,12 +545,44 @@ jobs:
       - name: Require every Linux test shard
         run: test "${{ needs.linux-test.result }}" = "success"
 
+  # Three shards, not the six macOS and Linux use: every Windows invocation
+  # pays about five minutes of loading and analysis, and the whole-workspace
+  # job ran its test tail strictly one suite at a time (mcp_suite alone held
+  # the runner for twelve minutes), so the root suites with long poles get a
+  # shard of their own and the rest of the root crate another.
   windows-test:
-    name: Windows checks
+    name: Windows checks (${{ matrix.shard }})
     needs: [scope-gate, gates]
     if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
     runs-on: ${{ vars.DEPOT_WINDOWS_RUNNER || 'windows-latest' }}
     timeout-minutes: 330
+    env:
+      CARGO_BAZEL_TIMEOUT: "3600"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: root-a
+            targets: >-
+              //crates/tracedecay:mcp_suite
+              //crates/tracedecay:dashboard_api_test
+              //crates/tracedecay:daemon_suite
+              //crates/tracedecay:storage_suite
+              //crates/tracedecay-cli:refresh_memory_journey
+          - shard: root-b
+            targets: >-
+              --
+              //crates/tracedecay/...
+              -//crates/tracedecay:mcp_suite
+              -//crates/tracedecay:dashboard_api_test
+              -//crates/tracedecay:daemon_suite
+              -//crates/tracedecay:storage_suite
+          - shard: workspace
+            targets: >-
+              --
+              //...
+              -//crates/tracedecay/...
+              -//crates/tracedecay-cli:refresh_memory_journey
     steps:
       # Full history: the search-quality workload fixture pins a
       # `source_repository_commit`, and `validate_source_bindings` resolves that
@@ -564,17 +596,20 @@ jobs:
         with:
           redirect-temp: "true"
 
+      # All Windows shards restore this prefix; the workspace shard alone
+      # saves the download caches so matrix jobs cannot race one cache key.
       - uses: ./.github/actions/setup-bazel
         id: bazel
         with:
           cache-key: ci-windows-test
           test-tools: ${{ needs.scope-gate.outputs.run-os }}
-          save-download-caches: "true"
+          save-download-caches: ${{ matrix.shard == 'workspace' }}
 
       # Check the shipped MSVC target without linking test executables or
       # applying Linux's Clippy warning policy to this compiler-only check.
+      # One shard covers the whole workspace; the others have nothing to add.
       - name: Compile the Windows workspace
-        if: ${{ needs.scope-gate.outputs.run-os != 'true' }}
+        if: ${{ needs.scope-gate.outputs.run-os != 'true' && matrix.shard == 'workspace' }}
         shell: bash
         run: >-
           bazel build --config=ci
@@ -583,29 +618,64 @@ jobs:
           --@rules_rust//rust/settings:clippy_flag=-Aclippy::all
           //...
 
-      # `bazel test` builds every target in the pattern, so tests start
-      # while the rest of the workspace still links.
-      - name: Build and test the workspace
+      # Materialize build outputs before deadline-bearing tests: a test that
+      # reserves HOST_CPUS otherwise parks the remaining compiles behind it
+      # for its whole run.
+      - name: Build this shard's test binaries
         if: ${{ needs.scope-gate.outputs.run-os == 'true' }}
         shell: bash
-        run: bazel test --config=ci //...
+        run: >-
+          bazel build --config=ci
+          --profile="${{ runner.temp }}/bazel-build-profile.json.gz"
+          ${{ matrix.targets }}
+
+      - name: Build and test this shard
+        if: ${{ needs.scope-gate.outputs.run-os == 'true' }}
+        shell: bash
+        run: >-
+          bazel test --config=ci
+          --profile="${{ runner.temp }}/bazel-test-profile.json.gz"
+          ${{ matrix.targets }}
+
+      - name: Upload Bazel execution profiles
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bazel-profiles-${{ runner.os }}-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/bazel-build-profile.json.gz
+            ${{ runner.temp }}/bazel-test-profile.json.gz
+          retention-days: 7
+          if-no-files-found: ignore
 
       - name: Upload failed test diagnostics
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: bazel-test-logs-${{ runner.os }}
+          name: bazel-test-logs-${{ runner.os }}-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: |
             bazel-testlogs/**/test.log
             bazel-testlogs/**/test.xml
 
-      # This single Windows job retains outputs for later pushes to the same PR.
+      # The workspace shard alone saves compiled actions so matrix jobs
+      # cannot race the same Actions cache key.
       - name: Save compiled Bazel actions
-        if: always() && !cancelled() && (github.ref == 'refs/heads/master' || github.event_name == 'pull_request') && steps.bazel.outputs.disk-cache-key != ''
+        if: always() && !cancelled() && (github.ref == 'refs/heads/master' || github.event_name == 'pull_request') && matrix.shard == 'workspace' && steps.bazel.outputs.disk-cache-key != ''
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.bazel.outputs.disk-cache-path }}
           key: ${{ steps.bazel.outputs.disk-cache-key }}
+
+  # Preserves the "Windows checks" check name for branch protection.
+  windows-test-result:
+    name: Windows checks
+    needs: [scope-gate, windows-test]
+    if: ${{ always() && !cancelled() && needs.scope-gate.outputs.run-heavy == 'true' }}
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    steps:
+      - name: Require every Windows shard
+        run: test "${{ needs.windows-test.result }}" = "success"
 
   # Blocking Clippy policy over every Bazel Rust target, the
   # `cargo clippy --workspace --all-targets -D warnings` equivalent.
