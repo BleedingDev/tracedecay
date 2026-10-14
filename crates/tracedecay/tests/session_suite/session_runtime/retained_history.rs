@@ -8,13 +8,9 @@ use std::time::Duration;
 
 use serde_json::json;
 use tempfile::TempDir;
-#[cfg(unix)]
 use tracing::Subscriber;
-#[cfg(unix)]
 use tracing::span::{Attributes, Id};
-#[cfg(unix)]
 use tracing_subscriber::Layer;
-#[cfg(unix)]
 use tracing_subscriber::layer::{Context, SubscriberExt};
 
 use super::SessionTemporalRefreshTestAuthority;
@@ -29,7 +25,6 @@ use tracedecay_domain::{
     SessionId, UtcMicros,
 };
 use tracedecay_global_db::{RegisteredGlobalDb, RegisteredGlobalDbLeaseV1};
-#[cfg(unix)]
 use tracedecay_session_runtime::session_sync::test_harness::SessionTemporalRefreshWakeState;
 use tracedecay_session_runtime::session_sync::test_harness::configure_scheduler;
 use tracedecay_session_runtime::session_temporal_refresh_scheduler::history::{
@@ -41,17 +36,14 @@ use tracedecay_session_runtime::session_temporal_refresh_scheduler::projector::{
     SessionTemporalRefreshProjectionFuture, SessionTemporalRefreshProjector,
 };
 use tracedecay_session_runtime::session_temporal_refresh_scheduler::registry::SessionTemporalRefreshSchedulerRegistry;
-#[cfg(unix)]
 use tracedecay_session_runtime::session_temporal_refresh_scheduler::run_session_temporal_refresh_pass;
-#[cfg(unix)]
 use tracedecay_session_runtime::session_temporal_refresh_scheduler::wake::{
     SessionTemporalRefreshRetryClass, SessionTemporalRefreshUnavailableReason,
 };
-use tracedecay_session_temporal_store::{SessionRefreshRecoveryV1, SessionTemporalStore};
+use tracedecay_session_temporal_store::SessionRefreshRecoveryV1;
 use tracedecay_store::{
     AnchoredObservationWrite, ObservationPersistOutcome, ObservationProjectionStore,
-    ObservationStore, ObservationWrite, SessionRefreshBeginOrJoinRequestV1,
-    SessionRefreshFrontierV1, SessionRefreshStore, build_observation_resolution_authorization_v1,
+    ObservationStore, ObservationWrite, build_observation_resolution_authorization_v1,
     build_observation_retrieval_anchor,
 };
 
@@ -531,10 +523,8 @@ async fn wait_until(predicate: impl Fn() -> bool, timeout: Duration) -> bool {
     true
 }
 
-#[cfg(unix)]
 struct SummaryConvergencePageCensus(Arc<AtomicUsize>);
 
-#[cfg(unix)]
 impl<S: Subscriber> Layer<S> for SummaryConvergencePageCensus {
     fn on_new_span(&self, attributes: &Attributes<'_>, _id: &Id, _context: Context<'_, S>) {
         if attributes.metadata().name() == "daemon.lcm.summary_convergence.page" {
@@ -543,16 +533,22 @@ impl<S: Subscriber> Layer<S> for SummaryConvergencePageCensus {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test]
-async fn initial_projection_identity_failure_withholds_summary_admission_until_recovery() {
+async fn initial_projection_discovery_failure_withholds_summary_admission_until_recovery() {
     let temp = TempDir::new().unwrap();
-    let authority = profile_authority(&temp, "history-initial-identity-failure").await;
+    let authority = profile_authority(&temp, "history-initial-discovery-failure").await;
     let path = authority.database().db_path().to_path_buf();
-    let displaced = path.with_extension("displaced");
-    // Move the fixture's sole file; restoring it preserves the retained inode
-    // authority without copying a store or changing any database contents.
-    std::fs::rename(&path, &displaced).unwrap();
+    // Cached readers survive pathname loss. Temporarily withhold the discovery
+    // table through the registered writer so the real refresh query must fail.
+    authority
+        .database()
+        .writer_connection()
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE session_refresh_operations RENAME TO unavailable_session_refresh_operations",
+        )
+        .await
+        .unwrap();
     let pages = Arc::new(AtomicUsize::new(0));
     let _capture = tracedecay_runtime_core::logging::set_tracing_capture(
         tracing_subscriber::registry().with(SummaryConvergencePageCensus(Arc::clone(&pages))),
@@ -569,10 +565,6 @@ async fn initial_projection_identity_failure_withholds_summary_admission_until_r
         Some(SessionTemporalRefreshRetryClass::Storage)
     );
     assert_eq!(report.backlog, None);
-    assert!(
-        !path.exists(),
-        "the refused read must not recreate the database"
-    );
 
     let ingestor = Arc::new(ScriptedHistoricalIngestor::new([
         SessionHistoricalIngestOutcome::Complete,
@@ -602,12 +594,19 @@ async fn initial_projection_identity_failure_withholds_summary_admission_until_r
     );
     assert_eq!(ingestor.passes.load(Ordering::Acquire), 1);
 
-    std::fs::rename(&displaced, &path).unwrap();
-    assert!(!displaced.exists());
+    authority
+        .database()
+        .writer_connection()
+        .unwrap()
+        .execute_batch(
+            "ALTER TABLE unavailable_session_refresh_operations RENAME TO session_refresh_operations",
+        )
+        .await
+        .unwrap();
     assert!(wake.wake_and_wait_until_idle(Duration::from_secs(2)).await);
     assert!(
         pages.load(Ordering::Acquire) > 0,
-        "restoring the exact store must admit convergence and prove the census is live"
+        "restoring the discovery table must admit convergence and prove the census is live"
     );
     assert_eq!(ingestor.passes.load(Ordering::Acquire), 1);
     registry.shutdown().await;
@@ -736,13 +735,12 @@ async fn history_only_retry_does_not_admit_projection_snapshots() {
         projector.clone(),
         SessionTemporalRefreshPolicy::default(),
     );
-    SessionTemporalStore::new(authority.database())
-        .begin_or_join_session_refresh(SessionRefreshBeginOrJoinRequestV1::new(
-            SessionId::new("session.history-only-retry").unwrap(),
-            SessionRefreshFrontierV1::new(1, 0).unwrap(),
-        ))
-        .await
-        .unwrap();
+    let seeded = HealthyProvidersWithBlockedCursorIngestor::new(authority.database.clone());
+    assert!(
+        seeded
+            .admit_healthy_provider("claude", "session.history-only-retry")
+            .await
+    );
 
     let wake = registry
         .ensure_profile_with_history(
@@ -769,13 +767,11 @@ async fn history_only_retry_does_not_admit_projection_snapshots() {
     let baseline_projection_calls = projector.calls.load(Ordering::Acquire);
     assert!(baseline_projection_calls > 0);
 
-    SessionTemporalStore::new(authority.database())
-        .begin_or_join_session_refresh(SessionRefreshBeginOrJoinRequestV1::new(
-            SessionId::new("session.history-only-explicit-wake").unwrap(),
-            SessionRefreshFrontierV1::new(1, 0).unwrap(),
-        ))
-        .await
-        .unwrap();
+    assert!(
+        seeded
+            .admit_healthy_provider("codex", "session.history-only-explicit-wake")
+            .await
+    );
 
     registry
         .ensure_profile_with_history(
