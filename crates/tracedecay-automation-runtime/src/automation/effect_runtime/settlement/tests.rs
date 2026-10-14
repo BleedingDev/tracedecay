@@ -2297,7 +2297,7 @@ async fn a_runner_failure_without_a_record_publishes_its_failed_ledger_row() {
         .start_retained_automation_settlement(
             retained,
             None,
-            |_: ()| -> (
+            |(): ()| -> (
                 AutomationRunLedgerRecord,
                 Option<AutomationCommittedReceipt>,
             ) { panic!("a failed runner result must not reach the projector") },
