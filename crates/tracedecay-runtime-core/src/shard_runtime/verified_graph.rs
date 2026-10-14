@@ -126,6 +126,16 @@ impl VerifiedGraphRuntimeWeakProxyV1 {
         }
     }
 
+    /// Whether the runtime this proxy routes to has been published.
+    ///
+    /// A deferred proxy answers every operation with a typed unavailable
+    /// error until its activation cell is filled; a caller that would rather
+    /// wait for the activation than report it as missing polls this.
+    #[must_use]
+    pub fn activation_completed(&self) -> bool {
+        self.resolved_weak().is_some()
+    }
+
     fn resolved_weak(&self) -> Option<&Weak<dyn VerifiedGraphRuntimePortV1>> {
         match &self.runtime {
             VerifiedGraphRuntimeSlotV1::Bound(runtime) => Some(runtime),
