@@ -313,6 +313,13 @@ jobs:
                     | sed -E 's/0x[0-9a-f]+/0xX/g; s/\.tmp[A-Za-z0-9]+/.tmpX/g' \
                     | sort | uniq -c | sort -rn | head -10
                 } >> "$samples/mcp_suite.txt"
+                # Once descriptors pile up, record every thread's stack once:
+                # the threads that never exit name what keeps them open.
+                open_now=$(($(wc -l < "$samples/lsof.tmp") - 1))
+                if [ "$open_now" -gt 8000 ] && [ ! -e "$samples/stacks-$pid.txt" ]; then
+                  sudo -n sample "$pid" 3 -file "$samples/stacks-$pid.txt" >/dev/null 2>&1
+                  sudo -n chmod a+r "$samples/stacks-$pid.txt"
+                fi
               done
             done
           ) &
@@ -323,7 +330,9 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fd-samples-macOS
-          path: ${{ runner.temp }}/fd-samples/mcp_suite.txt
+          path: |
+            ${{ runner.temp }}/fd-samples/mcp_suite.txt
+            ${{ runner.temp }}/fd-samples/stacks-*.txt
 
       - name: Upload failed test diagnostics
         if: failure()
