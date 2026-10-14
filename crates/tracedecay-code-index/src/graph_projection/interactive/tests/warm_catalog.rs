@@ -477,12 +477,44 @@ fn cancellation_during_background_warm_preserves_warming_ownership() {
             .expect("interactive catalog lock"),
         InteractiveCatalogState::Warming { owner: None }
     ));
+    // The refused read restarts an ownerless warm in the background. Fence
+    // that retry so the scan count observes the request's own work.
+    let build = store
+        .hold_catalog_build_for_test()
+        .expect("hold the background retry before its scan");
     assert!(matches!(
         reader(&store).external_type_import_candidates("pkg", None, 1, request()),
         Err(CodeGraphProjectionError::Unavailable(detail))
             if detail.contains("warming in the background")
     ));
     assert_eq!(store.interactive_catalog_scan_builds(), 1);
+    drop(build);
+
+    store
+        .await_rewarm_for(
+            Duration::from_secs(30),
+            crate::graph_projection::CodeGraphReadinessRequirement::Catalog,
+        )
+        .expect("the cancelled background warm retries and settles");
+    assert!(
+        store
+            .interactive_catalog_is_warm()
+            .expect("read retried catalog state")
+    );
+    assert_eq!(store.interactive_catalog_scan_builds(), 2);
+    assert_eq!(
+        reader(&store)
+            .external_type_import_candidates("pkg", Some("src/warm-import-00.ts"), 1, request())
+            .expect("the retried catalog serves the canonical import"),
+        vec![super::imports::external_type_import(
+            "file.warm.import.00",
+            "src/warm-import-00.ts",
+            "pkg",
+            "Foo",
+            "Foo",
+            0,
+        )]
+    );
 }
 
 #[test]
