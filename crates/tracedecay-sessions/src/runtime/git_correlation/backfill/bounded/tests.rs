@@ -2199,17 +2199,30 @@ async fn changed_session_discards_sealed_candidate_before_publishing_new_revisio
         )
         .await
         .unwrap();
+    // Capture and seal the real source, then stop at its first commit's work
+    // limit. A short deadline cannot establish which durable stage was reached.
+    let mut capture_only = options(false);
+    capture_only.max_commits_per_repo = 0;
     let partial = run_bounded_history_index_page(
         &store,
-        &options(false),
-        &BoundedGitControl::new(
-            ObservationCancellation::default(),
-            Duration::from_millis(700),
-        ),
+        &capture_only,
+        &BoundedGitControl::new(ObservationCancellation::default(), Duration::from_secs(10)),
     )
     .await
     .unwrap();
+    assert!(partial.committed);
+    assert_eq!(
+        partial.interruption,
+        Some(BoundedBackfillInterruption::HistoryLimitReached)
+    );
     assert_eq!(partial.frontier.change_sequence, 0);
+    let snapshot = store.connection.read_snapshot().await.unwrap();
+    let candidate = history_progress::read_oldest_progress(&snapshot)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(candidate.scan_mode, GitHistoryScanMode::Graph);
+    drop(snapshot);
     assert_eq!(
         scalar(
             &store,
@@ -2236,10 +2249,17 @@ async fn changed_session_discards_sealed_candidate_before_publishing_new_revisio
     .await
     .unwrap();
     assert_eq!(resumed.frontier.change_sequence, 0);
-    assert_eq!(
-        scalar(&store, "SELECT COUNT(*) FROM git_history_index_progress").await,
-        0
-    );
+    for table in [
+        "git_history_index_progress",
+        "git_history_index_staged_spans",
+        "git_history_index_staged_commits",
+    ] {
+        assert_eq!(
+            scalar(&store, &format!("SELECT COUNT(*) FROM {table}")).await,
+            0,
+            "{table}"
+        );
+    }
 
     let newer = run_bounded_history_index_page(
         &store,

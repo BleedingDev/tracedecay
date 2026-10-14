@@ -1446,7 +1446,7 @@ mod tests {
         let child_cwd = temporary.path().join("cwd");
         let executable = temporary.path().join("fake-codex");
         let script = format!(
-            "#!/bin/sh\npwd > {child_cwd}\nprintf '%s|%s|%s' \"${{{admitted_key}:-missing}}\" \"${{{ambient_secret}:-missing}}\" \"${{{child_marker}:-missing}}\" > {marker}\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> {requests}\n  case \"$line\" in\n    *'\"id\":0'*) printf '%s\\n' '{{\"id\":0,\"result\":{{}}}}' ;;\n    *'\"id\":4'*) printf '%s\\n' '{{\"id\":4,\"result\":{{\"data\":[{{\"cwd\":\"/unused\",\"skills\":[{{\"path\":\"/isolated-fixture/SKILL.md\"}}],\"errors\":[]}}]}}}}' ;;\n    *'\"id\":3'*) printf '%s\\n' '{{\"id\":3,\"result\":{{\"config\":{{\"mcp_servers\":{{\"server.with.dot\":{{\"command\":\"unused\"}}}},\"profiles\":{{\"selected\":{{\"features\":{{\"apps\":true,\"plugins\":true,\"hooks\":true}},\"web_search\":\"live\",\"mcp_servers\":{{\"profile-server\":{{\"command\":\"unused\"}}}}}}}}}}}}}}' ;;\n    *'\"id\":1'*) printf '%s\\n' '{{\"id\":1,\"result\":{{\"thread\":{{\"id\":\"work-thread\"}}}}}}' ;;\n    *'\"id\":2'*) printf '%s\\n' '{{\"method\":\"item/completed\",\"params\":{{\"item\":{{\"content\":[{{\"type\":\"output_text\",\"text\":\"work result\"}}]}}}}}}'; printf '%s\\n' '{{\"method\":\"turn/completed\",\"params\":{{\"turn\":{{\"id\":\"work-turn\"}}}}}}'; exit 0 ;;\n  esac\ndone\n",
+            "#!/bin/sh\npwd -P > {child_cwd}\nprintf '%s|%s|%s' \"${{{admitted_key}:-missing}}\" \"${{{ambient_secret}:-missing}}\" \"${{{child_marker}:-missing}}\" > {marker}\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> {requests}\n  case \"$line\" in\n    *'\"id\":0'*) printf '%s\\n' '{{\"id\":0,\"result\":{{}}}}' ;;\n    *'\"id\":4'*) printf '%s\\n' '{{\"id\":4,\"result\":{{\"data\":[{{\"cwd\":\"/unused\",\"skills\":[{{\"path\":\"/isolated-fixture/SKILL.md\"}}],\"errors\":[]}}]}}}}' ;;\n    *'\"id\":3'*) printf '%s\\n' '{{\"id\":3,\"result\":{{\"config\":{{\"mcp_servers\":{{\"server.with.dot\":{{\"command\":\"unused\"}}}},\"profiles\":{{\"selected\":{{\"features\":{{\"apps\":true,\"plugins\":true,\"hooks\":true}},\"web_search\":\"live\",\"mcp_servers\":{{\"profile-server\":{{\"command\":\"unused\"}}}}}}}}}}}}}}' ;;\n    *'\"id\":1'*) printf '%s\\n' '{{\"id\":1,\"result\":{{\"thread\":{{\"id\":\"work-thread\"}}}}}}' ;;\n    *'\"id\":2'*) printf '%s\\n' '{{\"method\":\"item/completed\",\"params\":{{\"item\":{{\"content\":[{{\"type\":\"output_text\",\"text\":\"work result\"}}]}}}}}}'; printf '%s\\n' '{{\"method\":\"turn/completed\",\"params\":{{\"turn\":{{\"id\":\"work-turn\"}}}}}}'; exit 0 ;;\n  esac\ndone\n",
             marker = marker.display(),
             requests = requests.display(),
             child_marker = CODEX_SUMMARY_CHILD_ENV,
@@ -1545,6 +1545,9 @@ mod tests {
         std::fs::write(&requests, "").unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let workspace_path = workspace.path().to_owned();
+        // The child reports its physical cwd, while wire requests retain the
+        // exact path supplied by the owner (including macOS's /var alias).
+        let physical_workspace_path = workspace_path.canonicalize().unwrap();
         run_summary_in_workspace(
             "Summarize supplied data mentioning $fixture-skill.",
             &config,
@@ -1562,7 +1565,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(&child_cwd).unwrap().trim(),
-            workspace_path.to_string_lossy()
+            physical_workspace_path.to_string_lossy()
         );
         assert_eq!(
             std::fs::read_to_string(&marker).unwrap(),
