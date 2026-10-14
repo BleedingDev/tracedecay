@@ -279,7 +279,7 @@ fn install_or_update(
                 &root_directory,
                 journal,
                 &staging_path,
-                &staging_directory,
+                staging_directory,
                 &acquisition,
                 &manifest,
             )?;
@@ -452,7 +452,7 @@ fn publish_candidate(
     root_directory: &Dir,
     mut journal: LifecycleJournal,
     staging_path: &Path,
-    staging_directory: &Dir,
+    staging_directory: Dir,
     acquisition: &ModelAcquisitionManifest,
     manifest: &PinnedEncoder,
 ) -> Result<(), EncoderError> {
@@ -503,7 +503,7 @@ fn publish_candidate(
     // staging capability so a swapped path cannot redirect publication.
     let candidate_path = staging_path.join(CANDIDATE_DIRECTORY);
     let staged_digest = digest_optional_entry(
-        staging_directory,
+        &staging_directory,
         OsStr::new(CANDIDATE_DIRECTORY),
         &candidate_path,
     )?
@@ -523,7 +523,7 @@ fn publish_candidate(
     }
     validate_candidate_structure(&candidate_path, manifest)?;
     let verified_staged_digest = digest_optional_entry(
-        staging_directory,
+        &staging_directory,
         OsStr::new(CANDIDATE_DIRECTORY),
         &candidate_path,
     )?
@@ -542,7 +542,7 @@ fn publish_candidate(
         );
     }
     if let Err(error) = tracedecay_private_fs::capability_dir::rename_noreplace(
-        staging_directory,
+        &staging_directory,
         OsStr::new(CANDIDATE_DIRECTORY),
         root_directory,
         OsStr::new("models"),
@@ -621,6 +621,8 @@ fn publish_candidate(
             })?,
         )?;
     }
+    // Windows refuses to remove a directory while a handle to it is open.
+    drop(staging_directory);
     cleanup_staging_entry(
         root,
         root_directory,
