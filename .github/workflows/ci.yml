@@ -296,7 +296,11 @@ jobs:
             while sleep 30; do
               # Bazel names the Rust test executable `mcp_suite__binary`.
               for pid in $(pgrep -f 'mcp_suite' || true); do
-                lsof -p "$pid" 2>/dev/null > "$samples/lsof.tmp" || continue
+                # Bazel's darwin-sandbox hides test processes from an
+                # unprivileged lsof. Only lsof needs privileges; the sample
+                # file stays the runner's.
+                # shellcheck disable=SC2024
+                sudo -n lsof -p "$pid" 2>/dev/null > "$samples/lsof.tmp" || continue
                 {
                   echo "== $(date -u +%T) pid=$pid open=$(($(wc -l < "$samples/lsof.tmp") - 1))"
                   awk 'NR>1 {print $5}' "$samples/lsof.tmp" | sort | uniq -c | sort -rn | head -8

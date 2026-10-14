@@ -415,8 +415,8 @@ fn process_exit_code(code: i32) -> ExitCode {
 
 #[cfg(unix)]
 fn restore_sigpipe_default() -> std::io::Result<()> {
-    // SAFETY: `async_main` calls this only after selecting the one-shot tool
-    // client mode, before that mode starts worker threads or writes output.
+    // SAFETY: `async_main` calls this only for the one-shot tool client mode,
+    // before that mode starts worker threads or writes output.
     let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     if previous == libc::SIG_ERR {
         Err(std::io::Error::last_os_error())
@@ -493,6 +493,18 @@ fn async_main() -> tracedecay_domain::errors::Result<CommandOutcome> {
         // parse replaces it below with the exact canonical nested command path.
         tracing::trace!(name: "cli.command.name", value = ?command.as_str());
     }
+    // The one-shot tool client is a pipeline stage: a reader that exits early
+    // (`tracedecay tool | head`) must end it quietly. Selected from argv, before
+    // help, usage, or parse errors can write to a closed pipe with SIGPIPE
+    // still ignored, which panicked in `println!` instead.
+    #[cfg(unix)]
+    if args.get(1).map(String::as_str) == Some("tool") {
+        restore_sigpipe_default().map_err(|error| {
+            tracedecay_domain::errors::TraceDecayError::Config {
+                message: format!("failed to configure tool pipeline output: {error}"),
+            }
+        })?;
+    }
     if render_dynamic_command_help(&args) {
         return Ok(CommandOutcome::Success);
     }
@@ -516,6 +528,8 @@ fn async_main() -> tracedecay_domain::errors::Result<CommandOutcome> {
         }
     };
     normalize_tool_reserved_global_flags(&mut cli);
+    // Global flags may precede the subcommand (`tracedecay --json tool ...`),
+    // which the argv check above does not see.
     #[cfg(unix)]
     if matches!(cli.command.as_ref(), Some(Commands::Tool { .. })) {
         restore_sigpipe_default().map_err(|error| {
