@@ -263,6 +263,9 @@ fn install_or_update(
                 &candidate_directory,
                 &manifest,
             )?;
+            // Windows refuses to rename a directory while a handle to it is
+            // open, so close the candidate before publication moves it.
+            drop(candidate_directory);
             super::write_manifest(&candidate_models, &manifest)?;
             validate_candidate(&candidate_models, &manifest)?;
             sync_tree_path(&candidate_models)?;
