@@ -6,6 +6,7 @@ description: >
   master and may also save within a PR's merge-ref scope for later pushes to
   that same PR. Bazelisk and repository caches are saved on master, and
   also by `save-download-caches` jobs on runners with a remote cache.
+  Restores MODULE.bazel.lock, which `save-module-lockfile` jobs save.
   With `test-tools`, also installs the host tools the test suites spawn.
   Runners with their own remote Bazel cache (Depot) keep it and skip the
   disk-cache archive.
@@ -29,6 +30,12 @@ inputs:
       runner's remote cache is in use. Depot keeps these in its own cache
       store, which cannot read the GitHub-stored master entries; one
       designated job per platform sets this.
+    default: "false"
+  save-module-lockfile:
+    description: >
+      Also save MODULE.bazel.lock when this job succeeds and its exact key
+      missed. Set it on one job per platform whose Bazel commands load the
+      Rust crates, so the saved file records the crate_universe result.
     default: "false"
 
 outputs:
@@ -105,6 +112,12 @@ runs:
         console.log(`Remote Bazel cache source: ${source}; user rc candidates: ${rcPaths.join(', ')}; `
           + `system rc ${fs.existsSync(systemRc) ? 'present' : 'absent'}; `
           + `DEPOT_CACHE_TOKEN ${token ? 'set' : 'unset'}`);
+        // MODULE.bazel.lock holds absolute checkout paths (crate_universe
+        // mirrors the patches/ path crates from them), so a lockfile only
+        // fits jobs on the same host type that check out to the same
+        // directory.
+        const checkout = require('node:crypto').createHash('sha256')
+          .update(process.env.GITHUB_WORKSPACE || '').digest('hex').slice(0, 16);
         const names = [process.env.CACHE_NAME, ...(process.env.EXTRA_RESTORE_KEYS || '')
           .split(',')
           .map((name) => name.trim())
@@ -115,9 +128,39 @@ runs:
           process.env.GITHUB_OUTPUT,
           `path=${path}\nprefix=${prefixes[0]}\nrestore-keys<<EOF\n${prefixes.join('\n')}\nEOF\n`
             + `output-base=${outputBase}\nremote-cache=${runnerRc !== undefined}\n`
-            + `bazelrc-paths=${JSON.stringify(rcPaths)}\n`,
+            + `bazelrc-paths=${JSON.stringify(rcPaths)}\n`
+            + `module-lockfile-prefix=bazel-module-lockfile-v1-${process.platform}-${process.arch}-${checkout}-\n`,
         );
         JS
+
+    # Without MODULE.bazel.lock, the first Bazel command of every job re-runs
+    # the crate_universe splice, about four minutes before loading starts
+    # (run 38644661902, every platform). The file is gitignored, so carry it
+    # in the Actions cache. Bazel checks every recorded input (Cargo.lock,
+    # the Cargo manifests, CARGO_BAZEL_* variables, repository mappings) and
+    # re-evaluates on a mismatch, so a stale restore costs only that splice.
+    - name: Restore the Bazel module lockfile
+      if: inputs.save-module-lockfile != 'true'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: MODULE.bazel.lock
+        key: >-
+          ${{ steps.disk-cache-config.outputs.module-lockfile-prefix }}timeout-${{ env.CARGO_BAZEL_TIMEOUT }}-${{
+          hashFiles('MODULE.bazel', '.bazelversion', 'Cargo.lock', 'Cargo.toml',
+          'crates/**/Cargo.toml', 'patches/**/Cargo.toml') }}
+        restore-keys: ${{ steps.disk-cache-config.outputs.module-lockfile-prefix }}
+
+    # Same key; the post-job step saves the file when this job succeeds.
+    - name: Restore the Bazel module lockfile and save it after the job
+      if: inputs.save-module-lockfile == 'true'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: MODULE.bazel.lock
+        key: >-
+          ${{ steps.disk-cache-config.outputs.module-lockfile-prefix }}timeout-${{ env.CARGO_BAZEL_TIMEOUT }}-${{
+          hashFiles('MODULE.bazel', '.bazelversion', 'Cargo.lock', 'Cargo.toml',
+          'crates/**/Cargo.toml', 'patches/**/Cargo.toml') }}
+        restore-keys: ${{ steps.disk-cache-config.outputs.module-lockfile-prefix }}
 
     - uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
       with:
