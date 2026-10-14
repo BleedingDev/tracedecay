@@ -640,9 +640,12 @@ _starts.mkdir(exist_ok=True)
     fake_lsp_script_with_preamble(&preamble, EMPTY_DIAGNOSTIC_PUBLISH)
 }
 
-/// Starts recorded by [`fake_lsp_script_that_records_start`].
+/// Starts recorded by [`fake_lsp_script_that_records_start`]. The directory
+/// exists once any start ran; a test expecting starts fails on its absence.
 fn start_count(counter_path: &std::path::Path) -> usize {
-    std::fs::read_dir(counter_path).map_or(0, Iterator::count)
+    std::fs::read_dir(counter_path)
+        .unwrap_or_else(|error| panic!("no analyzer start was recorded: {error}"))
+        .count()
 }
 
 fn fake_lsp_script_that_never_initializes() -> &'static str {
