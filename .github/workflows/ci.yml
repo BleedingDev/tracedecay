@@ -293,6 +293,9 @@ jobs:
           mkdir -p "$samples"
           echo "ulimit -n: $(ulimit -n)" > "$samples/mcp_suite.txt"
           (
+            # The step shell runs with -e -o pipefail; `head` closing a pipe
+            # must not end the sampler after its first sample.
+            set +e +o pipefail
             while sleep 30; do
               # Bazel names the Rust test executable `mcp_suite__binary`.
               for pid in $(pgrep -f 'mcp_suite' || true); do

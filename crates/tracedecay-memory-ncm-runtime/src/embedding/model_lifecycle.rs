@@ -2236,8 +2236,28 @@ fn open_file_nofollow(
     name: &OsStr,
     path: &Path,
 ) -> Result<cap_std::fs::File, EncoderError> {
+    open_file_nofollow_with(parent, name, path, false)
+}
+
+/// [`open_file_nofollow`] for a handle that will be flushed: Windows'
+/// `FlushFileBuffers` refuses a read-only handle with access denied.
+#[cfg(feature = "real-encoder")]
+fn open_file_nofollow_for_sync(
+    parent: &Dir,
+    name: &OsStr,
+    path: &Path,
+) -> Result<cap_std::fs::File, EncoderError> {
+    open_file_nofollow_with(parent, name, path, cfg!(windows))
+}
+
+fn open_file_nofollow_with(
+    parent: &Dir,
+    name: &OsStr,
+    path: &Path,
+    write: bool,
+) -> Result<cap_std::fs::File, EncoderError> {
     let mut options = OpenOptions::new();
-    options.read(true).follow(FollowSymlinks::No);
+    options.read(true).write(write).follow(FollowSymlinks::No);
     let file = parent.open_with(name, &options).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             EncoderError::ArtifactsMissing(path.display().to_string())
@@ -2363,7 +2383,7 @@ fn sync_tree(directory: &Dir, path: &Path) -> Result<(), EncoderError> {
             let child = open_directory_nofollow(directory, &name, &child_path)?;
             sync_tree(&child, &child_path)?;
         } else if file_type.is_file() {
-            open_file_nofollow(directory, &name, &child_path)?
+            open_file_nofollow_for_sync(directory, &name, &child_path)?
                 .sync_all()
                 .map_err(|error| io_error("sync model lifecycle file", &child_path, error))?;
         } else {
