@@ -9,6 +9,7 @@ pub mod support;
 use support::{
     BASE_SESSIONS, DrainFixture, GROWN_SESSIONS, SEED_TIMESTAMP, advance_wal_to_next_generation,
     probe_one_message, retention_tick_read_bytes, retention_writer_steps, seed_sessions,
+    settle_retention,
 };
 use tracedecay_sessions::admission::HostAdmissionScope;
 
@@ -31,6 +32,7 @@ async fn retention_tick_reads_do_not_scale_with_the_session_store() {
     let probe_timestamp = SEED_TIMESTAMP + 10_000_000;
 
     let mut streamed = seed_sessions(&facade, project, &scope, 0..BASE_SESSIONS).await;
+    settle_retention(database).await;
     advance_wal_to_next_generation(&facade, &fixture, &mut streamed, probe_timestamp).await;
     retention_writer_steps(database).await;
     for offset in 0..STREAMED {
@@ -46,6 +48,7 @@ async fn retention_tick_reads_do_not_scale_with_the_session_store() {
     let base_read = retention_tick_read_bytes(database).await;
 
     seed_sessions(&facade, project, &scope, BASE_SESSIONS..GROWN_SESSIONS).await;
+    settle_retention(database).await;
     advance_wal_to_next_generation(&facade, &fixture, &mut streamed, probe_timestamp).await;
     retention_writer_steps(database).await;
     for offset in STREAMED..2 * STREAMED {

@@ -356,6 +356,7 @@ async fn reset_reference_pages(
         }
         drop(rows);
         bodies_done = page.len() < PAGE as usize;
+        let mut next_cursor = None;
         for (kind, key, hash) in page {
             let kind = kind.map_err(|error| global_db_operation_error(OPERATION, error))?;
             let key = key.map_err(|error| global_db_operation_error(OPERATION, error))?;
@@ -364,8 +365,11 @@ async fn reset_reference_pages(
                 .await.map_err(|error| global_db_operation_error(OPERATION, error))?;
             let cursor = serde_json::to_string(&(kind, key, hash))
                 .map_err(|error| global_db_operation_error(OPERATION, error))?;
-            set_metadata(conn, &format!("{BODY_RESET}-cursor"), &cursor).await?;
+            next_cursor = Some(cursor);
             report.owner_rows_examined += 1;
+        }
+        if let Some(cursor) = next_cursor {
+            set_metadata(conn, &format!("{BODY_RESET}-cursor"), &cursor).await?;
         }
         if bodies_done {
             set_metadata(conn, &format!("{BODY_RESET}-complete"), "1").await?;
@@ -391,6 +395,7 @@ async fn reset_reference_pages(
         }
         drop(rows);
         captures_done = page.len() < PAGE as usize;
+        let mut next_cursor = None;
         for id in page {
             conn.execute(
                 "DELETE FROM observation_repository_capture_references WHERE observation_id = ?1",
@@ -398,8 +403,11 @@ async fn reset_reference_pages(
             )
             .await
             .map_err(|error| global_db_operation_error(OPERATION, error))?;
-            set_metadata(conn, &format!("{CAPTURE_RESET}-cursor"), &id).await?;
+            next_cursor = Some(id);
             report.owner_rows_examined += 1;
+        }
+        if let Some(cursor) = next_cursor {
+            set_metadata(conn, &format!("{CAPTURE_RESET}-cursor"), &cursor).await?;
         }
         if captures_done {
             set_metadata(conn, &format!("{CAPTURE_RESET}-complete"), "1").await?;
@@ -1189,6 +1197,116 @@ mod tests {
             count(&conn, "SELECT COUNT(*) FROM session_canonical_bodies").await,
             1
         );
+    }
+
+    async fn assert_reference_counts(conn: &impl QueryExecutor, expected: i64) {
+        assert_eq!(
+            count(
+                conn,
+                "SELECT COUNT(*) FROM session_canonical_body_references"
+            )
+            .await,
+            expected
+        );
+        assert_eq!(
+            count(
+                conn,
+                "SELECT COUNT(*) FROM observation_repository_capture_references"
+            )
+            .await,
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn reference_reset_cursor_failure_rolls_back_both_owner_pages() {
+        let harness = crate::tests::harness::RegisteredGlobalDbHarness::open(
+            "canonical-reference-reset-rollback",
+        )
+        .await;
+        let transaction = harness.registered.begin_write_transaction().await.unwrap();
+        transaction
+            .execute(
+                "DELETE FROM session_backfill_meta WHERE key LIKE 'canonical-reference-backfill-%'",
+                (),
+            )
+            .await
+            .unwrap();
+        for index in 0..=PAGE {
+            let id = format!("historical-{index:03}");
+            transaction.execute(
+                "INSERT INTO session_canonical_body_references (owner_kind, owner_key, content_hash) VALUES ('observation', ?1, ?2)",
+                params![id.as_str(), format!("body-{index:03}")],
+            ).await.unwrap();
+            transaction.execute(
+                "INSERT INTO observation_repository_capture_references (observation_id, capture_id) VALUES (?1, ?2)",
+                params![id.as_str(), format!("capture-{index:03}")],
+            ).await.unwrap();
+        }
+        transaction
+            .execute_batch(
+                "CREATE TRIGGER reject_capture_reset_cursor BEFORE INSERT ON session_backfill_meta
+             WHEN NEW.key = 'canonical-reference-backfill-reset-captures-cursor'
+             BEGIN SELECT RAISE(ABORT, 'refuse capture reset cursor'); END;",
+            )
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+
+        assert!(harness.registered.run_canonical_content_gc().await.is_err());
+        let snapshot = harness.registered.read_snapshot().await.unwrap();
+        assert_reference_counts(&snapshot, PAGE + 1).await;
+        assert_eq!(count(&snapshot, "SELECT COUNT(*) FROM session_backfill_meta WHERE key LIKE 'canonical-reference-backfill-reset-%'").await, 0);
+        drop(snapshot);
+
+        let transaction = harness.registered.begin_write_transaction().await.unwrap();
+        transaction
+            .execute_batch("DROP TRIGGER reject_capture_reset_cursor")
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        let report = harness.registered.run_canonical_content_gc().await.unwrap();
+        assert_eq!(report.owner_rows_examined, u64::try_from(2 * PAGE).unwrap());
+        assert_eq!(report.state, CanonicalContentGcState::Backfilling);
+        assert!(report.pending);
+        let snapshot = harness.registered.read_snapshot().await.unwrap();
+        assert_reference_counts(&snapshot, 1).await;
+        let body_cursor: (String, String, String) = serde_json::from_str(
+            &metadata(
+                &snapshot,
+                "canonical-reference-backfill-reset-bodies-cursor",
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body_cursor,
+            (
+                "observation".to_owned(),
+                format!("historical-{:03}", PAGE - 1),
+                format!("body-{:03}", PAGE - 1)
+            )
+        );
+        assert_eq!(
+            metadata(
+                &snapshot,
+                "canonical-reference-backfill-reset-captures-cursor"
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            format!("historical-{:03}", PAGE - 1)
+        );
+        drop(snapshot);
+
+        let report = harness.registered.run_canonical_content_gc().await.unwrap();
+        assert_eq!(report.owner_rows_examined, 2);
+        assert_eq!(report.state, CanonicalContentGcState::Ready);
+        assert!(!report.pending);
+        let snapshot = harness.registered.read_snapshot().await.unwrap();
+        assert_reference_counts(&snapshot, 0).await;
     }
 
     #[tokio::test]
