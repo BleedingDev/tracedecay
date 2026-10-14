@@ -777,7 +777,7 @@ fn automation_outcomes_endpoint_reports_activated_skills_and_automatic_fact_rece
 /// The run's row in the dashboard's newest-first run history once it reaches a
 /// terminal status. `fact_store_curate` answers at admission; the run settles
 /// on the daemon afterwards.
-fn wait_for_settled_run(agent: &ureq::Agent, base_url: &str, run_id: &str) -> Value {
+pub(crate) fn wait_for_settled_run(agent: &ureq::Agent, base_url: &str, run_id: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let (status, runs) = get_json(agent, &format!("{base_url}/api/automation/runs?limit=50"));
