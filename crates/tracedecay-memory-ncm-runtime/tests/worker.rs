@@ -327,14 +327,43 @@ fn force_kill(pid: u32) {
 }
 
 fn process_exists(pid: u32) -> bool {
-    Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    let mut inspection = if cfg!(windows) {
+        let mut powershell = Command::new("powershell.exe");
+        // Only the specific missing-PID result means exited. A failed query,
+        // including access denial, must fail the reaping assertion.
+        powershell.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
+        powershell.arg(format!(
+            "$ErrorActionPreference = 'Stop'; \
+             try {{ $null = Get-Process -Id {pid}; exit 0 }} \
+             catch {{ \
+               if ($_.FullyQualifiedErrorId -eq \
+                 'NoProcessFoundForGivenId,Microsoft.PowerShell.Commands.GetProcessCommand') \
+               {{ exit 3 }}; throw \
+             }}"
+        ));
+        powershell
+    } else {
+        let mut ps = Command::new("ps");
+        ps.args(["-p", &pid.to_string(), "-o", "pid="]);
+        ps
+    };
+    let output = inspection.output().expect("inspect worker process");
+    let absent = if cfg!(windows) { 3 } else { 1 };
+    match output.status.code() {
+        Some(0) => true,
+        Some(code)
+            if code == absent
+                && (cfg!(windows) || (output.stdout.is_empty() && output.stderr.is_empty())) =>
+        {
+            false
+        }
+        _ => panic!(
+            "could not inspect worker {pid}: {}, stdout={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ),
+    }
 }
 
 fn install_trusted_worker_manifest(binary: &Path) {
@@ -2351,6 +2380,7 @@ fn client_drop_reaps_worker_and_stdin_eof_exits_zero() {
         )
         .expect("worker starts");
     let pid = client.pid().expect("worker pid exists");
+    assert!(process_exists(pid), "started worker must be observable");
     drop(client);
     let deadline = Instant::now() + Duration::from_millis(300);
     while process_exists(pid) && Instant::now() < deadline {
