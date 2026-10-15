@@ -221,7 +221,7 @@ fn window_follow_up(
     }
 }
 
-pub(super) async fn run_session_temporal_refresh_scheduler(
+pub(crate) async fn run_session_temporal_refresh_scheduler(
     database: RegisteredGlobalDbLeaseV1,
     state: Arc<SessionTemporalRefreshWakeState>,
     projector: Arc<dyn SessionTemporalRefreshProjector>,

@@ -281,6 +281,11 @@ impl SessionApplicationRetrievalPortV1 for DaemonSessionRetrievalService {
                         | SessionRetrievalUnavailableReason::HistoricalBlocked
                 );
                 if !exact_current_observation || !historical_stale {
+                    // The refused reader depends on that history; a retry
+                    // parked on an unsignaled release must not outwait it.
+                    if historical_stale {
+                        self.refresh_status.request_historical_retry();
+                    }
                     return SessionRetrievalServiceOutcome::Unavailable(unavailable);
                 }
             }

@@ -12,6 +12,8 @@ pub use history::{ProfileSessionHistoricalIngestor, ProjectSessionHistoricalInge
 pub use registry::SessionTemporalRefreshSchedulerRegistry;
 pub use wake::SessionTemporalRefreshWake;
 
+#[cfg(test)]
+pub(crate) use worker::run_session_temporal_refresh_scheduler;
 #[cfg(any(test, feature = "test-helpers"))]
 pub use worker::{
     apply_refresh_effect, begin_admitted_session_refreshes, process_refresh_begin_requests,
