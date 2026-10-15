@@ -201,7 +201,10 @@ pub(crate) fn high_entropy_ranges(text: &str) -> Vec<Range<usize>> {
                 }
                 component_start = component_end + 1;
             }
-        } else if looks_high_entropy_token(candidate) && !is_lcm_payload_ref(candidate) {
+        } else if looks_high_entropy_token(candidate)
+            && !is_lcm_payload_ref(candidate)
+            && !super::structural_id::is_public_sync_message_id(candidate)
+        {
             ranges.push(start..end);
         }
         start = end;
@@ -308,6 +311,38 @@ mod tests {
         fn classify(&self, key: &NormalizedSensitiveKey) -> Option<Self::Match> {
             self.0.contains(key.ascii_compact()).then_some(())
         }
+    }
+
+    #[test]
+    fn plugin_sync_message_ids_are_never_entropy_redacted() {
+        // Whether the id crosses the entropy threshold depends on the
+        // timestamp digits, so sweep enough of them to hit both sides.
+        let mut crossed = 0;
+        for nanos in (1_792_000_000_000_000_000u64..)
+            .step_by(7_919_113)
+            .take(2_000)
+        {
+            for id in [
+                format!("tracedecay_sync_1_{nanos}_0_user"),
+                format!("tracedecay_sync_1_{nanos}_1_assistant"),
+            ] {
+                crossed += usize::from(looks_high_entropy_token(&id));
+                assert!(high_entropy_ranges(&id).is_empty(), "{id}");
+                assert!(
+                    high_entropy_ranges(&format!("id {id} done")).is_empty(),
+                    "{id}"
+                );
+            }
+        }
+        assert!(crossed > 0, "the sweep must include ids the detector flags");
+        // The exemption is shape-bound: a credential in the slot is redacted.
+        assert_eq!(
+            high_entropy_ranges(
+                "tracedecay_sync_x_Qm9vZ2llV29vZ2llMTIzNDU2Nzg5MGFiY2RlZmdo_0_user"
+            )
+            .len(),
+            1
+        );
     }
 
     #[test]

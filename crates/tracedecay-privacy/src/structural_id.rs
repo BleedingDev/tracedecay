@@ -26,7 +26,7 @@ pub(crate) fn is_already_protected_structural_id(value: &str) -> bool {
 /// threshold depends on the digits of the timestamp: some turns kept their
 /// id and others came back as a protected digest, so one message carried
 /// two canonical identities depending on the clock.
-fn is_public_sync_message_id(value: &str) -> bool {
+pub(crate) fn is_public_sync_message_id(value: &str) -> bool {
     let Some(rest) = value.strip_prefix("tracedecay_sync_") else {
         return false;
     };
