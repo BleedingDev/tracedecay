@@ -210,12 +210,19 @@ jobs:
       # The Linux test, Windows test and Clippy jobs wait for this one, so
       # its saved module lockfile spares them the crate_universe splice.
       - uses: ./.github/actions/setup-bazel
+        id: bazel
         with:
           cache-key: ci-format-linux
-          save-module-lockfile: "true"
 
       - name: Check formatting
         run: bazel build --config=ci //:rustfmt_check
+
+      - name: Save the Bazel module lockfile
+        if: steps.bazel.outputs.module-lockfile-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: MODULE.bazel.lock
+          key: ${{ steps.bazel.outputs.module-lockfile-key }}
 
       # Manifest edits that skip a gen_builds.py rerun leave stale BUILD
       # files; compare the committed files against a fresh generation.
@@ -338,17 +345,26 @@ jobs:
           cache-key: ci-macos-test
           test-tools: "true"
           save-download-caches: ${{ matrix.shard == 'root-b' }}
-          save-module-lockfile: ${{ matrix.shard == 'root-b' }}
 
       # Materialize build outputs before deadline-bearing tests: remote-cache
       # downloads otherwise compete for disk even with HOST_CPUS reserved.
       # ort-sys needs an explicit cache directory in Depot's macOS sandbox.
       - name: Build this shard's test binaries
+        id: build
         shell: bash
         run: >-
           bazel build --config=ci --action_env=ORT_CACHE_DIR=/tmp/ort.pyke.io
           --profile="${{ runner.temp }}/bazel-build-profile.json.gz"
           ${{ matrix.targets }}
+
+      # Save right after the build: a failing test later in the job must
+      # not discard the four-minute crate_universe splice.
+      - name: Save the Bazel module lockfile
+        if: matrix.shard == 'root-b' && steps.bazel.outputs.module-lockfile-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: MODULE.bazel.lock
+          key: ${{ steps.bazel.outputs.module-lockfile-key }}
 
       - name: Build and test this shard
         shell: bash
@@ -561,12 +577,12 @@ jobs:
           cache-key: ci-windows-test
           test-tools: ${{ needs.scope-gate.outputs.run-os }}
           save-download-caches: ${{ matrix.shard == 'workspace' }}
-          save-module-lockfile: ${{ matrix.shard == 'workspace' }}
 
       # Check the shipped MSVC target without linking test executables or
       # applying Linux's Clippy warning policy to this compiler-only check.
       # One shard covers the whole workspace; the others have nothing to add.
       - name: Compile the Windows workspace
+        id: compile
         if: ${{ needs.scope-gate.outputs.run-os != 'true' && matrix.shard == 'workspace' }}
         shell: bash
         run: >-
@@ -580,12 +596,22 @@ jobs:
       # reserves HOST_CPUS otherwise parks the remaining compiles behind it
       # for its whole run.
       - name: Build this shard's test binaries
+        id: build
         if: ${{ needs.scope-gate.outputs.run-os == 'true' }}
         shell: bash
         run: >-
           bazel build --config=ci
           --profile="${{ runner.temp }}/bazel-build-profile.json.gz"
           ${{ matrix.targets }}
+
+      # Save right after the build: a failing test later in the job must
+      # not discard the four-minute crate_universe splice.
+      - name: Save the Bazel module lockfile
+        if: matrix.shard == 'workspace' && steps.bazel.outputs.module-lockfile-hit != 'true' && (steps.compile.outcome == 'success' || steps.build.outcome == 'success')
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: MODULE.bazel.lock
+          key: ${{ steps.bazel.outputs.module-lockfile-key }}
 
       - name: Build and test this shard
         if: ${{ needs.scope-gate.outputs.run-os == 'true' }}

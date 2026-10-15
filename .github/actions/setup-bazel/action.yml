@@ -6,7 +6,8 @@ description: >
   master and may also save within a PR's merge-ref scope for later pushes to
   that same PR. Bazelisk and repository caches are saved on master, and
   also by `save-download-caches` jobs on runners with a remote cache.
-  Restores MODULE.bazel.lock, which `save-module-lockfile` jobs save.
+  Restores MODULE.bazel.lock; callers save it with the `module-lockfile-*`
+  outputs once their first Bazel command succeeds.
   With `test-tools`, also installs the host tools the test suites spawn.
   Runners with their own remote Bazel cache (Depot) keep it and skip the
   disk-cache archive.
@@ -31,12 +32,6 @@ inputs:
       store, which cannot read the GitHub-stored master entries; one
       designated job per platform sets this.
     default: "false"
-  save-module-lockfile:
-    description: >
-      Also save MODULE.bazel.lock when this job succeeds and its exact key
-      missed. Set it on one job per platform whose Bazel commands load the
-      Rust crates, so the saved file records the crate_universe result.
-    default: "false"
 
 outputs:
   disk-cache-path:
@@ -48,6 +43,15 @@ outputs:
   remote-cache:
     description: "`true` when the runner's own remote Bazel cache is in use."
     value: ${{ steps.disk-cache-config.outputs.remote-cache }}
+  module-lockfile-key:
+    description: >
+      Save key for MODULE.bazel.lock. A designated caller saves the file with
+      actions/cache/save right after its first Bazel command succeeds, so a
+      later test failure in the same job cannot discard a completed splice.
+    value: ${{ steps.module-lockfile.outputs.cache-primary-key }}
+  module-lockfile-hit:
+    description: "`true` when the exact lockfile key was restored; nothing to save."
+    value: ${{ steps.module-lockfile.outputs.cache-hit }}
 
 runs:
   using: composite
@@ -140,20 +144,8 @@ runs:
     # the Cargo manifests, CARGO_BAZEL_* variables, repository mappings) and
     # re-evaluates on a mismatch, so a stale restore costs only that splice.
     - name: Restore the Bazel module lockfile
-      if: inputs.save-module-lockfile != 'true'
+      id: module-lockfile
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      with:
-        path: MODULE.bazel.lock
-        key: >-
-          ${{ steps.disk-cache-config.outputs.module-lockfile-prefix }}timeout-${{ env.CARGO_BAZEL_TIMEOUT }}-${{
-          hashFiles('MODULE.bazel', '.bazelversion', 'Cargo.lock', 'Cargo.toml',
-          'crates/**/Cargo.toml', 'patches/**/Cargo.toml') }}
-        restore-keys: ${{ steps.disk-cache-config.outputs.module-lockfile-prefix }}
-
-    # Same key; the post-job step saves the file when this job succeeds.
-    - name: Restore the Bazel module lockfile and save it after the job
-      if: inputs.save-module-lockfile == 'true'
-      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: MODULE.bazel.lock
         key: >-
@@ -218,6 +210,9 @@ runs:
       if: inputs.test-tools == 'true'
       shell: bash
       run: |
+        # The minimal profile still installs the toolchain file's components;
+        # it drops rust-docs, which no test reads.
+        rustup set profile minimal
         rustup toolchain install
         # Git Bash spells $HOME as /c/...; native Windows programs need C:\...
         native() { if command -v cygpath >/dev/null; then cygpath -w "$1"; else echo "$1"; fi; }
