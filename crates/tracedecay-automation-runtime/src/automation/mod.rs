@@ -53,6 +53,25 @@ pub fn config_error(message: impl Into<String>) -> tracedecay_domain::errors::Tr
     }
 }
 
+/// Reads a file the automation runtime published moments earlier. On Windows
+/// a scanner or a pending atomic replace briefly denies the open (os error 5,
+/// 32 or 33) although the file is readable milliseconds later, so the read
+/// retries those codes like every other runtime publication; elsewhere it
+/// reads once.
+pub(crate) async fn read_published_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut bytes = Vec::new();
+        tracedecay_runtime_core::storage::retry_transient_file_op(|| {
+            bytes = std::fs::read(&path)?;
+            Ok(())
+        })?;
+        Ok(bytes)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
 pub(crate) fn job_error<T>(message: &str) -> tracedecay_domain::errors::Result<T> {
     Err(config_error(message))
 }
