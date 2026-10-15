@@ -277,7 +277,7 @@ pub fn automation_outcomes_path(dashboard_root: &Path) -> PathBuf {
 #[tracing::instrument(name = "automation.outcomes.load", level = "trace", skip_all)]
 pub async fn load_outcomes_snapshot(dashboard_root: &Path) -> Result<AutomationOutcomesSnapshot> {
     let path = automation_outcomes_path(dashboard_root);
-    let bytes = match tokio::fs::read(&path).await {
+    let bytes = match super::read_published_file(&path).await {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(AutomationOutcomesSnapshot::default());
