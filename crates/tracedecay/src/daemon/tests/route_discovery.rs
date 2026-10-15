@@ -16,8 +16,9 @@ use tracedecay_daemon_service::ProjectRuntimePublicationStateV1;
 use tracedecay_runtime_core::git_discovery::identity_resolution_elapsed;
 use tracedecay_runtime_core::git_repository::{
     block_repository_discovery_for_test, delay_repository_discovery_for_test,
-    observe_repository_discovery_for_test, repository_discovery_count_for_test,
-    repository_topology_resolution_count_for_test, reset_repository_discovery_for_test,
+    hold_repository_discovery_clock_for_test, observe_repository_discovery_for_test,
+    repository_discovery_count_for_test, repository_topology_resolution_count_for_test,
+    reset_repository_discovery_for_test, wait_for_topology_callers_for_test,
 };
 
 use super::bootstrap::run_git;
@@ -223,6 +224,65 @@ async fn concurrent_routes_resolve_one_repository_topology() {
     assert!(
         discoveries <= CONNECTIONS as u64 + 1,
         "{discoveries} live discoveries for {CONNECTIONS} routes: topology is being rediscovered"
+    );
+}
+
+/// Two opens of one route that reach its single-flight gate together share
+/// the checkout walk the first one started.
+///
+/// Live flake this covers: a checkout and its symlinked alias opened at once
+/// both walk the canonical path at the gate. The later open found that walk
+/// in flight and was refused as deferred on the spot, so the pair failed
+/// whenever the walk outlasted their scheduling skew, as on a loaded runner.
+/// A directory outside any repository is never retained, so every gate walks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_route_gates_join_the_in_flight_checkout_walk() {
+    let home = TempDir::new().expect("isolated home");
+    let project = home.path().join("project");
+    std::fs::create_dir_all(&project).expect("project directory");
+    let project = project.canonicalize().expect("canonical project");
+    let handshake = handshake_for(&project, &home.path().join("profile"));
+    let route =
+        super::super::ProjectRouteKey::from_handshake(&project, &handshake).expect("route key");
+    let gates = std::sync::Arc::new(tokio::sync::Mutex::new(
+        super::super::ProjectOpenGates::default(),
+    ));
+
+    let mut block = block_repository_discovery_for_test(&project);
+    // The subject is the join, not the discovery deadline.
+    hold_repository_discovery_clock_for_test(&project);
+    let first = tokio::spawn({
+        let gates = std::sync::Arc::clone(&gates);
+        let route = route.clone();
+        async move { super::super::project_routing::project_open_gate(&gates, &route).await }
+    });
+    block.wait_entered().await;
+    let second = tokio::spawn({
+        let gates = std::sync::Arc::clone(&gates);
+        let route = route.clone();
+        async move { super::super::project_routing::project_open_gate(&gates, &route).await }
+    });
+    wait_for_topology_callers_for_test(&project, 1, || u64::from(second.is_finished())).await;
+    block.release();
+
+    let second = second
+        .await
+        .expect("second gate task")
+        .expect("the later open joins the walk in flight instead of being deferred");
+    let first = first
+        .await
+        .expect("first gate task")
+        .expect("the first open resolves its walk");
+    let resolutions = repository_topology_resolution_count_for_test(&project);
+    reset_repository_discovery_for_test(&project);
+
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &second),
+        "both opens must hold the route's one single-flight gate"
+    );
+    assert_eq!(
+        resolutions, 1,
+        "the later open must join the in-flight walk, not walk the checkout again"
     );
 }
 

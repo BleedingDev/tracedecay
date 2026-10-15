@@ -164,15 +164,17 @@ pub(super) async fn project_open_gate(
     route: &ProjectRouteKey,
 ) -> Result<Arc<ProjectOpenGate>> {
     let mut gate_route = route.clone();
-    match tracedecay_runtime_core::worktree::git_common_dir_outcome(&route.project_path) {
-        Ok(Some(git_common_dir)) => gate_route.project_path = git_common_dir,
-        Ok(None) => {}
-        Err(tracedecay_runtime_core::git_repository::DiscoveryBlocked { .. }) => {
-            return Err(super::core_proxy::repository_discovery_deferred(
-                &route.project_path,
-                tracedecay_runtime_core::git_discovery::GitDiscoveryUnknown::DeadlineExceeded,
-            ));
-        }
+    // Concurrent opens of one route (a checkout and its symlinked alias) walk
+    // the same topology slot. The later caller joins the earlier walk under
+    // the discovery budget; refusing it outright failed an open whose answer
+    // was moments away, and more often the slower the volume.
+    let probe_path = route.project_path.clone();
+    if let Some(git_common_dir) = bounded_repository_probe(&route.project_path, move || {
+        tracedecay_runtime_core::worktree::git_common_dir(&probe_path)
+    })
+    .await?
+    {
+        gate_route.project_path = git_common_dir;
     }
     let mut gates = gates.lock().await;
     if let Some(gate) = gates

@@ -59,8 +59,9 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tracedecay_contracts::retained_surfaces::{
     FactCommitOwnerV1, FactProjectionV1, FactSearchGraphCoverageV1, FactStoreAddCommitV1,
-    FactStoreAddResultV1, FactV1, LcmLoadSessionResultV1, LcmMessageV1, MessageSearchHitV1,
-    MessageSearchResultV1, RetainedOutcomeStatusV1, TemporalFreshnessV1,
+    FactStoreAddResultV1, FactV1, LcmConvergenceStateV1, LcmLoadSessionResultV1, LcmMessageV1,
+    LcmStatusResultV1, MessageSearchHitV1, MessageSearchResultV1, RetainedOutcomeStatusV1,
+    TemporalFreshnessV1,
 };
 use tracedecay_contracts::retrieval::ContextResultV1;
 use tracedecay_contracts::{
@@ -2309,6 +2310,7 @@ fn assert_host_memory_journey(codex: bool) {
     let baseline = native_context(&journey, &journey.project);
     assert!(baseline.memory_matches.is_empty());
     await_native_startup_history(&journey);
+    await_native_history_converged(&journey);
 
     journey.initialize_session_transcript(journey.session_id());
     assert_native_hook_succeeds(
@@ -2685,6 +2687,54 @@ fn await_native_startup_history(journey: &ClaudeHostJourney) {
         assert!(
             Instant::now() < deadline,
             "startup import did not settle: {outcome}"
+        );
+        std::thread::sleep(JOURNAL_POLL_INTERVAL);
+    }
+}
+
+/// Waits until the project's refresh worker has actually run the historical
+/// catch-up the startup import handed to it.
+///
+/// The startup receipt is only that hand-off: the import schedules the pass
+/// and completes without waiting for it, so `Scheduled` is never evidence that
+/// sources were read (`schedule_import_history`,
+/// `schedule_historical_admission`). A pass still pending when the fixture
+/// appends its first turn reads the rollout and admits it, because the
+/// project catch-up sweep is a sanctioned ingest route for the same rollout
+/// the Stop hook admits. The no-Stop control is only meaningful once that
+/// pass has finished, so wait for the worker to report `Converged`: quiescent
+/// with historical discovery current. Startup marked history pending before
+/// its receipt completed, so this convergence cannot predate that pass.
+fn await_native_history_converged(journey: &ClaudeHostJourney) {
+    let deadline = Instant::now() + SETTLEMENT_BUDGET;
+    loop {
+        let status: LcmStatusResultV1 =
+            serde_json::from_value(native_tool_payload(native_tool_document_until(
+                journey,
+                &journey.project,
+                "tracedecay_lcm_status",
+                &json!({
+                    "provider": if journey.codex { "codex" } else { "claude" },
+                    "format": "json",
+                }),
+                deadline,
+            )))
+            .expect("typed LCM status");
+        assert_eq!(status.status, RetainedOutcomeStatusV1::Ok, "{status:?}");
+        let projection = status
+            .projection
+            .as_ref()
+            .expect("the project store must have a refresh worker");
+        match projection.convergence.state {
+            LcmConvergenceStateV1::Converged => return,
+            LcmConvergenceStateV1::Converging => {}
+            LcmConvergenceStateV1::Blocked | LcmConvergenceStateV1::Unavailable => {
+                panic!("startup historical catch-up cannot converge: {status:?}")
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "startup historical catch-up did not converge: {status:?}"
         );
         std::thread::sleep(JOURNAL_POLL_INTERVAL);
     }

@@ -256,6 +256,43 @@ fn production_text_serving_builds_publishes_and_reopens_the_artifact_head() {
         .path()
         .join("code-text-artifact-restore-witnesses-v1")
         .join(artifact_file.replace(".bin", ".json"));
+    if cfg!(unix) {
+        // The build loop opens the artifact right after its last write. A
+        // change time vouches for the bytes only once the coarse change clock
+        // has left its quantum, so an open inside that tick rightly persists
+        // no witness. Wait for the stamp to settle (bounded by its quantum),
+        // then a fresh full-verification open must regenerate the witness.
+        let settle_started = std::time::Instant::now();
+        while !tracedecay_private_fs::RewriteWitness::NATIVE.vouches_for_unchanged_bytes(
+            &std::fs::metadata(&artifact_path).expect("published artifact metadata"),
+        ) {
+            assert!(
+                settle_started.elapsed() < std::time::Duration::from_secs(10),
+                "the artifact change time never settled"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        if !witness_path.is_file() {
+            let regenerating = scheduler(
+                &fixture,
+                store.path().to_path_buf(),
+                Arc::new(SharedCodeIndexBytePoolV1::default()),
+            );
+            regenerating
+                .publication
+                .load_active_shared()
+                .expect("durable generation remains readable")
+                .expect("active generation remains published");
+            assert!(
+                regenerating
+                    .latest_complete()
+                    .expect("regenerating generation")
+                    .advance_text_serving(1)
+                    .expect("full-verification reopen"),
+                "a published durable head must reopen without a rebuild"
+            );
+        }
+    }
     assert_eq!(
         witness_path.is_file(),
         cfg!(unix),

@@ -566,6 +566,12 @@ async fn run_memory_curator_for_store_with_publication(
         Ok(record) => record,
         Err(error) => {
             if let Some(committed_receipt) = committed_receipt {
+                // The static detail below replaces `error`; keep its cause.
+                tracing::warn!(
+                    run_id = %run.run_id,
+                    %error,
+                    "memory curation terminal publication failed after commit"
+                );
                 return Err(AutomationRunError::PartialEffect {
                     run_id: run.run_id.clone(),
                     committed_receipt: Box::new(AutomationCommittedReceipt::MemoryCuration(
