@@ -256,45 +256,25 @@ jobs:
     if: ${{ needs.scope-gate.outputs.run-os == 'true' }}
     runs-on: ${{ vars.DEPOT_MACOS_RUNNER || 'macos-26' }}
     timeout-minutes: 330
-    # One partition definition keeps macOS and Linux coverage aligned.
+    # Depot admits macOS jobs slowly (run 38652711787's four shards started
+    # 29 to 65 minutes into the run) and every job pays setup and a binary
+    # build, so macOS runs two shards whose union is the workspace: the
+    # root crate, and everything else.
     strategy:
       fail-fast: false
-      matrix: &workspace_test_shards
+      matrix:
         include:
-          - shard: root-a
-            targets: >-
-              //crates/tracedecay:mcp_suite
-              //crates/tracedecay:storage_suite
-          - shard: root-b
+          - shard: root
             targets: >-
               --
               //crates/tracedecay/...
-              -//crates/tracedecay:mcp_suite
               -//crates/tracedecay:dashboard_api_test
               -//crates/tracedecay:daemon_suite
-              -//crates/tracedecay:storage_suite
-          - shard: workspace-code
-            targets: >-
-              --
-              //crates/tracedecay-cli/...
-              //crates/tracedecay-code-extraction/...
-              //crates/tracedecay-code-index/...
-              //crates/tracedecay-code-index-retention/...
-              //crates/tracedecay-code-index-runtime/...
-          # Everything outside the root crate except the cli and code-index
-          # group, plus the two root suites that finished root-a's queue.
-          # Root-a ran its suites one at a time for eleven minutes on Linux
-          # (run 38652711787) while this shard's tests took about one.
           - shard: workspace
             targets: >-
               --
               //...
               -//crates/tracedecay/...
-              -//crates/tracedecay-cli/...
-              -//crates/tracedecay-code-extraction/...
-              -//crates/tracedecay-code-index/...
-              -//crates/tracedecay-code-index-retention/...
-              -//crates/tracedecay-code-index-runtime/...
               //crates/tracedecay:dashboard_api_test
               //crates/tracedecay:daemon_suite
     steps:
@@ -343,7 +323,7 @@ jobs:
         with:
           cache-key: ci-macos-test
           test-tools: "true"
-          save-download-caches: ${{ matrix.shard == 'root-b' }}
+          save-download-caches: ${{ matrix.shard == 'root' }}
 
       # Materialize build outputs before deadline-bearing tests: remote-cache
       # downloads otherwise compete for disk even with HOST_CPUS reserved.
@@ -359,7 +339,7 @@ jobs:
       # Save right after the build: a failing test later in the job must
       # not discard the four-minute crate_universe splice.
       - name: Save the Bazel module lockfile
-        if: matrix.shard == 'root-b' && steps.bazel.outputs.module-lockfile-hit != 'true'
+        if: matrix.shard == 'root' && steps.bazel.outputs.module-lockfile-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: MODULE.bazel.lock
@@ -391,10 +371,10 @@ jobs:
             bazel-testlogs/**/test.log
             bazel-testlogs/**/test.xml
 
-      # All macOS shards restore this prefix; root-b alone saves compiled
+      # Both macOS shards restore this prefix; root alone saves compiled
       # actions so matrix jobs cannot race the same Actions cache key.
       - name: Save compiled Bazel actions
-        if: always() && !cancelled() && (github.ref == 'refs/heads/master' || github.event_name == 'pull_request') && matrix.shard == 'root-b' && steps.bazel.outputs.disk-cache-key != ''
+        if: always() && !cancelled() && (github.ref == 'refs/heads/master' || github.event_name == 'pull_request') && matrix.shard == 'root' && steps.bazel.outputs.disk-cache-key != ''
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.bazel.outputs.disk-cache-path }}
@@ -426,7 +406,44 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
-      matrix: *workspace_test_shards
+      matrix:
+        include:
+          - shard: root-a
+            targets: >-
+              //crates/tracedecay:mcp_suite
+              //crates/tracedecay:storage_suite
+          - shard: root-b
+            targets: >-
+              --
+              //crates/tracedecay/...
+              -//crates/tracedecay:mcp_suite
+              -//crates/tracedecay:dashboard_api_test
+              -//crates/tracedecay:daemon_suite
+              -//crates/tracedecay:storage_suite
+          - shard: workspace-code
+            targets: >-
+              --
+              //crates/tracedecay-cli/...
+              //crates/tracedecay-code-extraction/...
+              //crates/tracedecay-code-index/...
+              //crates/tracedecay-code-index-retention/...
+              //crates/tracedecay-code-index-runtime/...
+          # Everything outside the root crate except the cli and code-index
+          # group, plus the two root suites that finished root-a's queue.
+          # Root-a ran its suites one at a time for eleven minutes on Linux
+          # (run 38652711787) while this shard's tests took about one.
+          - shard: workspace
+            targets: >-
+              --
+              //...
+              -//crates/tracedecay/...
+              -//crates/tracedecay-cli/...
+              -//crates/tracedecay-code-extraction/...
+              -//crates/tracedecay-code-index/...
+              -//crates/tracedecay-code-index-retention/...
+              -//crates/tracedecay-code-index-runtime/...
+              //crates/tracedecay:dashboard_api_test
+              //crates/tracedecay:daemon_suite
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
