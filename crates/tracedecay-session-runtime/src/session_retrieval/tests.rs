@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use super::*;
 use serde_json::json;
@@ -1528,6 +1529,126 @@ async fn require_fresh_with_a_current_refresh_worker_is_not_refused_as_worker_mi
         | SessionRetrievalServiceOutcome::Partial { .. } => {}
         other => panic!("unexpected RequireFresh outcome with a current worker: {other:?}"),
     }
+}
+
+/// First history pass: retryable backpressure that commits nothing and names
+/// no capacity signal. Every later pass completes.
+#[derive(Default)]
+struct BackpressuredOnceHistory {
+    passes: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::session_temporal_refresh_scheduler::history::SessionHistoricalIngestor
+    for BackpressuredOnceHistory
+{
+    fn run_pass(
+        &self,
+    ) -> crate::session_temporal_refresh_scheduler::history::SessionHistoricalIngestPass<'_> {
+        use crate::session_temporal_refresh_scheduler::history::SessionHistoricalIngestOutcome;
+        let pass = self
+            .passes
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Box::pin(async move {
+            if pass == 0 {
+                SessionHistoricalIngestOutcome::Retryable {
+                    reason_code: "ingest_pass_backpressured".to_owned(),
+                    made_progress: false,
+                }
+            } else {
+                SessionHistoricalIngestOutcome::Complete
+            }
+        })
+    }
+
+    fn capacity_release(
+        &self,
+    ) -> crate::session_temporal_refresh_scheduler::history::SessionHistoricalCapacityRelease {
+        crate::session_temporal_refresh_scheduler::history::SessionHistoricalCapacityRelease::new(
+            Vec::new(),
+        )
+    }
+
+    fn cancel(&self) {}
+}
+
+/// A `RequireFresh` read refused because a historical retry is owed must get
+/// that retry run promptly. The retry above names no capacity signal, so
+/// without the read's request the worker only re-runs it at its one-minute
+/// idle recheck, and every fresh read in between is refused.
+#[tokio::test(start_paused = true)]
+async fn a_fresh_read_refused_for_a_historical_retry_readmits_that_retry() {
+    use std::sync::atomic::Ordering;
+    let harness = tracedecay_global_db::tests::harness::RegisteredGlobalDbHarness::open(
+        "session-retrieval-fresh-read-readmits-history",
+    )
+    .await;
+    let state = std::sync::Arc::new(
+        crate::session_temporal_refresh_scheduler::wake::SessionTemporalRefreshWakeState::default(),
+    );
+    let history = std::sync::Arc::new(BackpressuredOnceHistory::default());
+    let ingestor: crate::session_temporal_refresh_scheduler::history::SharedSessionHistoricalIngestor =
+        history.clone();
+    state.mark_history_pending();
+    state.wake_history();
+    let worker = tokio::spawn(
+        crate::session_temporal_refresh_scheduler::run_session_temporal_refresh_scheduler(
+            harness.registered.clone(),
+            std::sync::Arc::clone(&state),
+            std::sync::Arc::new(
+                crate::session_temporal_refresh_scheduler::projector::CanonicalSessionTemporalProjector,
+            ),
+            std::sync::Arc::new(std::sync::RwLock::new(Some(ingestor))),
+            std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            crate::session_temporal_refresh_scheduler::projector::SessionTemporalRefreshPolicy::default(),
+        ),
+    );
+    // The backpressured pass ran and the worker now waits for a release.
+    for _ in 0..10_000 {
+        if history.passes.load(Ordering::Acquire) == 1 && state.history_retry_pending() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(
+        state.history_retry_pending(),
+        "the backpressured history pass must leave its retry pending"
+    );
+
+    let root = registered_profile_retrieval_root(&harness.registered);
+    let scope = root
+        .identity()
+        .session_request_scope()
+        .expect("profile session scope");
+    let service =
+        DaemonSessionRetrievalService::new(harness.registered.clone(), root, state.handle())
+            .expect("registered retrieval service");
+    let query = admitted_session_query("session.fresh-read.history-retry", None)
+        .with_freshness_policy(SessionFreshnessPolicy::RequireFresh);
+    match service
+        .retrieve_admitted(&admitted_lookup_context(scope), query)
+        .await
+    {
+        SessionRetrievalServiceOutcome::Unavailable(unavailable) => assert_eq!(
+            unavailable.reason,
+            SessionRetrievalUnavailableReason::HistoricalRetry
+        ),
+        other => panic!("a pending historical retry must refuse RequireFresh: {other:?}"),
+    }
+
+    let refused_at = tokio::time::Instant::now();
+    while history.passes.load(Ordering::Acquire) < 2
+        && refused_at.elapsed() < Duration::from_secs(120)
+    {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let waited = refused_at.elapsed();
+    assert_eq!(history.passes.load(Ordering::Acquire), 2);
+    assert!(
+        waited < Duration::from_secs(1),
+        "the refused fresh read waited {waited:?} for the historical retry"
+    );
+    state.cancel();
+    worker.await.expect("refresh worker exits on cancellation");
 }
 
 struct FixedRefreshServing(SessionProjectionServingState);

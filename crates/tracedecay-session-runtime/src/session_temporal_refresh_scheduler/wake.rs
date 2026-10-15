@@ -1026,6 +1026,19 @@ impl SessionProjectionServingStatusPort for SessionTemporalRefreshWake {
             |state| state.serving_status(),
         )
     }
+
+    /// A retry that committed nothing waits for a capacity release, and a
+    /// refusal no release signals waits for the idle recheck. A reader that
+    /// needs that history now runs the retry instead; a worker that is not
+    /// waiting on a retry is left alone.
+    fn request_historical_retry(&self) {
+        let Some(state) = self.target() else {
+            return;
+        };
+        if !state.cancelled.load(Ordering::Acquire) && state.history_retry_pending() {
+            state.wake_history();
+        }
+    }
 }
 
 #[cfg(test)]

@@ -93,6 +93,11 @@ pub struct SessionProjectionServingStatus {
 
 pub trait SessionProjectionServingStatusPort: Send + Sync {
     fn serving_status(&self) -> SessionProjectionServingStatus;
+
+    /// A fresh read was refused because historical catch-up is still owed.
+    /// A port backed by a live worker re-admits a historical retry that is
+    /// waiting on a release; a port without a worker has nothing to wake.
+    fn request_historical_retry(&self) {}
 }
 
 /// The serving status of a store no refresh worker is mounted for.
