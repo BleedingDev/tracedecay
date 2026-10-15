@@ -137,6 +137,34 @@ async fn active_publication_generation(
     CodeGenerationId::new(generation_id).expect("valid active generation id")
 }
 
+/// The serving head may only ever name the incumbent or the canonical
+/// competitor while a stale admission candidate races a competing reconcile.
+///
+/// Which of the two serves at a given instant is not an invariant: the serving
+/// swap converges on the active durable publication
+/// (`ServingSwapOutcomeV1::decide`), and any worker pass that won the
+/// background admission ahead of this test's hold may seat the competitor as
+/// soon as its graph tail finishes. The stale candidate must never serve.
+async fn assert_serving_excludes_stale_candidate(
+    registry: &CodeIndexSchedulerRegistryV1,
+    project_root: &Path,
+    incumbent: &CodeGenerationId,
+    competitor: &CodeGenerationId,
+    candidate: &CodeGenerationId,
+    context: &str,
+) {
+    let serving = registry
+        .latest_generation_id(project_root)
+        .await
+        .unwrap_or_else(|| panic!("{context}: the mounted worktree serves no generation"));
+    assert_ne!(&serving, candidate, "{context}: stale candidate serves");
+    assert!(
+        &serving == incumbent || &serving == competitor,
+        "{context}: serving {serving:?} is neither the incumbent {incumbent:?} nor the \
+         competitor {competitor:?}"
+    );
+}
+
 async fn wait_for_active_publication_change(
     registry: &CodeIndexSchedulerRegistryV1,
     project_root: &Path,
@@ -387,14 +415,21 @@ export function CompetingTrackedEdit(value: PublicWidget) { return value.value; 
         .expect("admission task joins")
         .expect_err("superseded activation cannot publish serving state");
     assert_refusal(error, CodeIndexIgnoredDependencyRefusalV1::StaleGeneration);
+    // FIFO admission does not make this hold the follow-up: a worker pass
+    // woken while the admission owned the permit queued ahead of this hold,
+    // wins the permit first, and seats the competitor from its graph tail.
     let worker_hold = worker_hold
         .await
-        .expect("hold the authoritative follow-up reconcile");
-    assert_eq!(
-        registry.latest_generation_id(fixture.path()).await,
-        Some(incumbent.clone()),
-        "a candidate superseded in the canonical store cannot replace the incumbent serving head"
-    );
+        .expect("hold the background reconcile admission");
+    assert_serving_excludes_stale_candidate(
+        &registry,
+        fixture.path(),
+        &incumbent,
+        &competitor,
+        &candidate,
+        "a candidate superseded in the canonical store cannot replace the serving head",
+    )
+    .await;
     assert_eq!(
         active_publication_generation(&registry, fixture.path()).await,
         competitor,
@@ -417,11 +452,15 @@ export function CompetingTrackedEdit(value: PublicWidget) { return value.value; 
     held_rx.recv().expect("follow-up scheduler is held");
     drop(worker_hold);
     wait_for_reconciling(&registry, 1).await;
-    assert_eq!(
-        registry.latest_generation_id(fixture.path()).await,
-        Some(incumbent.clone()),
-        "the scheduled follow-up cannot expose the stale admission candidate while blocked"
-    );
+    assert_serving_excludes_stale_candidate(
+        &registry,
+        fixture.path(),
+        &incumbent,
+        &competitor,
+        &candidate,
+        "the scheduled follow-up cannot expose the stale admission candidate while blocked",
+    )
+    .await;
     release_tx.send(()).expect("release follow-up scheduler");
     scheduler_hold
         .join()
