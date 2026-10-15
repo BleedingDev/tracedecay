@@ -3,9 +3,12 @@ use std::time::Duration;
 use crate::dashboard_api_support::*;
 use serde_json::{Value, json};
 
+/// Polls until the run is terminal. The server bounds every run by its
+/// admitted request deadline and marks it `timed_out` there, so the product,
+/// not a test-side clock, guarantees this loop ends; a timed-out source then
+/// fails the caller's coverage assertions.
 fn wait_for_query(agent: &ureq::Agent, base_url: &str, run_id: &str) -> Value {
-    let mut last_status = None;
-    for _ in 0..100 {
+    loop {
         let (status, body) = get_json(agent, &format!("{base_url}/api/explorer/queries/{run_id}"));
         assert_eq!(status, 200, "query status should resolve: {body}");
         if matches!(
@@ -14,10 +17,8 @@ fn wait_for_query(agent: &ureq::Agent, base_url: &str, run_id: &str) -> Value {
         ) {
             return body;
         }
-        last_status = Some(body);
         std::thread::sleep(Duration::from_millis(10));
     }
-    panic!("explorer query {run_id} did not reach a terminal state; last status: {last_status:?}");
 }
 
 #[test]

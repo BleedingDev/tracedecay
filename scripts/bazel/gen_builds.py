@@ -1008,6 +1008,50 @@ def main():
             size = test_sizes.pop(target, None)
             return f'    size = "{size}",' if size else None
 
+        test_partitions = (p.get("metadata") or {}).get("bazel", {}).get("test_partitions", {})
+        if not isinstance(test_partitions, dict) or any(
+            not isinstance(groups, dict)
+            or any(
+                not isinstance(modules, list) or not modules
+                or not all(
+                    isinstance(module, str)
+                    and all(segment.isidentifier() for segment in module.split("::"))
+                    for module in modules
+                )
+                for modules in groups.values()
+            )
+            for groups in test_partitions.values()
+        ):
+            sys.exit(
+                f"{name}: package.metadata.bazel.test_partitions must map a test target to "
+                "partition names, each listing test module paths such as `a` or `a::b`"
+            )
+        test_partitions = dict(test_partitions)
+
+        def test_partitions_attr(target, test):
+            """A partition runs its modules of `target`'s binary as its own
+            Bazel test (scripts/bazel/rust_test.bzl). A module that no longer
+            exists would leave its partition passing with zero tests."""
+            groups = test_partitions.pop(target, None)
+            if not groups:
+                return None
+            root = Path(test["src_path"]).parent
+            for partition, modules in groups.items():
+                if partition in used_names:
+                    sys.exit(f"{name}: test partition {partition} reuses a target name")
+                used_names.add(partition)
+                for module in modules:
+                    path = root.joinpath(*module.split("::"))
+                    if not (path.with_suffix(".rs").is_file() or (path / "mod.rs").is_file()):
+                        sys.exit(f"{name}: test partition {partition} names missing module {module} of {target}")
+            lines = ["    partitions = {"]
+            for partition, modules in sorted(groups.items()):
+                lines.append(f"        {json.dumps(partition)}: [")
+                lines += [f"            {json.dumps(module)}," for module in sorted(modules)]
+                lines.append("        ],")
+            lines.append("    },")
+            return "\n".join(lines)
+
         # Mirror the Cargo `perf` profile hosted CI tests with: the package's
         # opt-level with debug assertions and overflow checks on. `-c opt`
         # (release) keeps the toolchain's own opt-level 3 without assertions.
@@ -1378,6 +1422,7 @@ def main():
                 "rust_test(",
                 f'    name = "{test_name}",',
                 test_size_attr(test_name),
+                test_partitions_attr(test_name, t),
                 # Cargo metadata distinguishes opt-in measurements from default tests.
                 '    tags = ["manual"],'
                 if manual_benchmark else None,
@@ -1453,6 +1498,8 @@ def main():
 
         if test_sizes:
             sys.exit(f"{name}: test_sizes names unknown test targets: {', '.join(sorted(test_sizes))}")
+        if test_partitions:
+            sys.exit(f"{name}: test_partitions names unknown test targets: {', '.join(sorted(test_partitions))}")
         if name == "tracedecay-sdk":
             # The Bazel-only SDK generator reuses the canonical renderer and
             # compares its output with the checked-in Rust descriptors.

@@ -23,6 +23,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Every job records the same value in MODULE.bazel.lock, so a saved
+  # lockfile matches every later job (see setup-bazel).
+  CARGO_BAZEL_TIMEOUT: "3600"
 
 jobs:
   # Drafts run cheap gates. Ready PRs, pushes and dispatches run everything:
@@ -81,6 +84,8 @@ jobs:
           config: ci
           dest: target/debug
           cache-key: ci-linux-arm64
+          # The only arm64 Linux Bazel job here, so it seeds that lockfile.
+          save-module-lockfile: "true"
 
       - name: Publish the binary for the host integration jobs
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -204,12 +209,22 @@ jobs:
           bash tests/dashboard_bundle_check_test.sh
           bash tests/dashboard_digests_check_test.sh
 
+      # Gates finishes before the other Linux jobs, so its saved module
+      # lockfile is the one concurrent and later runs restore.
       - uses: ./.github/actions/setup-bazel
+        id: bazel
         with:
           cache-key: ci-format-linux
 
       - name: Check formatting
         run: bazel build --config=ci //:rustfmt_check
+
+      - name: Save the Bazel module lockfile
+        if: steps.bazel.outputs.module-lockfile-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: MODULE.bazel.lock
+          key: ${{ steps.bazel.outputs.module-lockfile-key }}
 
       # Manifest edits that skip a gen_builds.py rerun leave stale BUILD
       # files; compare the committed files against a fresh generation.
@@ -241,103 +256,27 @@ jobs:
     if: ${{ needs.scope-gate.outputs.run-os == 'true' }}
     runs-on: ${{ vars.DEPOT_MACOS_RUNNER || 'macos-26' }}
     timeout-minutes: 330
-    # One partition definition keeps macOS and Linux coverage aligned.
+    # Depot admits macOS jobs slowly (run 38652711787's four shards started
+    # 29 to 65 minutes into the run) and every job pays setup and a binary
+    # build, so macOS runs two shards whose union is the workspace: the
+    # root crate, and everything else.
     strategy:
       fail-fast: false
-      matrix: &workspace_test_shards
+      matrix:
         include:
-          - shard: root-a
-            targets: >-
-              //crates/tracedecay:mcp_suite
-              //crates/tracedecay:dashboard_api_test
-              //crates/tracedecay:daemon_suite
-              //crates/tracedecay:storage_suite
-              //crates/tracedecay-cli:refresh_memory_journey
-          - shard: root-b
+          - shard: root
             targets: >-
               --
               //crates/tracedecay/...
-              -//crates/tracedecay:mcp_suite
               -//crates/tracedecay:dashboard_api_test
               -//crates/tracedecay:daemon_suite
-              -//crates/tracedecay:storage_suite
-          # Four package groups. New crates land in workspace-c via the
-          # catch-all until listed here for balance.
-          - shard: workspace-a
-            targets: >-
-              //crates/tracedecay-agent-hosts/...
-              //crates/tracedecay-api/...
-              //crates/tracedecay-application/...
-              //crates/tracedecay-automation/...
-              //crates/tracedecay-automation-runtime/...
-              //crates/tracedecay-capture/...
-          - shard: workspace-code
-            targets: >-
-              --
-              //crates/tracedecay-cli/...
-              //crates/tracedecay-code-extraction/...
-              //crates/tracedecay-code-index/...
-              //crates/tracedecay-code-index-retention/...
-              //crates/tracedecay-code-index-runtime/...
-              -//crates/tracedecay-cli:refresh_memory_journey
-          - shard: workspace-b
-            targets: >-
-              //crates/tracedecay-configuration/...
-              //crates/tracedecay-contracts/...
-              //crates/tracedecay-daemon-control/...
-              //crates/tracedecay-daemon-identity/...
-              //crates/tracedecay-daemon-protocol/...
-              //crates/tracedecay-daemon-service/...
-              //crates/tracedecay-dashboard-api/...
-              //crates/tracedecay-domain/...
-              //crates/tracedecay-framing/...
-              //crates/tracedecay-global-db/...
-              //crates/tracedecay-graph-db/...
-              //crates/tracedecay-graph-query/...
-              //crates/tracedecay-hooks/...
-              //crates/tracedecay-host-admission/...
-              //crates/tracedecay-host-integration/...
-              //crates/tracedecay-lcm/...
-              //crates/tracedecay-lsp/...
-              //crates/tracedecay-maintenance/...
-              //crates/tracedecay-mcp/...
-              //crates/tracedecay-mcp-catalog/...
-          - shard: workspace-c
+          - shard: workspace
             targets: >-
               --
               //...
               -//crates/tracedecay/...
-              -//crates/tracedecay-agent-hosts/...
-              -//crates/tracedecay-api/...
-              -//crates/tracedecay-application/...
-              -//crates/tracedecay-automation/...
-              -//crates/tracedecay-automation-runtime/...
-              -//crates/tracedecay-capture/...
-              -//crates/tracedecay-cli/...
-              -//crates/tracedecay-code-extraction/...
-              -//crates/tracedecay-code-index/...
-              -//crates/tracedecay-code-index-retention/...
-              -//crates/tracedecay-code-index-runtime/...
-              -//crates/tracedecay-configuration/...
-              -//crates/tracedecay-contracts/...
-              -//crates/tracedecay-daemon-control/...
-              -//crates/tracedecay-daemon-identity/...
-              -//crates/tracedecay-daemon-protocol/...
-              -//crates/tracedecay-daemon-service/...
-              -//crates/tracedecay-dashboard-api/...
-              -//crates/tracedecay-domain/...
-              -//crates/tracedecay-framing/...
-              -//crates/tracedecay-global-db/...
-              -//crates/tracedecay-graph-db/...
-              -//crates/tracedecay-graph-query/...
-              -//crates/tracedecay-hooks/...
-              -//crates/tracedecay-host-admission/...
-              -//crates/tracedecay-host-integration/...
-              -//crates/tracedecay-lcm/...
-              -//crates/tracedecay-lsp/...
-              -//crates/tracedecay-maintenance/...
-              -//crates/tracedecay-mcp/...
-              -//crates/tracedecay-mcp-catalog/...
+              //crates/tracedecay:dashboard_api_test
+              //crates/tracedecay:daemon_suite
     steps:
       # Full history: the search-quality workload fixture pins a
       # `source_repository_commit`, and `validate_source_bindings` resolves that
@@ -346,14 +285,22 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Remove inactive Xcode installations
+      # Hosted macOS images ran out of disk mid-build; Depot's start with
+      # about 177 GiB free, where deleting ten Xcode copies took three
+      # minutes per job for nothing (run 38644661902).
+      - name: Remove inactive Xcode installations when disk is short
         shell: bash
         run: |
           df -h /
           python3 - <<'PYTHON'
           import pathlib
+          import shutil
           import subprocess
 
+          free_gib = shutil.disk_usage("/").free / 2**30
+          if free_gib >= 100:
+              print(f"{free_gib:.0f} GiB free; keeping the installed Xcode applications.", flush=True)
+              raise SystemExit(0)
           applications = pathlib.Path("/Applications")
           selected = pathlib.Path(subprocess.check_output(["xcode-select", "-p"], text=True).strip()).resolve(strict=True)
           active = next((path for path in selected.parents if path.suffix == ".app"), None)
@@ -376,17 +323,27 @@ jobs:
         with:
           cache-key: ci-macos-test
           test-tools: "true"
-          save-download-caches: ${{ matrix.shard == 'root-b' }}
+          save-download-caches: ${{ matrix.shard == 'root' }}
 
       # Materialize build outputs before deadline-bearing tests: remote-cache
       # downloads otherwise compete for disk even with HOST_CPUS reserved.
       # ort-sys needs an explicit cache directory in Depot's macOS sandbox.
       - name: Build this shard's test binaries
+        id: build
         shell: bash
         run: >-
           bazel build --config=ci --action_env=ORT_CACHE_DIR=/tmp/ort.pyke.io
           --profile="${{ runner.temp }}/bazel-build-profile.json.gz"
           ${{ matrix.targets }}
+
+      # Save right after the build: a failing test later in the job must
+      # not discard the four-minute crate_universe splice.
+      - name: Save the Bazel module lockfile
+        if: matrix.shard == 'root' && steps.bazel.outputs.module-lockfile-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: MODULE.bazel.lock
+          key: ${{ steps.bazel.outputs.module-lockfile-key }}
 
       - name: Build and test this shard
         shell: bash
@@ -414,10 +371,10 @@ jobs:
             bazel-testlogs/**/test.log
             bazel-testlogs/**/test.xml
 
-      # All macOS shards restore this prefix; root-b alone saves compiled
+      # Both macOS shards restore this prefix; root alone saves compiled
       # actions so matrix jobs cannot race the same Actions cache key.
       - name: Save compiled Bazel actions
-        if: always() && !cancelled() && (github.ref == 'refs/heads/master' || github.event_name == 'pull_request') && matrix.shard == 'root-b' && steps.bazel.outputs.disk-cache-key != ''
+        if: always() && !cancelled() && (github.ref == 'refs/heads/master' || github.event_name == 'pull_request') && matrix.shard == 'root' && steps.bazel.outputs.disk-cache-key != ''
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.bazel.outputs.disk-cache-path }}
@@ -436,23 +393,67 @@ jobs:
 
   # Every Rust suite inherits the HOST_CPUS reservation from .bazelrc to
   # account for its libtest worker pool.
-  # Warm v2 cache (run 38071732620) still left workspace-a at 65m because
-  # cli + code-index share one critical path; split that group into
-  # workspace-a (light a–capture) and workspace-code (cli + code-*). One
-  # shared ci-linux-test-v2 prefix; root-b alone saves (a 6.9 GiB second
-  # family previously evicted the budget). root-b and workspace-c catch
-  # unlisted targets in their groups.
+  # cli + code-index share one critical path (65m on a warm v2 cache, run
+  # 38071732620), so they keep the workspace-code shard. One shared
+  # ci-linux-test-v2 prefix; root-b alone saves (a 6.9 GiB second family
+  # previously evicted the budget). root-b and workspace catch unlisted
+  # targets in their groups. root-a and root-b split the root crate's
+  # suite time evenly (run 38689933223: about 330 s each on Linux, 550-600 s
+  # on Windows); unit_test stays in root-b so only one shard compiles it.
   linux-test:
     name: Test Linux (${{ matrix.shard }})
-    needs: [scope-gate, gates]
+    needs: scope-gate
     if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
     runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 240
-    env:
-      CARGO_BAZEL_TIMEOUT: "3600"
     strategy:
       fail-fast: false
-      matrix: *workspace_test_shards
+      matrix:
+        include:
+          - shard: root-a
+            targets: >-
+              //crates/tracedecay:mcp_suite
+              //crates/tracedecay:storage_suite
+              //crates/tracedecay:transport_acceptance_suite
+              //crates/tracedecay:session_suite
+              //crates/tracedecay:automation_runner_test
+              //crates/tracedecay:transcript_ingest_suite
+          - shard: root-b
+            targets: >-
+              --
+              //crates/tracedecay/...
+              -//crates/tracedecay:mcp_suite
+              -//crates/tracedecay:dashboard_api_test
+              -//crates/tracedecay:daemon_suite
+              -//crates/tracedecay:storage_suite
+              -//crates/tracedecay:transport_acceptance_suite
+              -//crates/tracedecay:session_suite
+              -//crates/tracedecay:automation_runner_test
+              -//crates/tracedecay:transcript_ingest_suite
+          - shard: workspace-code
+            targets: >-
+              --
+              //crates/tracedecay-cli/...
+              //crates/tracedecay-code-extraction/...
+              //crates/tracedecay-code-index/...
+              //crates/tracedecay-code-index-retention/...
+              //crates/tracedecay-code-index-runtime/...
+          # Everything outside the root crate except the cli and code-index
+          # group, plus the two root suites that finished root-a's queue.
+          # Root-a ran its suites one at a time for eleven minutes on Linux
+          # (run 38652711787) while this shard's tests took about one.
+          - shard: workspace
+            targets: >-
+              --
+              //...
+              -//crates/tracedecay/...
+              -//crates/tracedecay-cli/...
+              -//crates/tracedecay-code-extraction/...
+              -//crates/tracedecay-code-index/...
+              -//crates/tracedecay-code-index-retention/...
+              -//crates/tracedecay-code-index-runtime/...
+              //crates/tracedecay:dashboard_api_test
+              //crates/tracedecay:daemon_suite
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -489,10 +490,9 @@ jobs:
           test-tools: "true"
           save-download-caches: ${{ matrix.shard == 'root-b' }}
 
-      # Root suites exercise latency-sensitive daemon journeys. Finish their
+      # Every shard runs latency-sensitive daemon journeys. Finish their
       # compilation before testing so compiler work cannot consume that budget.
-      - name: Build root suite binaries
-        if: ${{ startsWith(matrix.shard, 'root-') }}
+      - name: Build this shard's test binaries
         run: >-
           bazel build --config=ci
           --profile="${{ runner.temp }}/bazel-build-profile.json.gz"
@@ -545,19 +545,17 @@ jobs:
       - name: Require every Linux test shard
         run: test "${{ needs.linux-test.result }}" = "success"
 
-  # Three shards, not the six macOS and Linux use: every Windows invocation
-  # pays about five minutes of loading and analysis, and the whole-workspace
-  # job ran its test tail strictly one suite at a time (mcp_suite alone held
-  # the runner for twelve minutes), so the root suites with long poles get a
-  # shard of their own and the rest of the root crate another.
+  # Three shards: the whole-workspace job ran its test tail strictly one
+  # suite at a time (mcp_suite alone held the runner for eleven minutes), so
+  # the root crate's suites split across root-a and root-b by measured run
+  # time, as on Linux, and the workspace shard, whose own tests take about
+  # four minutes, also runs the daemon and dashboard suites.
   windows-test:
     name: Windows checks (${{ matrix.shard }})
-    needs: [scope-gate, gates]
+    needs: scope-gate
     if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
     runs-on: ${{ vars.DEPOT_WINDOWS_RUNNER || 'windows-latest' }}
     timeout-minutes: 330
-    env:
-      CARGO_BAZEL_TIMEOUT: "3600"
     strategy:
       fail-fast: false
       matrix:
@@ -565,10 +563,11 @@ jobs:
           - shard: root-a
             targets: >-
               //crates/tracedecay:mcp_suite
-              //crates/tracedecay:dashboard_api_test
-              //crates/tracedecay:daemon_suite
               //crates/tracedecay:storage_suite
-              //crates/tracedecay-cli:refresh_memory_journey
+              //crates/tracedecay:transport_acceptance_suite
+              //crates/tracedecay:session_suite
+              //crates/tracedecay:automation_runner_test
+              //crates/tracedecay:transcript_ingest_suite
           - shard: root-b
             targets: >-
               --
@@ -577,12 +576,17 @@ jobs:
               -//crates/tracedecay:dashboard_api_test
               -//crates/tracedecay:daemon_suite
               -//crates/tracedecay:storage_suite
+              -//crates/tracedecay:transport_acceptance_suite
+              -//crates/tracedecay:session_suite
+              -//crates/tracedecay:automation_runner_test
+              -//crates/tracedecay:transcript_ingest_suite
           - shard: workspace
             targets: >-
               --
               //...
               -//crates/tracedecay/...
-              -//crates/tracedecay-cli:refresh_memory_journey
+              //crates/tracedecay:dashboard_api_test
+              //crates/tracedecay:daemon_suite
     steps:
       # Full history: the search-quality workload fixture pins a
       # `source_repository_commit`, and `validate_source_bindings` resolves that
@@ -609,6 +613,7 @@ jobs:
       # applying Linux's Clippy warning policy to this compiler-only check.
       # One shard covers the whole workspace; the others have nothing to add.
       - name: Compile the Windows workspace
+        id: compile
         if: ${{ needs.scope-gate.outputs.run-os != 'true' && matrix.shard == 'workspace' }}
         shell: bash
         run: >-
@@ -622,12 +627,22 @@ jobs:
       # reserves HOST_CPUS otherwise parks the remaining compiles behind it
       # for its whole run.
       - name: Build this shard's test binaries
+        id: build
         if: ${{ needs.scope-gate.outputs.run-os == 'true' }}
         shell: bash
         run: >-
           bazel build --config=ci
           --profile="${{ runner.temp }}/bazel-build-profile.json.gz"
           ${{ matrix.targets }}
+
+      # Save right after the build: a failing test later in the job must
+      # not discard the four-minute crate_universe splice.
+      - name: Save the Bazel module lockfile
+        if: matrix.shard == 'workspace' && steps.bazel.outputs.module-lockfile-hit != 'true' && (steps.compile.outcome == 'success' || steps.build.outcome == 'success')
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: MODULE.bazel.lock
+          key: ${{ steps.bazel.outputs.module-lockfile-key }}
 
       - name: Build and test this shard
         if: ${{ needs.scope-gate.outputs.run-os == 'true' }}
@@ -681,7 +696,7 @@ jobs:
   # `cargo clippy --workspace --all-targets -D warnings` equivalent.
   clippy:
     name: Clippy
-    needs: [scope-gate, gates]
+    needs: scope-gate
     if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
     # Same image as Test Linux so rustc action keys can restore that job's
     # disk cache (proc-macros, build scripts, grammar cc, matching rlibs)
