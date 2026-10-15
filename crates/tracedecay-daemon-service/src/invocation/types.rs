@@ -91,8 +91,43 @@ type HookOrchestrationEventKeyV1 = ([u8; 16], [u8; 16], [u8; 16], Option<Manifes
 type HookOrchestrationAddressV1 = String;
 type HookOrchestrationCompletionV1 = Arc<dyn Fn() + Send + Sync + 'static>;
 
+/// Where one boundary falls in its host's order: the provider's native
+/// sequence when both boundaries carry one, else the capture time.
+#[derive(Clone, Copy)]
+struct HookOrchestrationBoundaryOrderV1 {
+    producer: tracedecay_domain::NativeHostIdentityV1,
+    ordering: tracedecay_hooks::HookOrderingV1,
+    observed_at: tracedecay_domain::UtcMicros,
+}
+
+impl HookOrchestrationBoundaryOrderV1 {
+    fn of(envelope: &HookEventEnvelopeV2) -> Self {
+        Self {
+            producer: envelope.producer,
+            ordering: envelope.ordering,
+            observed_at: envelope.observed_at,
+        }
+    }
+
+    /// Whether this boundary was captured strictly before `later` by the same
+    /// host. Boundaries the host cannot order keep the arrival order.
+    fn precedes(self, later: Self) -> bool {
+        if self.producer != later.producer {
+            return false;
+        }
+        match (self.ordering, later.ordering) {
+            (
+                tracedecay_hooks::HookOrderingV1::ProviderSequence(earlier),
+                tracedecay_hooks::HookOrderingV1::ProviderSequence(later),
+            ) => earlier < later,
+            _ => self.observed_at < later.observed_at,
+        }
+    }
+}
+
 struct HookOrchestrationInFlightEntryV1 {
     event: HookOrchestrationEventKeyV1,
+    boundary: HookOrchestrationBoundaryOrderV1,
     lifecycle: Option<ContextScoutLifecycleAddressV1>,
     cancellation: tracedecay_runtime_core::cancellation::CancellationToken,
     superseded: std::sync::atomic::AtomicBool,
@@ -237,6 +272,27 @@ impl BoundedHookOrchestratorV1 {
         }
     }
 
+    /// Joins `incumbent`'s cycle: its one terminal settles every joined
+    /// admission, up to the coalescing bound.
+    fn join_incumbent(
+        incumbent: &HookOrchestrationInFlightEntryV1,
+        completion: Option<HookOrchestrationCompletionV1>,
+    ) -> Result<
+        tracedecay_runtime_core::cancellation::CancellationToken,
+        HookOrchestrationAdmissionV1,
+    > {
+        if let Some(completion) = completion {
+            let Ok(mut completions) = incumbent.completions.lock() else {
+                return Err(HookOrchestrationAdmissionV1::Unavailable);
+            };
+            if completions.len() >= MAX_COALESCED_HOOK_COMPLETIONS {
+                return Err(HookOrchestrationAdmissionV1::Backpressured);
+            }
+            completions.push(completion);
+        }
+        Ok(incumbent.cancellation.clone())
+    }
+
     #[tracing::instrument(name = "daemon.service.hooks.admit", level = "trace", skip_all)]
     pub fn admit(&self, request: HookOrchestrationRequestV1) -> HookOrchestrationAdmissionV1 {
         match self.admit_with_cancellation(request) {
@@ -262,6 +318,7 @@ impl BoundedHookOrchestratorV1 {
             envelope.event_id,
             request.explicit_request_id.clone(),
         );
+        let boundary = HookOrchestrationBoundaryOrderV1::of(envelope);
         let Some(address) = Self::stable_address(&request) else {
             return Err(HookOrchestrationAdmissionV1::Unavailable);
         };
@@ -281,16 +338,7 @@ impl BoundedHookOrchestratorV1 {
                 // The exact boundary is already running. Join it: one cycle
                 // terminates once and every joined admission observes that one
                 // terminal, so a duplicate never consumes a second permit.
-                if let Some(completion) = completion {
-                    let Ok(mut completions) = incumbent.completions.lock() else {
-                        return Err(HookOrchestrationAdmissionV1::Unavailable);
-                    };
-                    if completions.len() >= MAX_COALESCED_HOOK_COMPLETIONS {
-                        return Err(HookOrchestrationAdmissionV1::Backpressured);
-                    }
-                    completions.push(completion);
-                }
-                return Ok(incumbent.cancellation.clone());
+                return Self::join_incumbent(&incumbent, completion);
             }
             // A public request may refer to the last mounted hook while a
             // newer native edit is still producing its authority. It cannot
@@ -303,6 +351,16 @@ impl BoundedHookOrchestratorV1 {
                 })
             {
                 return Err(HookOrchestrationAdmissionV1::Backpressured);
+            }
+            // Supersession settles the incumbent's receipt, which is only
+            // honest when the successor is the newer boundary. A redriven
+            // older boundary (for example one whose superseded cycle is still
+            // committing its completion) must not settle the newer boundary's
+            // owed work; the newer cycle subsumes it, so it joins that cycle.
+            if let Some(incumbent) = in_flight.addresses.get(&address)
+                && boundary.precedes(incumbent.boundary)
+            {
+                return Self::join_incumbent(incumbent, completion);
             }
             let permit = if let Some(incumbent) = in_flight.addresses.remove(&address) {
                 // A newer boundary at the same stable address supersedes the
@@ -326,6 +384,7 @@ impl BoundedHookOrchestratorV1 {
             let work_cancellation = tracedecay_runtime_core::cancellation::CancellationToken::new();
             let operation = Arc::new(HookOrchestrationInFlightEntryV1 {
                 event: event.clone(),
+                boundary,
                 lifecycle: request.lifecycle.clone(),
                 cancellation: work_cancellation,
                 superseded: std::sync::atomic::AtomicBool::new(false),

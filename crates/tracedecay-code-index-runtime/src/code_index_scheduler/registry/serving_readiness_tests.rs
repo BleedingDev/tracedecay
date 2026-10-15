@@ -281,19 +281,24 @@ async fn serving_waiter_tracks_installation_freshness_and_retirement() {
     move_git_metadata(&project);
     changes.borrow_and_update();
     let serving_seat_before_move = *serving_seats.borrow_and_update();
+    let source_freshness = registry
+        .source_freshness_for_root(&project)
+        .await
+        .expect("mounted source-freshness fence");
+    let source_sweeps_before_move = source_freshness.source_sweeps_for_test();
     // One sample at millisecond zero cannot tell a parked worker from a pass
     // that advertised itself idle and is still about to publish its seat and
     // renew the source proof. Sample the whole window.
+    //
+    // Each read completing while this test still holds the worker's admission
+    // and build/publication lock proves it does not wait on the worker. The
+    // fence's sweep count proves it does not walk source. A per-call
+    // wall-clock bound only stood in for both, and canonicalizing and
+    // stat-ing Git metadata on a loaded Windows runner outlasted it.
     let unproven_window = Instant::now() + Duration::from_millis(250);
     loop {
         assert!(
-            tokio::time::timeout(
-                Duration::from_millis(250),
-                registry.latest_complete_ready(&project)
-            )
-            .await
-            .expect("moved-metadata readiness returns without walking source")
-            .is_none(),
+            registry.latest_complete_ready(&project).await.is_none(),
             "moved Git metadata cannot be promoted current before the worker renews the proof"
         );
         if Instant::now() >= unproven_window {
@@ -301,6 +306,11 @@ async fn serving_waiter_tracks_installation_freshness_and_retirement() {
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    assert_eq!(
+        source_freshness.source_sweeps_for_test(),
+        source_sweeps_before_move,
+        "moved-metadata readiness returns without walking source"
+    );
     assert_eq!(
         *serving_seats.borrow(),
         serving_seat_before_move,

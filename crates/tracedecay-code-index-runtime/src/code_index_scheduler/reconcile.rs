@@ -532,6 +532,10 @@ pub(crate) struct SourceFreshnessFenceV1 {
     source_epoch: Arc<AtomicU64>,
     /// Held only by source sweeps, never across a scheduler pass.
     sweep_cache: Arc<Mutex<SourceSweepCacheV1>>,
+    /// Source sweeps run through `sweep_cache`, so tests can prove a path
+    /// never walked source instead of inferring it from elapsed time.
+    #[cfg(test)]
+    source_sweeps: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -569,7 +573,15 @@ impl SourceFreshnessFenceV1 {
             last_reconciled_at_micros: Arc::new(AtomicI64::new(0)),
             source_epoch,
             sweep_cache: Arc::new(Mutex::new(SourceSweepCacheV1::new(path_policy))),
+            #[cfg(test)]
+            source_sweeps: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// How many source sweeps this fence has started.
+    #[cfg(test)]
+    pub(super) fn source_sweeps_for_test(&self) -> u64 {
+        self.source_sweeps.load(Ordering::Acquire)
     }
 
     fn snapshot(&self) -> SourceFreshnessFenceStateV1 {
@@ -807,6 +819,8 @@ impl SourceFreshnessFenceV1 {
         manifest: &SourceContentManifestV1,
         shutting_down: &AtomicBool,
     ) -> (bool, freshness_witness::SourceSweepStatsV1) {
+        #[cfg(test)]
+        self.source_sweeps.fetch_add(1, Ordering::AcqRel);
         self.sweep_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -827,6 +841,8 @@ impl SourceFreshnessFenceV1 {
         manifest: &SourceContentManifestV1,
         shutting_down: &AtomicBool,
     ) -> Result<BTreeSet<String>, CodeIndexSchedulerErrorV1> {
+        #[cfg(test)]
+        self.source_sweeps.fetch_add(1, Ordering::AcqRel);
         self.sweep_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

@@ -115,7 +115,7 @@ pub async fn read_published_artifact_chain(
         "automation artifact publication",
     )
     .map_err(TraceDecayError::from)?;
-    let bytes = match tokio::fs::read(&publication_path).await {
+    let bytes = match super::super::read_published_file(&publication_path).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -335,7 +335,12 @@ fn publish_run_artifact_chain_blocking_with_fault(
         fault(ArtifactPublishBoundary::BeforeStageSync)?;
         sync_directory(&stage_directory)?;
         fault(ArtifactPublishBoundary::BeforeRename)?;
-        std::fs::rename(&stage_directory, &final_directory).map_err(|error| {
+        // Windows refuses to rename a directory while a scanner still holds
+        // one of the files just written into it.
+        tracedecay_runtime_core::storage::retry_transient_file_op(|| {
+            std::fs::rename(&stage_directory, &final_directory)
+        })
+        .map_err(|error| {
             config_error(format!(
                 "failed to publish artifact chain '{}': {error}",
                 final_directory.display()
