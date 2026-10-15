@@ -378,6 +378,81 @@ async fn hook_orchestration_supersedes_same_address_without_replay_delay() {
 }
 
 #[tokio::test]
+async fn a_redriven_older_boundary_joins_the_newer_cycle_instead_of_settling_it() {
+    let newer_started = Arc::new(tokio::sync::Notify::new());
+    let observed_newer_started = Arc::clone(&newer_started);
+    let release = Arc::new(tokio::sync::Notify::new());
+    let work_release = Arc::clone(&release);
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_runs = Arc::clone(&runs);
+    let runtime = BoundedHookOrchestratorV1::new(1, move |_, cancellation| {
+        let started = Arc::clone(&observed_newer_started);
+        let release = Arc::clone(&work_release);
+        observed_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        async move {
+            started.notify_one();
+            tokio::select! {
+                () = cancellation.cancelled() => HookOrchestrationWorkOutcomeV1::RetryableFailure,
+                () = release.notified() => HookOrchestrationWorkOutcomeV1::RetryableFailure,
+            }
+        }
+    })
+    .unwrap();
+    let stop = |event_id, observed_at, completions: &Arc<std::sync::atomic::AtomicUsize>| {
+        let mut envelope = hook_envelope(HookEventV2::SessionBoundary {
+            boundary: HookBoundaryV1::TurnComplete,
+        });
+        envelope.event_id = event_id;
+        envelope.observed_at = UtcMicros(observed_at);
+        let mut request =
+            HookOrchestrationRequestV1::from_envelope(envelope, &hook_binding(), None, 1, false)
+                .unwrap();
+        let completions = Arc::clone(completions);
+        request.completion = Some(Arc::new(move || {
+            completions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
+        request
+    };
+    let newer_completions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let older_completions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    assert_eq!(
+        runtime.admit(stop([2; 16], 20, &newer_completions)),
+        HookOrchestrationAdmissionV1::Enqueued
+    );
+    newer_started.notified().await;
+
+    // The older stop's owed work is redriven while the newer stop runs.
+    assert_eq!(
+        runtime.admit(stop([1; 16], 10, &older_completions)),
+        HookOrchestrationAdmissionV1::Enqueued,
+        "an older boundary joins the newer cycle that subsumes it"
+    );
+    release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while runtime.active_tasks() > 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the newer cycle settles");
+    assert_eq!(
+        runs.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the older boundary must not start a cycle of its own"
+    );
+    assert_eq!(
+        newer_completions.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "an older boundary must never settle the newer boundary's owed work"
+    );
+    assert_eq!(
+        older_completions.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a joined boundary stays owed when the cycle subsuming it fails"
+    );
+}
+
+#[tokio::test]
 async fn no_identity_successor_retains_exact_lifecycle_without_overwriting_explicit_identity() {
     let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
     let work_observed = Arc::clone(&observed);
