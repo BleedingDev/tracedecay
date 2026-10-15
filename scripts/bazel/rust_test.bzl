@@ -209,11 +209,16 @@ def perf_rustc_flags(opt_level):
         ],
     })
 
-def rust_test(name, tags = [], runfiles_env = {}, **kwargs):
+def rust_test(name, tags = [], runfiles_env = {}, partitions = {}, **kwargs):
     """rules_rust's rust_test behind the isolating launcher.
 
     `runfiles_env` maps environment variable names to labels whose absolute
     runfiles path the suite reads at run time; each label also joins `data`.
+
+    `partitions` maps extra test target names to test module paths (`a` or
+    `a::b`) of the same binary. Each extra target runs only its modules and
+    `name` runs the rest, so CI can spread one long suite across shards
+    while compiling and linking it once.
     """
     visibility = kwargs.pop("visibility", None)
     test_attributes = {
@@ -259,4 +264,16 @@ def rust_test(name, tags = [], runfiles_env = {}, **kwargs):
     wrapper_args.update(test_attributes)
     if visibility != None:
         wrapper_args["visibility"] = visibility
+    base_args = wrapper_args.get("args", [])
+    skipped = []
+    for partition, modules in partitions.items():
+        filters = [module + "::" for module in modules]
+        skipped += filters
+        _isolated_rust_test(**dict(wrapper_args, name = partition, args = base_args + filters))
+    if skipped:
+        wrapper_args["args"] = base_args + [
+            argument
+            for module_filter in skipped
+            for argument in ["--skip", module_filter]
+        ]
     _isolated_rust_test(**wrapper_args)
