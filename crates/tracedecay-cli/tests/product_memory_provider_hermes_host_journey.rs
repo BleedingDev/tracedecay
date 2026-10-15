@@ -817,6 +817,7 @@ impl HermesJourney {
                 remaining.as_millis() > 0,
                 "{name} exhausted its settlement budget"
             );
+            let call_started = Instant::now();
             let output = self
                 .cli_at(
                     project,
@@ -836,6 +837,7 @@ impl HermesJourney {
                 )
                 .output()
                 .unwrap_or_else(|error| panic!("{name} could not run: {error}"));
+            let call_took = call_started.elapsed();
             let result: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
                 panic!(
                     "{name} returned invalid JSON: {error}\nstdout:\n{}\nstderr:\n{}",
@@ -867,9 +869,13 @@ impl HermesJourney {
                 let delay = problem
                     .pre_admission_retry_delay()
                     .unwrap_or_else(|| panic!("{name} returned a terminal refusal: {problem:?}"));
+                // The next read must fit after the delay. A call sent with
+                // the few milliseconds left times out on the client and hides
+                // this refusal behind an unrelated `timed_out`.
                 assert!(
-                    delay < deadline.saturating_duration_since(Instant::now()),
-                    "{name} authority did not settle within its budget: {problem:?}"
+                    delay.saturating_add(call_took)
+                        < deadline.saturating_duration_since(Instant::now()),
+                    "{name} authority did not settle within its budget; last refusal: {problem:?}"
                 );
                 std::thread::sleep(delay);
                 continue;
