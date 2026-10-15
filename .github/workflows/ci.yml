@@ -397,7 +397,9 @@ jobs:
   # 38071732620), so they keep the workspace-code shard. One shared
   # ci-linux-test-v2 prefix; root-b alone saves (a 6.9 GiB second family
   # previously evicted the budget). root-b and workspace catch unlisted
-  # targets in their groups.
+  # targets in their groups. root-a and root-b split the root crate's
+  # suite time evenly (run 38689933223: about 330 s each on Linux, 550-600 s
+  # on Windows); unit_test stays in root-b so only one shard compiles it.
   linux-test:
     name: Test Linux (${{ matrix.shard }})
     needs: scope-gate
@@ -412,6 +414,10 @@ jobs:
             targets: >-
               //crates/tracedecay:mcp_suite
               //crates/tracedecay:storage_suite
+              //crates/tracedecay:transport_acceptance_suite
+              //crates/tracedecay:session_suite
+              //crates/tracedecay:automation_runner_test
+              //crates/tracedecay:transcript_ingest_suite
           - shard: root-b
             targets: >-
               --
@@ -420,6 +426,10 @@ jobs:
               -//crates/tracedecay:dashboard_api_test
               -//crates/tracedecay:daemon_suite
               -//crates/tracedecay:storage_suite
+              -//crates/tracedecay:transport_acceptance_suite
+              -//crates/tracedecay:session_suite
+              -//crates/tracedecay:automation_runner_test
+              -//crates/tracedecay:transcript_ingest_suite
           - shard: workspace-code
             targets: >-
               --
@@ -537,9 +547,9 @@ jobs:
 
   # Three shards: the whole-workspace job ran its test tail strictly one
   # suite at a time (mcp_suite alone held the runner for eleven minutes), so
-  # mcp_suite gets a shard of its own, the rest of the root crate another,
-  # and the workspace shard, whose own tests take about four minutes, also
-  # runs the daemon and dashboard suites.
+  # the root crate's suites split across root-a and root-b by measured run
+  # time, as on Linux, and the workspace shard, whose own tests take about
+  # four minutes, also runs the daemon and dashboard suites.
   windows-test:
     name: Windows checks (${{ matrix.shard }})
     needs: scope-gate
@@ -554,6 +564,10 @@ jobs:
             targets: >-
               //crates/tracedecay:mcp_suite
               //crates/tracedecay:storage_suite
+              //crates/tracedecay:transport_acceptance_suite
+              //crates/tracedecay:session_suite
+              //crates/tracedecay:automation_runner_test
+              //crates/tracedecay:transcript_ingest_suite
           - shard: root-b
             targets: >-
               --
@@ -562,6 +576,10 @@ jobs:
               -//crates/tracedecay:dashboard_api_test
               -//crates/tracedecay:daemon_suite
               -//crates/tracedecay:storage_suite
+              -//crates/tracedecay:transport_acceptance_suite
+              -//crates/tracedecay:session_suite
+              -//crates/tracedecay:automation_runner_test
+              -//crates/tracedecay:transcript_ingest_suite
           - shard: workspace
             targets: >-
               --
